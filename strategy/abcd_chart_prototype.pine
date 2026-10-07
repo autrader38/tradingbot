@@ -1,0 +1,119 @@
+//@version=6
+indicator("ABCD Breakout — chart prototype (paper research only)", overlay = true, max_labels_count = 200)
+
+// This is a visual research aid only. It does not create TradingView alerts,
+// send orders, or check broker positions, buying power, spread, Level 2, halts,
+// account risk, or bridge state. Threshold defaults below are unvalidated.
+
+string GROUP_PATTERN = "Pattern thresholds (unvalidated)"
+int pivotLen = input.int(3, "Pivot confirmation bars", minval = 1, group = GROUP_PATTERN)
+float minImpulsePct = input.float(5.0, "Minimum A impulse (%)", minval = 0.1, step = 0.1, group = GROUP_PATTERN)
+float minBRetracePct = input.float(20.0, "Minimum B retracement (%)", minval = 0.0, maxval = 100.0, step = 1.0, group = GROUP_PATTERN)
+float maxBRetracePct = input.float(75.0, "Maximum B retracement (%)", minval = 1.0, maxval = 100.0, step = 1.0, group = GROUP_PATTERN)
+float minHigherLowPct = input.float(0.1, "Minimum C above B (%)", minval = 0.0, step = 0.1, group = GROUP_PATTERN)
+int baseBars = input.int(8, "D base bars", minval = 4, group = GROUP_PATTERN)
+float compressionRatio = input.float(0.8, "Recent/previous D range maximum", minval = 0.1, maxval = 1.0, step = 0.05, group = GROUP_PATTERN)
+float resistanceTolerancePct = input.float(0.5, "D range tolerance above resistance (%)", minval = 0.0, step = 0.1, group = GROUP_PATTERN)
+float resistanceProximityPct = input.float(3.0, "D must be within this % below resistance", minval = 0.1, step = 0.1, group = GROUP_PATTERN)
+float maxExtensionPct = input.float(1.0, "Maximum close extension above resistance (%)", minval = 0.0, step = 0.1, group = GROUP_PATTERN)
+int volumeLen = input.int(20, "1-minute volume baseline bars", minval = 2, group = GROUP_PATTERN)
+float breakoutVolumeMultiple = input.float(1.5, "Breakout volume baseline multiple", minval = 0.1, step = 0.1, group = GROUP_PATTERN)
+int htfEmaLen = input.int(20, "Higher-timeframe EMA length", minval = 2, group = GROUP_PATTERN)
+
+string GROUP_FILTERS = "Context filters"
+bool use15mFilter = input.bool(true, "Require confirmed 15-minute close above EMA", group = GROUP_FILTERS)
+bool useWeeklyFilter = input.bool(true, "Require confirmed weekly close above EMA", group = GROUP_FILTERS)
+string tradeSession = input.session("0930-1530:23456", "Entry session (New York)", group = GROUP_FILTERS)
+
+if not (timeframe.isminutes and timeframe.multiplier == 1)
+    runtime.error("Apply this prototype to a 1-minute chart.")
+
+// Confirmed higher-timeframe bars only. The one-bar offset with lookahead_on
+// avoids using a developing 15-minute or weekly candle.
+[close15, ema15] = request.security(syminfo.tickerid, "15", [close[1], ta.ema(close, htfEmaLen)[1]], lookahead = barmerge.lookahead_on)
+[closeW, emaW] = request.security(syminfo.tickerid, "1W", [close[1], ta.ema(close, htfEmaLen)[1]], lookahead = barmerge.lookahead_on)
+bool context15Ok = not use15mFilter or close15 >= ema15
+bool contextWOk = not useWeeklyFilter or closeW >= emaW
+bool inSession = not na(time(timeframe.period, tradeSession, "America/New_York"))
+
+float pivotHigh = ta.pivothigh(high, pivotLen, pivotLen)
+float pivotLow = ta.pivotlow(low, pivotLen, pivotLen)
+var float lastPivotLow = na
+var float aPrice = na
+var float bPrice = na
+var float cPrice = na
+var int patternState = 0 // 0 wait for A; 1 wait for B; 2 wait for bounce then C; 3 build D; 4 breakout seen
+var bool bounceAfterB = false
+var int patternStartBar = na
+var int cBar = na
+
+// Clear stale or invalid patterns. Pattern pivots are only accepted after the
+// configured right-side confirmation bars, so labels appear with that delay.
+bool patternTooOld = not na(patternStartBar) and bar_index - patternStartBar > 250
+bool cInvalidated = patternState >= 3 and low < cPrice
+if patternTooOld or cInvalidated
+    patternState := 0
+    bounceAfterB := false
+    aPrice := na
+    bPrice := na
+    cPrice := na
+    patternStartBar := na
+    cBar := na
+
+if not na(pivotHigh)
+    float confirmedHigh = pivotHigh
+    if patternState == 0 and not na(lastPivotLow)
+        float impulsePct = (confirmedHigh / lastPivotLow - 1.0) * 100.0
+        if impulsePct >= minImpulsePct
+            aPrice := confirmedHigh
+            patternState := 1
+            patternStartBar := bar_index - pivotLen
+            label.new(bar_index - pivotLen, confirmedHigh, "A", style = label.style_label_down, color = color.lime, textcolor = color.black)
+    else if patternState == 1 and confirmedHigh > aPrice
+        // A newer confirmed high replaces A while the impulse is still forming.
+        aPrice := confirmedHigh
+        patternStartBar := bar_index - pivotLen
+        label.new(bar_index - pivotLen, confirmedHigh, "A", style = label.style_label_down, color = color.lime, textcolor = color.black)
+    else if patternState == 2
+        bounceAfterB := true
+
+if not na(pivotLow)
+    float confirmedLow = pivotLow
+    if patternState == 0
+        lastPivotLow := confirmedLow
+    else if patternState == 1 and confirmedLow < aPrice and not na(lastPivotLow)
+        float impulseRange = aPrice - lastPivotLow
+        float retracementPct = impulseRange > 0 ? (aPrice - confirmedLow) / impulseRange * 100.0 : na
+        if retracementPct >= minBRetracePct and retracementPct <= maxBRetracePct
+            bPrice := confirmedLow
+            patternState := 2
+            bounceAfterB := false
+            label.new(bar_index - pivotLen, confirmedLow, "B", style = label.style_label_up, color = color.orange, textcolor = color.black)
+    else if patternState == 2 and bounceAfterB and confirmedLow > bPrice * (1.0 + minHigherLowPct / 100.0) and confirmedLow < aPrice
+        cPrice := confirmedLow
+        cBar := bar_index - pivotLen
+        patternState := 3
+        label.new(bar_index - pivotLen, confirmedLow, "C", style = label.style_label_up, color = color.aqua, textcolor = color.black)
+
+int halfBase = int(math.floor(baseBars / 2.0))
+float recentBaseRange = ta.highest(high, halfBase) - ta.lowest(low, halfBase)
+float previousBaseRange = ta.highest(high[halfBase], halfBase) - ta.lowest(low[halfBase], halfBase)
+bool rangesContract = not na(previousBaseRange) and previousBaseRange > 0 and recentBaseRange <= previousBaseRange * compressionRatio
+bool baseBelowResistance = patternState == 3 and ta.highest(high, baseBars) <= aPrice * (1.0 + resistanceTolerancePct / 100.0)
+bool baseNearResistance = patternState == 3 and close >= aPrice * (1.0 - resistanceProximityPct / 100.0) and close <= aPrice
+bool dBaseReady = patternState == 3 and baseBelowResistance and baseNearResistance and rangesContract and not na(cBar) and bar_index > cBar + baseBars
+float volumeBaseline = ta.sma(volume, volumeLen)
+bool volumeExpansion = not na(volumeBaseline) and volume > volumeBaseline * breakoutVolumeMultiple
+bool confirmedBreakout = barstate.isconfirmed and dBaseReady[1] and ta.crossover(close, aPrice) and close <= aPrice * (1.0 + maxExtensionPct / 100.0) and volumeExpansion and inSession and context15Ok and contextWOk
+
+plot(patternState >= 1 and patternState <= 4 ? aPrice : na, "A resistance", color = color.new(color.yellow, 5), linewidth = 2, style = plot.style_linebr)
+plot(patternState >= 2 and patternState <= 4 ? bPrice : na, "B pullback low", color = color.new(color.orange, 35), style = plot.style_linebr)
+plot(patternState >= 3 and patternState <= 4 ? cPrice : na, "C higher low / structural invalidation", color = color.new(color.aqua, 15), style = plot.style_linebr)
+bgcolor(dBaseReady ? color.new(color.blue, 88) : na, title = "Potential tightening D base")
+plotshape(confirmedBreakout, title = "Confirmed chart-only breakout candidate", text = "BREAKOUT?", style = shape.labelup, location = location.belowbar, color = color.lime, textcolor = color.black, size = size.tiny)
+
+if confirmedBreakout
+    label.new(bar_index, high, "D / confirmed close above A resistance\nChart candidate only — review filters", style = label.style_label_down, color = color.green, textcolor = color.white)
+    patternState := 4
+
+// No alertcondition() by design. This prototype is for chart review only.

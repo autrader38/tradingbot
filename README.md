@@ -11,6 +11,7 @@ A long-only ABCD Breakout research project. **Strategy Spec v1.0 is frozen:** ap
 - [Architecture](docs/architecture.md): research components and separately gated future integration.
 - [Phase 1 foundation](docs/phase-1-foundation.md): Python data/configuration primitives and offline test commands.
 - [Phase 2 A/B detector](docs/phase-2-ab-detector.md): deterministic per-ticker activation, impulse and B confirmation with supplied historical inputs.
+- [Phase 3 C development](docs/phase-3-c-detector.md): potential C, consolidation, higher lows and immutable C locking evidence.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 
@@ -22,9 +23,9 @@ Freezing the rules does not prove suitable historical data are available or esta
 
 ## Current repository
 
-The repository contains frozen documentation, a dependency-free Python foundation and Phase 2 A/B detector with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). C/D detection, a completed historical backtester, scanner and execution service remain unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
+The repository contains frozen documentation, a dependency-free Python foundation, an A/B detector and a Phase 3 C extension with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). Breakout/D detection, a completed historical backtester, scanner and execution service remain unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
 
-The user separately authorized the Phase 1 foundation and Phase 2 A/B detection. This does not authorize C/D detection, execution simulation, IBKR/TradingView connections or order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
+The user separately authorized the Phase 1 foundation, Phase 2 A/B detection and Phase 3 C development/locking. This does not authorize breakout/D detection, execution simulation, IBKR/TradingView connections or order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
 
 ## Safety and next phases
 

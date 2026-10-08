@@ -226,9 +226,7 @@ class ABDetector:
             self._audit("ELIGIBILITY_RESTORED", bar)
             return tuple(self._events)
         if self.active:
-            if self.state.lifecycle != State.B_CONFIRMED:
-                self._participants.append(evidence)
-                self._advance(evidence)
+            self._process_active(evidence)
             return tuple(self._events)
         if not inputs.static_eligible:
             self.state = ABState(lifecycle=State.INELIGIBLE)
@@ -249,6 +247,12 @@ class ABDetector:
                 return tuple(self._events)
         self._remember_price(evidence)
         return tuple(self._events)
+
+    def _process_active(self, evidence: VolumeEvidence) -> None:
+        """Extension point; A/B-only callers retain the approved Phase 2 path."""
+        if self.state.lifecycle != State.B_CONFIRMED:
+            self._participants.append(evidence)
+            self._advance(evidence)
 
     def _remember_price(self, evidence: VolumeEvidence) -> None:
         self._price.append(evidence)

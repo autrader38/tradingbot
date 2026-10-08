@@ -10,8 +10,9 @@ Read the [canonical specification](strategy-spec-v1.0.md), [defaults](strategy-p
 - Unverified: availability, licensing, coverage and point-in-time reliability of a suitable historical dataset.
 - Built in separately authorized Phase 1: typed configuration, minute/session models, validation, state/code enums, exact numerical primitives, audit records and offline foundation tests. See [Phase 1 guide](phase-1-foundation.md).
 - Built in separately authorized Phase 2: per-ticker A activation, A/B impulse, provisional B/confirmation, chronological RVOL evidence and structured audits. See [Phase 2 guide](phase-2-ab-detector.md).
-- Not built: C/D detector, complete transition engine, historical portfolio backtester, scanner, integration or execution service.
-- Current authorization: Phase 1 foundation and Phase 2 A/B processing only. Do not implement later strategy phases or connect to external trading services until separately authorized.
+- Built in separately authorized Phase 3: a C extension with conditional post-B evidence, provisional-C updates, consolidation/higher-low qualification, C locking and C-stage termination. See [Phase 3 guide](phase-3-c-detector.md).
+- Not built: breakout/D detector, complete transition engine, historical portfolio backtester, scanner, integration or execution service.
+- Current authorization: foundation, A/B processing and C development/locking only. Do not implement later strategy phases or connect to external trading services until separately authorized.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 

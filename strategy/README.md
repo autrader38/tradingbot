@@ -1,13 +1,13 @@
-# TradingView strategy code
+# Strategy artifacts
 
-The first chart-only prototype is [`abcd_chart_prototype.pine`](abcd_chart_prototype.pine). It marks confirmed A/B/C pivots, a candidate tightening base below A resistance, and a confirmed one-minute close above resistance.
+The authoritative strategy is [Frozen Strategy Spec v1.0](../docs/strategy-spec-v1.0.md), with its [parameter table](../docs/strategy-parameters-v1.0.md) and [Decisions #1–47 history](../docs/strategy-decision-history.md).
 
-## Important limits
+## Historical chart prototype
 
-- This is an indicator for visual review, not a `strategy()` backtest and not an order system.
-- It intentionally has no `alertcondition()` and cannot check IBKR account/order state, spread, Level 1/2, market cap, average daily volume, halts, buying power, risk locks, stop placement, or bridge status.
-- The built-in swing-pivot confirmation means A/B/C labels appear several bars after the pivot. Changing pivot length changes those points.
-- The initial numeric defaults are examples only and are unvalidated. Adjust them in the indicator settings during chart review; don't route them to an account.
-- Higher-timeframe context uses only the last confirmed 15-minute and weekly bars to avoid acting on developing candles.
+[`abcd_chart_prototype.pine`](abcd_chart_prototype.pine) is preserved unchanged as a chart-only research artifact. It predates the frozen specification and **does not implement Strategy Spec v1.0**.
 
-Never put bridge secrets or account credentials in Pine source or alert messages. Add alert logic only after the visual candidate rules and execution boundaries have been reviewed.
+Its A/B labels, retrospective pivot confirmation, numerical defaults, base terminology and moving-average context checks differ from approved v1.0. Do not import those behaviors into a future backtester. The approved definitions are A = impulse beginning, B = high/resistance, C = pullback, D = confirmed breakout; mandatory 15-minute and weekly checks use the frozen price-structure rules.
+
+The prototype is an indicator, not a strategy backtest or execution system. It contains no alertcondition and cannot establish broker/account state, executable ticks, universe eligibility, portfolio limits or verified fills. No compilation/backtest or TradingView connection is claimed by this documentation change.
+
+Never embed bridge endpoints, credentials or account identifiers in Pine or alerts. Any later prototype alignment, alert implementation, external connection or order routing requires separate authorization. No source code has been changed here.

@@ -1,34 +1,35 @@
-# Initial architecture
+# Architecture
 
-## Current phase: research and paper validation
+## Frozen historical research scope
+
+[Strategy Spec v1.0](strategy-spec-v1.0.md), [parameters](strategy-parameters-v1.0.md), and [decision history](strategy-decision-history.md) define the authoritative approved behavior. The design phase is complete; implementation has not started.
 
 ```text
-TradingView charts + Pine conditions
-               |
-         JSON alert
-               v
-       Hosted webhook bridge
-               |
-        IBKR paper account
-
-This repository: rules, alert contract, research notes, and paper-result analysis
+Historical security/reference/calendar/corporate-action data
+                          +
+Regular-session minute data / same-day premarket volume / daily-weekly history
+                          |
+                 Validate and normalize point-in-time
+                          |
+             Universe gates + one setup state per ticker
+                          |
+             One chronological shared-portfolio simulator
+                          |
+       Approved research fills + risk/cash/exposure/lockout accounting
+                          |
+        Reproducible audit records, complete/incomplete results, disclosures
 ```
 
-The hosted bridge avoids operating a custom public webhook server. It also means a third party handles account authorization and order routing. Keep that integration isolated from this project's research tools.
+The future implementation should keep price-pattern state, chronological volume history, security-reference state, portfolio accounting and run-integrity status separate. Market-data schemas must preserve classifications and information availability; no-trade is not missing data. Full fills and modeled OPEN timestamps are explicit research assumptions, not verified broker executions.
 
-## Boundaries
+Python is a recommended future research/runtime choice; no runtime dependencies or source implementation are added by this documentation change. The existing Pine indicator is a non-authoritative historical prototype. Mandatory 15-minute structure and weekly swing-high room use the approved price rules, not that prototype's moving averages.
 
-- TradingView is the chart/signal source for this phase; it is not treated as a complete market-data warehouse or as proof of execution.
-- The bridge routes a signal; IBKR remains the execution and position source of truth.
-- Before any strategy is automated, specify symbol, direction, order type, quantity rule, maximum exposure, stop/invalidation, exit, session, expiration, and unique signal identity.
-- Prefer explicit, bounded quantities and protective order behavior. Do not use an alert that can repeatedly add to a position without a defined cap.
-- If delivery or broker state is uncertain, freeze new entries and reconcile through the bridge and IBKR.
-- Scanner, news, Level 2, and multi-timeframe research are later phases. They need separate data-source and licensing decisions and are not assumed to be supplied by TradingView alerts.
+Suitable historical data are not yet established. Do not infer readiness from a frozen design or a passing syntax check. See [implementation readiness](implementation-readiness.md) for provider capabilities and meaningful validation.
 
-## Decisions still open
+## Future integration candidate, outside v1.0 execution
 
-- First setup to encode.
-- Allowed symbols/universe and market hours.
-- Paper account and market-data permissions.
-- Exact bridge plan, broker permissions, and account connection method.
-- Position sizing and maximum daily loss. No defaults should be invented.
+The earlier proposal was TradingView signals → hosted webhook bridge → IBKR paper account. TradersPost was a first evaluation candidate, not an activated selection. [Bridge notes](bridge-evaluation.md) retain verification questions.
+
+Before any external integration, verify current service capabilities, broker permissions, protective orders, duplicate handling, reconciliation, recovery, authentication and kill/disable behavior. TradingView alerts are signals, not fills; broker executions/positions are authoritative for any future execution system. Scanner/news/order-book services and market-data licensing need their own evaluation.
+
+Current authorization is documentation only: no service connection, backtester, order placement or live implementation. Paper/live execution realism and acceptance criteria are not supplied by the research freeze and must not be invented. Live routing requires a later explicit reviewed change.

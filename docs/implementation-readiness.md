@@ -1,33 +1,70 @@
-# ABCD v1 implementation readiness
+# Frozen v1.0 implementation readiness
 
-The user's strategy-inputs document defines a long-only ABCD breakout and paper-only scope. This note translates it into engineering gates. Do not silently fill unresolved items with assumptions.
+**Strategy Spec v1.0 is frozen. Decisions #1–47 are approved.** The full audit's four material rule blockers were resolved by #44–#47; no further strategy-design decisions are required before implementation.
 
-## Can be represented now
+Read the [canonical specification](strategy-spec-v1.0.md), [defaults](strategy-parameters-v1.0.md) and [decision history](strategy-decision-history.md). Old prototype thresholds, pivots, labels and moving-average filters are not authoritative. This readiness document adds no strategy rules.
 
-- Long-only, regular-hours entries from 9:30 a.m. to 3:30 p.m. America/New_York on the U.S. market calendar.
-- A one-minute candle must close above a previously established resistance; touching resistance is not an entry.
-- Initial stop is below the confirmed C higher low. Never widen it.
-- Take half off at 2R; manage the remainder under a deterministic exit rule.
-- Maximum 5 new trades/day, 1% of account equity risk/trade, stop new entries at -2% realized daily P/L or after 3 consecutive losses.
-- Do not enter on stale/missing data, uncertain broker state, duplicate exposure, excessive spread, poor liquidity, halt/abnormal conditions, or missing protection.
-- Paper only; the strategy may not control or change its own rules.
+## What is and is not ready
 
-## Required before executable strategy alerts
+- Ready: frozen signal/risk/accounting rules, deterministic lifecycle and event-order requirements, explicit research execution assumptions, failure outcomes and audit contract.
+- Unverified: availability, licensing, coverage and point-in-time reliability of a suitable historical dataset.
+- Not built: historical portfolio backtester, scanner, test suite, integration or execution service.
+- Current authorization: documentation only. Do not build or connect to external trading services until separately authorized.
 
-1. **Swing and pattern measurement:** pivot confirmation length or another swing-point method; minimum A impulse size; allowed B retracement; minimum C higher-low margin; D consolidation lookback; objective compression formula; how many tests define resistance; resistance tolerance.
-2. **Breakout quality:** 1-minute volume baseline/lookback and required multiple; maximum extension beyond resistance; precise rule for a non-bearish 15-minute structure.
-3. **Weekly resistance:** objective source for major resistance and minimum required reward room. This must avoid look-ahead and use only confirmed weekly bars.
-4. **Market quality:** maximum spread (absolute or percent), minimum real-time volume/liquidity, halt/abnormal-market source, and whether Level 2 is required. TradingView/Pine alerts may not expose all broker-side order-book and account state needed for these checks.
-5. **Order behavior:** entry order type, time-in-force, partial-fill handling, stop order type/placement behavior, end-of-day policy, and what happens if the bridge or broker rejects a protective stop.
-6. **Deterministic runner exit:** define significant resistance, lower-high pattern, prior 1-minute swing-low confirmation, VWAP-loss confirmation, and breakout-failure rules. Several are currently descriptive rather than executable.
-7. **Paper acceptance:** observation period/sample size, metrics including fees/slippage, and criteria to stop, revise, or continue.
+**RESEARCH BACKTEST MODEL — V1.0**
 
-## Implementation sequence
+**ZERO-FRICTION BASELINE**
 
-1. **Done:** write a non-executing chart prototype with configurable thresholds.
-2. Apply it to a 1-minute TradingView chart and compare candidates to the supplied example; record false positives and missed setups.
-3. Freeze a versioned threshold set; backtest with confirmed higher-timeframe data and realistic costs.
-4. Add TradingView alerts only after the above gates are reviewed.
-5. Route alerts to an IBKR paper account through the selected hosted bridge; reconcile every alert against broker orders and fills.
+**FULL-FILL RESEARCH ASSUMPTION — MARKET DEPTH AND PARTIAL FILLS NOT MODELED**
 
-The prototype must label values as unvalidated and must not place or route orders. No numerical threshold values are approved by the current specification unless they are explicitly stated above.
+TRANSACTION COSTS AND SLIPPAGE NOT YET MODELED.
+
+These labels must accompany applicable results. Specification readiness is not proof of profitability, realistic fills or paper/live deployment readiness.
+
+## Required historical-data capability groups
+
+| Required capability | Verification needed |
+|---|---|
+| Historical security master | Common-stock/depositary/instrument types, listing identity and dates, stable IDs, ticker reuse |
+| Inactive/delisted coverage | Historically eligible failures as well as surviving names; disclose actual coverage limitations |
+| Point-in-time market cap | Authoritative cap or applicable historical shares outstanding and compatible contemporaneous price |
+| Prior official regular close | Trustworthy reference, adjusted only for already-effective applicable actions |
+| Regular-session daily history | Actual prior ADV10/ADR20 sessions, volume/HLC and early-close handling |
+| Completed weekly history | Up to 52 candidate weeks plus two older context weeks, minimum 12, confirmation and completeness |
+| Corporate-action metadata | Effective dates/terms, source adjustment semantics, point-in-time normalization without double adjustment |
+| Regular-session minute OHLCV | Eligible trades, trustworthy values/order/timestamps/corrections and security identifiers |
+| Same-day premarket volume | 04:00 onward eligible chronological history, no previous-date substitution |
+| Interval classification | Affirmative genuine no-trade evidence versus missing/invalid/corrupt/conflicting intervals |
+| Historical ticks | Security/date/price/venue/order-specific valid increments and required replacement applicability |
+| Official exchange calendar | Actual sessions, holidays, early closes, DST; unresolved boundaries flagged invalid |
+
+Missing requirements use approved rejection/pause/incomplete outcomes; never guess data to obtain desired trades. Historical quotes are optional for initial spread reporting; depth, queues, routing, auction/next-day liquidation models and exact first-trade timestamps are not requirements of the approved baseline abstraction.
+
+## Implementation checklist after separate authorization
+
+- Use one canonical configuration from the frozen parameter table; record every departure as a separate research configuration.
+- Specify data schemas for minute classifications, daily/weekly history, security references, corporate actions, ticks and calendar. Preserve raw/source-normalized/strategy-normalized provenance and availability.
+- Implement separate ticker setup state and a single chronological shared account; preserve reset boundaries, traded/elapsed counters and finite RVOL ranking.
+- Document timestamp labels alongside interval start/end and availability, deterministic primary-code precedence, negligible comparison tolerance and fee-remainder reconciliation. These are implementation conventions, not new strategy filters.
+- Use precision-safe decimal/integer arithmetic for ticks and quantities; no invented numeric tolerances that alter approved equality rules.
+- Implement exact data-pause, tick-failure and EOD-no-liquidity run outcomes; preserve completed results without fabricated continuation.
+- Produce all canonical setup/entry/exit/portfolio/data-quality/termination audit records and explicit research disclosures.
+
+## Meaningful validation fixtures
+
+Use hand-checkable expected outcomes exercising the actual approved logic rather than mirroring implementation:
+
+- A earliest-low and B latest-equal-high ties; permitted origin resets and post-deadline failures.
+- Activation initialization with already-completed confirmation; no retrospective trades or same-A-candle impulse credit.
+- Candle-10 impulse/C boundaries, two post-impulse confirmation slots, no-trade traded-count versus elapsed timers.
+- Provisional-C lower-low resets, exact 20%/50% boundaries, locked-C touches/breaks and invalidation-versus-D ambiguity.
+- Retry attempts, first-wait/resolution limits, D price/volume equalities and all-zero/mixed volume baselines.
+- Chronological 15-minute aggregation, no-trade/invalid blocks, 10:15 context and completed weekly confirmation/window boundaries.
+- Scheduled entry cancellation, dynamic gates, exact cutoff and early-close final-minute liquidation.
+- Sizing caps, odd-share partials, simultaneous ranked entries and opening-exit cash versus later intrabar proceeds.
+- Stop/target touches, gap prices, 2R/breakeven ambiguity, prospective non-decreasing trailing and no-trade runner periods.
+- Tick normalization/unavailability, point-in-time split units and unavailable reference-data handling.
+- Net cost allocation, net loss streaks/sticky lockouts, final-exit quarantine with retained volume context.
+- Missing held data/replay, unresolved EOD no liquidity and required open-position tick failure; no false complete metrics.
+
+Do not claim historical behavior verified until representative data-backed tests execute. A complete dataset may still expose incomplete runs; report them honestly. Parameter optimization/out-of-sample methodology, realistic commissions/fees/slippage/partial fills, automated paper acceptance and any live deployment remain future separately approved work.

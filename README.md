@@ -1,37 +1,33 @@
 # AI Day Trader
 
-A staged research and paper-trading project for a TradingView + Interactive Brokers workflow. The initial scope is strategy specification, data review, and paper validation. It does not place trades.
+A long-only ABCD Breakout research project. **Strategy Spec v1.0 is frozen:** approved Decisions #1–47 are permanently documented. A begins the impulse, B is its high/resistance, C is the controlled pullback, and D is the confirmed breakout above B.
 
-## Proposed first architecture
+## Read the frozen specification
 
-1. TradingView supplies charts and runs deterministic, user-approved Pine Script conditions.
-2. TradingView alerts go to a hosted webhook bridge (initial candidate: TradersPost) which connects to an IBKR paper account.
-3. This project maintains the strategy specification, alert contract, historical research, and independent review of paper results.
-4. No custom cloud server is needed in this first phase. The hosted bridge is a third party with order-routing access, so its permissions and behavior must be reviewed and tested with paper trading before activation.
+- [Canonical Strategy Spec v1.0](docs/strategy-spec-v1.0.md): final authoritative rules, timing, state machine, accounting, data behavior and audit requirements.
+- [Canonical parameter table](docs/strategy-parameters-v1.0.md): every frozen numerical default and policy boundary.
+- [Approved decision history](docs/strategy-decision-history.md): Decisions #1–47 and supersession map.
+- [Implementation readiness](docs/implementation-readiness.md): dataset requirements, remaining implementation work and validation checklist.
+- [Architecture](docs/architecture.md): research components and separately gated future integration.
 
-TradingView's native IBKR panel supports chart-based manual trading; it is not the webhook automation path. Capitalise.ai is not the default choice because its current IBKR availability is unclear from conflicting public information. Confirm availability with IBKR and Capitalise before relying on it. A hosted bridge is only a candidate until a paper end-to-end test proves it works on this account.
+**RESEARCH BACKTEST MODEL — V1.0**
 
-## Safety boundary
+**ZERO-FRICTION BASELINE**
 
-- Paper account only.
-- No credentials or real webhook endpoints in this repository.
-- No live order code or live trading switch.
-- No strategy rules invented by the software. Define each setup and risk limit with the user first.
-- A TradingView alert is not proof of an IBKR fill. Review bridge logs, broker orders, executions, and positions.
+**FULL-FILL RESEARCH ASSUMPTION — MARKET DEPTH AND PARTIAL FILLS NOT MODELED**
 
-## Start here
+Freezing the rules does not prove suitable historical data are available or establish realistic live execution. The initial research model uses explicit full-fill and opening-timestamp abstractions. Zero-friction results are not expected live returns. No profitability claim is made.
 
-- Read [`docs/architecture.md`](docs/architecture.md).
-- Fill in [`docs/strategy-inputs.md`](docs/strategy-inputs.md) before writing entry or exit logic.
-- Review [`docs/bridge-evaluation.md`](docs/bridge-evaluation.md) before connecting any account.
-- Use [`strategy/README.md`](strategy/README.md) for the later Pine Script signal implementation.
+## Current repository
 
-## Planned phases
+The repository contains documentation, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). It contains no completed historical backtester, scanner or execution service. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
 
-1. Agree on one setup and fixed paper-only risk constraints.
-2. Specify an alert schema and write a deterministic TradingView strategy.
-3. Validate signals without broker access, including duplicate/stale alert behavior.
-4. Connect the bridge to IBKR paper and verify small, controlled test orders manually.
-5. Collect and analyze paper results before considering any further automation.
+Documentation is the currently authorized work. No backtester construction, IBKR/TradingView connection or order placement is authorized by the specification freeze. Future implementation requires separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
 
-This repository is not financial advice and makes no return claims.
+## Safety and next phases
+
+Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
+
+After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.
+
+TradingView/IBKR with a hosted bridge was an earlier integration candidate, not a selected or connected service. [Bridge evaluation notes](docs/bridge-evaluation.md) are retained for future verification, not part of the historical fill model. A signal is not evidence of a broker fill.

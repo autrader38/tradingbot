@@ -1,5 +1,7 @@
 # Hosted bridge evaluation
 
+These historical integration notes are retained for a future separately authorized service evaluation. They are not a selected/connected execution environment, not current verification of third-party claims, and not the fill model for [frozen Strategy Spec v1.0](strategy-spec-v1.0.md). The current approved work is documentation only; do not connect services or place test orders based on this checklist.
+
 ## Candidate to evaluate first: TradersPost
 
 Its current documentation describes TradingView webhook signals routed to Interactive Brokers and paper-account testing. It exposes signal fields for actions, quantities, stop-loss, and take-profit. Those claims establish technical compatibility, not execution quality or suitability. Confirm current account eligibility, support for the intended US equities and order types, paper-account connection, subscription costs, and required permissions directly before connecting.

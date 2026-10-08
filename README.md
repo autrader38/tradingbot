@@ -14,6 +14,7 @@ A long-only ABCD Breakout research project. **Strategy Spec v1.0 is frozen:** ap
 - [Phase 3 C development](docs/phase-3-c-detector.md): potential C, consolidation, higher lows and immutable C locking evidence.
 - [Phase 4 D confirmation](docs/phase-4-d-detector.md): elapsed breakout timers, attempts, volume qualification and pending-entry signal handoff.
 - [Phase 5 entry validation](docs/phase-5-entry-validation.md): opening-only checks, mandatory 15-minute/weekly context and approved candidates without fills.
+- [Phase 6 trade construction](docs/phase-6-trade-construction.md): supplied ticks/account state, exact levels/sizing and simulated zero-friction opening entries.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 
@@ -25,9 +26,9 @@ Freezing the rules does not prove suitable historical data are available or esta
 
 ## Current repository
 
-The repository contains frozen documentation, a dependency-free Python foundation, A/B/C/D detection and Phase 5 opening/context validation with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). Entry fills/sizing, a completed historical backtester, scanner and portfolio/execution service remain unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
+The repository contains frozen documentation, a dependency-free Python foundation, A/B/C/D detection, opening/context validation and Phase 6 simulated entry construction with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). Exit management, a completed historical backtester, scanner and portfolio/integration service remain unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
 
-The user separately authorized Phases 1–5: foundation, A/B/C/D detection and opening/context validation. This does not authorize trade fills/sizing, portfolio simulation, IBKR/TradingView connections or order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
+The user separately authorized Phases 1–6: foundation, A/B/C/D detection, opening/context validation and single simulated opening entries. This does not authorize exits, a portfolio event loop, IBKR/TradingView connections or broker order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
 
 ## Safety and next phases
 

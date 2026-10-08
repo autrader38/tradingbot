@@ -13,8 +13,9 @@ Read the [canonical specification](strategy-spec-v1.0.md), [defaults](strategy-p
 - Built in separately authorized Phase 3: a C extension with conditional post-B evidence, provisional-C updates, consolidation/higher-low qualification, C locking and C-stage termination. See [Phase 3 guide](phase-3-c-detector.md).
 - Built in separately authorized Phase 4: elapsed breakout timers, failed attempts/retries, D price/volume confirmation and one scheduled pending-entry signal with cancellation or unevaluated opening handoff. See [Phase 4 guide](phase-4-d-detector.md).
 - Built in separately authorized Phase 5: opening-only B/dynamic/session validation, fixed completed 15-minute context, chronological weekly resistance and immutable approval/consumption records. See [Phase 5 guide](phase-5-entry-validation.md).
-- Not built: trade/tick/size/account execution engine, historical portfolio backtester, scanner, integration or execution service.
-- Current authorization: foundation, A/B/C/D detection and opening/context validation only. Do not implement later strategy phases or connect to external trading services until separately authorized.
+- Built in separately authorized Phase 6: supplied tick/account contracts, exact initial stop/target/risk, quantity caps, simulated full opening fill and immutable entry account effects. See [Phase 6 guide](phase-6-trade-construction.md).
+- Not built: exit management, full account/lockout/event-loop engine, historical portfolio backtester, scanner, integration or broker execution service.
+- Current authorization: foundation, A/B/C/D detection, opening/context validation and single simulated opening entries only. Do not implement later strategy phases or connect to external trading services until separately authorized.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 

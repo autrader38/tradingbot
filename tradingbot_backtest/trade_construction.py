@@ -24,6 +24,8 @@ def _validate_decimal(value: Decimal) -> None:
 class TickPurpose(StrEnum):
     INITIAL_STOP = 'INITIAL_STOP'
     TARGET_2R = 'TARGET_2R'
+    BREAKEVEN_STOP = 'BREAKEVEN_STOP'
+    TRAILING_STOP = 'TRAILING_STOP'
 
 
 class TickDirection(StrEnum):

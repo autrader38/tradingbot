@@ -9,8 +9,9 @@ Read the [canonical specification](strategy-spec-v1.0.md), [defaults](strategy-p
 - Ready: frozen signal/risk/accounting rules, deterministic lifecycle and event-order requirements, explicit research execution assumptions, failure outcomes and audit contract.
 - Unverified: availability, licensing, coverage and point-in-time reliability of a suitable historical dataset.
 - Built in separately authorized Phase 1: typed configuration, minute/session models, validation, state/code enums, exact numerical primitives, audit records and offline foundation tests. See [Phase 1 guide](phase-1-foundation.md).
-- Not built: ABCD detector, transition engine, historical portfolio backtester, scanner, integration or execution service.
-- Current authorization: Phase 1 foundation only. Do not implement later strategy phases or connect to external trading services until separately authorized.
+- Built in separately authorized Phase 2: per-ticker A activation, A/B impulse, provisional B/confirmation, chronological RVOL evidence and structured audits. See [Phase 2 guide](phase-2-ab-detector.md).
+- Not built: C/D detector, complete transition engine, historical portfolio backtester, scanner, integration or execution service.
+- Current authorization: Phase 1 foundation and Phase 2 A/B processing only. Do not implement later strategy phases or connect to external trading services until separately authorized.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 

@@ -14,7 +14,7 @@ from .codes import ReasonCode, SetupTermination
 from .config import FROZEN_V1, StrategyConfig
 from .market import IntervalClassification as Kind, MarketInterval
 from .numerics import decimal
-from .sessions import NEW_YORK, SessionCalendar, SessionPeriod
+from .sessions import NEW_YORK, SessionCalendar, SessionPeriod, TradingSession
 from .states import StrategyState as State
 from .volume import VolumeEvidence, volume_evidence
 
@@ -168,7 +168,10 @@ class ABDetector:
         self._previous = bar
         self._audit("DATA_INTERVAL", bar, classification=bar.classification.value,
                     source_id=bar.source_id, open=bar.open, high=bar.high,
-                    low=bar.low, close=bar.close, volume=bar.volume)
+                    low=bar.low, close=bar.close, volume=bar.volume,
+                    data_quality_reason=bar.data_quality_reason)
+        if self._process_pending_interval(bar, inputs, session):
+            return tuple(self._events)
         if bar.classification in (Kind.MISSING, Kind.INVALID):
             reason = ReasonCode.DATA_GAP if bar.classification == Kind.MISSING else ReasonCode.INVALID_DATA
             if self.active:
@@ -201,7 +204,7 @@ class ABDetector:
             self._price.clear()
             return tuple(self._events)
         if evidence is None:
-            self._audit("NO_TRADE_PRESERVED", bar)
+            self._process_no_trade(bar)
             return tuple(self._events)
         reason = self._dynamic_reason(bar.close, inputs)
         self._audit("DYNAMIC_ELIGIBILITY", bar, reason=reason, close=bar.close,
@@ -253,6 +256,15 @@ class ABDetector:
         if self.state.lifecycle != State.B_CONFIRMED:
             self._participants.append(evidence)
             self._advance(evidence)
+
+    def _process_pending_interval(self, bar: MarketInterval, inputs: EligibilityInputs,
+                                  session: TradingSession) -> bool:
+        """Later signal stages may handle their scheduled OPEN before close guards."""
+        return False
+
+    def _process_no_trade(self, bar: MarketInterval) -> None:
+        """Elapsed-minute extension point; A/B-only processing remains unchanged."""
+        self._audit("NO_TRADE_PRESERVED", bar)
 
     def _remember_price(self, evidence: VolumeEvidence) -> None:
         self._price.append(evidence)

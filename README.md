@@ -9,6 +9,7 @@ A long-only ABCD Breakout research project. **Strategy Spec v1.0 is frozen:** ap
 - [Approved decision history](docs/strategy-decision-history.md): Decisions #1–47 and supersession map.
 - [Implementation readiness](docs/implementation-readiness.md): dataset requirements, remaining implementation work and validation checklist.
 - [Architecture](docs/architecture.md): research components and separately gated future integration.
+- [Phase 1 foundation](docs/phase-1-foundation.md): Python data/configuration primitives and offline test commands.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 
@@ -20,9 +21,9 @@ Freezing the rules does not prove suitable historical data are available or esta
 
 ## Current repository
 
-The repository contains documentation, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). It contains no completed historical backtester, scanner or execution service. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
+The repository contains frozen documentation, a dependency-free Python Phase 1 foundation with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). It contains no ABCD detector, completed historical backtester, scanner or execution service. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
 
-Documentation is the currently authorized work. No backtester construction, IBKR/TradingView connection or order placement is authorized by the specification freeze. Future implementation requires separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
+The user separately authorized the Phase 1 Python foundation. That authorization does not cover strategy detection, execution simulation, IBKR/TradingView connections or order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
 
 ## Safety and next phases
 

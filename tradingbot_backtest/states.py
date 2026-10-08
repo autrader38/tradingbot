@@ -1,0 +1,22 @@
+"""State names only; no transition engine or signal detection."""
+
+from enum import StrEnum
+
+
+class StrategyState(StrEnum):
+    INELIGIBLE = "INELIGIBLE"
+    ELIGIBLE = "ELIGIBLE"
+    A_CANDIDATE = "A_CANDIDATE"
+    AB_IMPULSE = "AB_IMPULSE"
+    PROVISIONAL_B = "PROVISIONAL_B"
+    B_CONFIRMED = "B_CONFIRMED"
+    C_DEVELOPING = "C_DEVELOPING"
+    C_LOCKED = "C_LOCKED"
+    BREAKOUT_ATTEMPT = "BREAKOUT_ATTEMPT"
+    D_CONFIRMED = "D_CONFIRMED"
+    PENDING_ENTRY = "PENDING_ENTRY"
+    OPEN_POSITION = "OPEN_POSITION"
+    PARTIAL_2R = "PARTIAL_2R"
+    RUNNER = "RUNNER"
+    CLOSED = "CLOSED"
+    TERMINATED = "TERMINATED"

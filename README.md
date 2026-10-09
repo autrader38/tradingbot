@@ -36,6 +36,8 @@ The user separately authorized Phases 1–9: foundation, A/B/C/D detection, open
 
 Separately authorized Phase 10C1 adds an isolated offline broker foundation. **NO REAL BROKER ORDERS ARE ENABLED BY THIS PHASE.** LIVE submission is hard blocked; the IBKR adapter accepts only the bundled in-memory transport. No IBKR session, provider connection, credentials or external dependency is added. The historical backtester remains unchanged.
 
+Phase 10C2 adds an optional [local IB Gateway read-only transport and diagnostics](docs/phase-10c2-real-ibkr-readonly.md), with lazy official TWS API dependency loading. **ORDER TRANSMISSION REMAINS DISABLED.** Account mode remains independently UNKNOWN; no successful real connection is claimed. Local Gateway setup and SDK compatibility verification remain user steps.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

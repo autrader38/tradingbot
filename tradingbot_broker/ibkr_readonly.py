@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import importlib
 import logging
 import os
@@ -94,6 +95,24 @@ _STATES = {'PendingSubmit': OrderState.SUBMITTED, 'PreSubmitted': OrderState.ACK
            'Inactive': OrderState.REJECTED, 'Expired': OrderState.EXPIRED}
 
 
+def _read_opcodes(out):
+    """Only approved SDK OUT names, with exact positive-int wire values."""
+    result = {}
+    for name in _READ_MESSAGES:
+        if not hasattr(out, name):
+            continue
+        value = getattr(out, name)
+        if type(value) is not int:
+            if not (isinstance(out, type) and issubclass(out, Enum)
+                    and isinstance(value, out) and value.name == name):
+                raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+            value = value.value
+        if type(value) is not int or value <= 0:
+            raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+        result[name] = value
+    return result
+
+
 def execution_timestamp(text, configured_zone):
     if type(text) is not str:
         raise ReadOnlyError('INVALID_EXECUTION_TIMESTAMP')
@@ -130,9 +149,7 @@ def _order_id(order):
 
 
 def _make_client(api, owner, generation):
-    allowed = frozenset(getattr(api.OUT, name) for name in _READ_MESSAGES if hasattr(api.OUT, name))
-    if any(type(value) is not int or value <= 0 for value in allowed):
-        raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+    allowed = frozenset(_read_opcodes(api.OUT).values())
     # SDK logs may contain account identifiers/raw payloads. No propagation to app logs.
     for name in ('ibapi', *tuple(logging.Logger.manager.loggerDict)):
         if name == 'ibapi' or name.startswith('ibapi.'):
@@ -209,8 +226,7 @@ class ReadOnlyTWSTransport:
         api = sdk_call('SDK_INITIALIZATION_FAILED', _load_official_api)
         # Metadata only: no raw SDK client/connection class is exposed by transport.
         def metadata():
-            return SimpleNamespace(OUT=SimpleNamespace(**{
-                name: getattr(api.OUT, name) for name in _READ_MESSAGES if hasattr(api.OUT, name)}),
+            return SimpleNamespace(OUT=SimpleNamespace(**_read_opcodes(api.OUT)),
                 completed_min_version=api.completed_min_version)
         self._api = sdk_call('SDK_INITIALIZATION_FAILED', metadata)
         self._create_client = lambda generation: sdk_call('SDK_CLIENT_CONSTRUCTION_FAILED', _make_client, api, self, generation)

@@ -51,6 +51,14 @@ Protobuf/unknown message encodings fail closed with
 `UNSUPPORTED_IBAPI_WIRE_ENCODING`; they need a separately reviewed read allowlist.
 The exact locally installed official SDK/Gateway version must pass local read testing.
 
+Local inspection of the official TWS API 10.50.2 found that its OUT message IDs are
+enum members with numeric `.value` fields. The adapter normalizes only existing
+approved read-message members belonging to that OUT enum, with matching names and
+exact positive integer values. Plain integer constants remain supported; strings,
+floats, booleans and arbitrary coercible objects are rejected. Both the wire allowlist
+and read-only metadata contain plain integer opcodes. This is compatibility handling,
+not an expansion of the outbound allowlist; protobuf remains blocked.
+
 The guarded connection installs a socket descriptor before the SDK creates its
 socket. The socket view exposes no raw socket or file descriptor. It accepts only
 one legacy-framed read message at a time, or the initial bounded version-negotiation

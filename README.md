@@ -18,6 +18,7 @@ A long-only ABCD Breakout research project. **Strategy Spec v1.0 is frozen:** ap
 - [Phase 7 position management](docs/phase-7-position-management.md): single-position stops/2R/runner/EOD exits, data pause/incomplete outputs and final-exit quarantine.
 - [Phase 8 portfolio engine](docs/phase-8-portfolio-engine.md): shared OPEN/completion ordering, current-OPEN allocation, daily risk locks, cash/P&L and incomplete-run propagation.
 - [Phase 9 historical backtest](docs/phase-9-historical-backtest.md): provider-neutral historical contracts, point-in-time universe, chronological end-to-end runner, exact results and reproducibility manifest.
+- [Phase 10C1 paper integration foundation](docs/phase-10c1-paper-integration.md): broker-neutral models, backend safety gates, fake execution lifecycle and an IBKR adapter restricted to an in-memory transport.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 
@@ -32,6 +33,8 @@ Freezing the rules does not prove suitable historical data are available or esta
 The repository contains frozen documentation, a dependency-free Python strategy stack, a provider-neutral historical universe/session runner, exact research results and offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). The runner accepts supplied historical data; real provider ingestion, representative historical coverage and integration services remain unverified or unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
 
 The user separately authorized Phases 1–9: foundation, A/B/C/D detection, opening/context validation, simulated entries/exits, offline portfolio orchestration and a provider-neutral historical research runner. This does not authorize external provider connections, IBKR/TradingView connections or broker order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
+
+Separately authorized Phase 10C1 adds an isolated offline broker foundation. **NO REAL BROKER ORDERS ARE ENABLED BY THIS PHASE.** LIVE submission is hard blocked; the IBKR adapter accepts only the bundled in-memory transport. No IBKR session, provider connection, credentials or external dependency is added. The historical backtester remains unchanged.
 
 ## Safety and next phases
 

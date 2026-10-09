@@ -126,10 +126,10 @@ class WeeklyBar:
     source_id: str
     share_basis_id: str
     classification: WeeklyClassification
-    high: Decimal | None = None
-    open: Decimal | None = None
-    low: Decimal | None = None
-    close: Decimal | None = None
+    high: Decimal | Fraction | None = None
+    open: Decimal | Fraction | None = None
+    low: Decimal | Fraction | None = None
+    close: Decimal | Fraction | None = None
     data_quality_reason: str | None = None
 
     def __post_init__(self) -> None:
@@ -142,10 +142,12 @@ class WeeklyBar:
         if not isinstance(self.classification, WeeklyClassification):
             raise TypeError('Supply an explicit weekly classification')
         if self.classification == WeeklyClassification.VALID:
-            if type(self.high) is not Decimal or not self.high.is_finite() or self.high <= 0:
-                raise ValueError('Valid weekly comparison requires trustworthy positive Decimal HIGH')
+            if (type(self.high) not in (Decimal, Fraction)
+                    or (isinstance(self.high, Decimal) and not self.high.is_finite()) or self.high <= 0):
+                raise ValueError('Valid weekly comparison requires trustworthy positive exact HIGH')
             for value in (self.open, self.low, self.close):
-                if value is not None and (type(value) is not Decimal or not value.is_finite()
+                if value is not None and (type(value) not in (Decimal, Fraction)
+                                          or (isinstance(value, Decimal) and not value.is_finite())
                                           or value <= 0 or value > self.high):
                     raise ValueError('Invalid optional weekly OHLC')
             if self.low is not None and any(value is not None and value < self.low
@@ -174,7 +176,7 @@ class WeeklyEvaluation:
     left_weeks: tuple[date, ...]
     right_weeks: tuple[date, ...]
     status: str
-    high: Decimal | None
+    high: Decimal | Fraction | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -183,8 +185,8 @@ class WeeklyContextResult:
     context_weeks: tuple[date, ...]
     bars: tuple[WeeklyBar, ...]
     evaluations: tuple[WeeklyEvaluation, ...]
-    confirmed_highs: tuple[Decimal, ...]
-    nearest_resistance: Decimal | None
+    confirmed_highs: tuple[Decimal | Fraction, ...]
+    nearest_resistance: Decimal | Fraction | None
     room_pct: Fraction | None
     reason: ReasonCode | None
     status: str

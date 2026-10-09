@@ -3,12 +3,13 @@
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
+from fractions import Fraction
 
 from .codes import ReasonCode, RunStatus
 from .market import validate_timestamp
 from .states import StrategyState
 
-AuditValue = str | int | bool | Decimal | datetime | None
+AuditValue = str | int | bool | Decimal | Fraction | datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,7 +63,7 @@ class AuditRecord:
             if not isinstance(key, str) or not key or key in keys:
                 raise ValueError("Detail keys must be nonempty and unique")
             keys.add(key)
-            if value is not None and type(value) not in (str, int, bool, Decimal, datetime):
+            if value is not None and type(value) not in (str, int, bool, Decimal, Fraction, datetime):
                 raise TypeError("Audit values must be exact supported scalars, never floats")
             if isinstance(value, Decimal) and not value.is_finite():
                 raise ValueError("Audit Decimal values must be finite")

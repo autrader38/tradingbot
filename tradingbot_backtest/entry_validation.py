@@ -19,7 +19,7 @@ from .sessions import NEW_YORK, SessionCalendar, SessionPeriod, TradingSession
 
 @dataclass(frozen=True, slots=True)
 class OpeningEligibility:
-    prior_regular_close: Decimal | None
+    prior_regular_close: Decimal | Fraction | None
     static_eligible: bool
     available_at: datetime
     source_id: str
@@ -36,9 +36,10 @@ class OpeningEligibility:
         if not self.source_id or not self.share_basis_id:
             raise ValueError('Supply eligibility source and share-basis identifiers')
         if self.prior_regular_close is not None and (
-                type(self.prior_regular_close) is not Decimal or not self.prior_regular_close.is_finite()
+                type(self.prior_regular_close) not in (Decimal, Fraction)
+                or (isinstance(self.prior_regular_close, Decimal) and not self.prior_regular_close.is_finite())
                 or self.prior_regular_close <= 0):
-            raise ValueError('Supply trustworthy positive Decimal prior close, or None for unavailable')
+            raise ValueError('Supply trustworthy positive exact prior close, or None for unavailable')
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,7 +89,7 @@ class EntryApproval:
     d: MarketInterval
     d_confirmation_timestamp: datetime
     d_attempt: BreakoutAttempt
-    prior_regular_close: Decimal
+    prior_regular_close: Decimal | Fraction
     opening_change: Fraction
     b_extension: Fraction
     price_eligible: bool

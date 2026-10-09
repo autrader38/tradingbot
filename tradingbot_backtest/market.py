@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
+from fractions import Fraction
 from enum import StrEnum
 from collections.abc import Iterable
 
@@ -41,7 +42,7 @@ class MarketInterval:
     high: Decimal | None = None
     low: Decimal | None = None
     close: Decimal | None = None
-    volume: Decimal | None = None
+    volume: Decimal | Fraction | None = None
     no_trade_verified: bool = False
     data_quality_reason: str | None = None
 
@@ -68,11 +69,15 @@ def validate_interval(interval: MarketInterval) -> None:
         raise TypeError("no_trade_verified must be bool")
     prices = (interval.open, interval.high, interval.low, interval.close)
     if interval.classification == IntervalClassification.TRADED:
-        for value in (*prices, interval.volume):
+        for value in prices:
             if not isinstance(value, Decimal):
                 raise TypeError("TRADED requires Decimal OHLCV")
             if not value.is_finite():
                 raise ValueError("OHLCV must be finite")
+        if type(interval.volume) not in (Decimal, Fraction):
+            raise TypeError('TRADED requires exact Decimal or Fraction volume')
+        if isinstance(interval.volume, Decimal) and not interval.volume.is_finite():
+            raise ValueError('Volume must be finite')
         if any(value <= 0 for value in prices):
             raise ValueError("Prices must be positive")
         if interval.volume < 0:

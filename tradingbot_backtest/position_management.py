@@ -171,6 +171,7 @@ class PositionManager:
                                    last_trustworthy_at=position.entry_timestamp)
         self.next_interval = position.entry_timestamp
         self._pending: MarketInterval | None = None
+        self._completion_open: MarketInterval | None = None
         self._checkpoint = self.state
         self._records: list[AuditRecord] = []
 
@@ -372,6 +373,33 @@ class PositionManager:
                 self.finish_session()
         return self._result(start, fills)
 
+    def complete_interval(self, bar: MarketInterval) -> ManagementResult:
+        """Historical ingestion may deliver completed fields after the OPEN call.
+
+        Only unseen completion fields can differ. Known opening information and
+        already-applied OPEN fills must remain unchanged; otherwise rerun data.
+        """
+        self._require_active()
+        if (self._pending is None or bar.timestamp != self._pending.timestamp
+                or bar.security_id != self._pending.security_id or bar.ticker != self._pending.ticker):
+            raise ValueError('Completion must identify the pending OPEN interval')
+        if bar.classification in (K.MISSING,K.INVALID):
+            start,fills=len(self._records),len(self.state.fills)
+            reason=ReasonCode.INVALID_DATA if bar.classification==K.INVALID else ReasonCode.DATA_GAP
+            self._checkpoint=self.state
+            self._completion_open=self._pending
+            self._pending=bar
+            self.state=replace(self.state,status=ManagementStatus.PAUSED_DATA,failure_at=bar.end,
+                               failure_reason=reason,data_quality_reason=bar.data_quality_reason)
+            self._audit('OPEN_POSITION_COMPLETION_DATA_PAUSE',bar.end,bar,reason=reason,
+                        data_quality_reason=bar.data_quality_reason,active_stop=self.state.active_stop,
+                        remaining_quantity=self.state.remaining_quantity,shared_portfolio_pause_required=True)
+            return self._result(start,fills)
+        if (bar.classification != self._pending.classification or bar.open != self._pending.open):
+            raise ValueError('Known opening classification/price corrections require a clean rerun')
+        self._pending=bar
+        return self.on_close(bar)
+
     def _trail(self, bar: MarketInterval) -> None:
         activation = self.state.entry.config.runner_trailing_activation_traded_candles
         length = self.state.entry.config.runner_low_lookback_traded_candles
@@ -413,12 +441,31 @@ class PositionManager:
         if (self.state.status != ManagementStatus.PAUSED_DATA or self._pending is None
                 or bar.timestamp != self._pending.timestamp or bar.classification not in (K.TRADED, K.NO_TRADE)):
             raise ValueError('Supply reliable replacement for the exact paused interval')
+        # Validate the complete replay contract before restoring any checkpoint
+        # or appending audit records. Rejected data must leave the pause intact.
+        if (bar.security_id != self._pending.security_id or bar.ticker != self._pending.ticker
+                or bar.security_id != self.state.entry.approval.security_id
+                or bar.ticker != self.state.entry.approval.ticker
+                or bar.timestamp != self.next_interval
+                or not self.session.open <= bar.timestamp < self.session.close):
+            raise ValueError('Replacement must preserve paused security, ticker and session interval')
+        if (bar.timestamp == self.state.entry.entry_timestamp
+                and (bar.classification != K.TRADED or bar.open != self.state.entry.entry_price)):
+            raise ValueError('Entry replacement must preserve the Phase 6 approved opening fill')
         cause, failed_at = self.state.data_quality_reason, self.state.failure_at
         start, fills = len(self._records), len(self._checkpoint.fills)
-        self.state, self._pending = self._checkpoint, None
+        completion_open = self._completion_open
+        if completion_open is not None and (bar.classification != completion_open.classification
+                                           or bar.open != completion_open.open):
+            raise ValueError('Completion replay cannot revise the already-known OPEN')
+        self.state, self._pending = self._checkpoint, completion_open
         self._audit('DATA_REPLACEMENT_REPLAY', failed_at, bar, previous_data_quality_reason=cause,
                     replacement_source=bar.source_id, shared_checkpoint_replay_required=True)
-        self.feed(bar)
+        if completion_open is not None:
+            self._completion_open = None
+            self.complete_interval(bar)
+        else:
+            self.feed(bar)
         return self._result(start, fills)
 
     def mark_data_incomplete(self) -> ManagementResult:

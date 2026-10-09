@@ -136,6 +136,7 @@ class PortfolioEngine:
         self._next: datetime | None = None
         self._checkpoint = None
         self._replay_generation = 0
+        self._pause_phase = 'OPEN'
 
     @property
     def audit(self) -> tuple[AuditRecord, ...]:
@@ -307,6 +308,7 @@ class PortfolioEngine:
         start = len(self._records)
         bad = [security for security in self._managers if bars[security].classification in (K.MISSING, K.INVALID)]
         if bad:
+            self._pause_phase = 'OPEN'
             memo = {id(self.calendar): self.calendar, id(self.ticks): self.ticks}
             self._checkpoint = (self.state, deepcopy(self._managers, memo), deepcopy(self.constructor),
                                 self.completed, self._quarantines.copy(), self._consumed.copy(), self._next)
@@ -373,16 +375,42 @@ class PortfolioEngine:
                              construction, before_cash, self.state.cash, before_exposure, self.state.exposure))
         return self._result(start, tuple(decisions))
 
-    def on_close(self, at: datetime) -> PortfolioStep:
+    def on_close(self, at: datetime, intervals: tuple[MarketInterval, ...] | None = None) -> PortfolioStep:
         self._active()
         if self._pending is None or at != self._pending[0]+timedelta(minutes=1):
             raise ValueError('Completion must follow the pending minute OPEN')
         start = len(self._records)
         bars = {bar.security_id: bar for bar in self._pending[1]}
+        if intervals is not None:
+            replacement={bar.security_id:bar for bar in intervals}
+            if (len(replacement)!=len(intervals) or any(bar.timestamp!=self._pending[0] for bar in intervals)
+                    or any(security not in replacement for security in self._managers)):
+                raise ValueError('Supply unique completed records for every held pending interval')
+            for security in self._managers:
+                original, completed = bars[security], replacement[security]
+                if (completed.ticker != original.ticker or
+                        (completed.classification not in (K.MISSING, K.INVALID) and
+                         (completed.classification != original.classification or completed.open != original.open))):
+                    raise ValueError('Completion cannot revise an already-known OPEN; rerun corrected inputs')
+            bars.update(replacement)
+            bad=[security for security in self._managers if bars[security].classification in (K.MISSING,K.INVALID)]
+            if bad:
+                memo={id(self.calendar):self.calendar,id(self.ticks):self.ticks}
+                self._checkpoint=(self.state,deepcopy(self._managers,memo),deepcopy(self.constructor),
+                                  self.completed,self._quarantines.copy(),self._consumed.copy(),self._next)
+                self._pause_phase='COMPLETION'
+                self._pending=self._pending[0],tuple(bars.values()),self._pending[2]
+                self.state=replace(self.state,last_event_at=at)
+                for security in sorted(bad,key=lambda s:bars[s].ticker):
+                    self._apply_management(security,self._managers[security].complete_interval(bars[security]),at)
+                self._sync()
+                return self._result(start)
         self.state = replace(self.state, last_event_at=at)
         self._audit('PORTFOLIO_COMPLETION_PHASE', at, phase='INTRABAR_EXITS_THEN_PROSPECTIVE_UPDATES')
         for security in sorted(tuple(self._managers), key=lambda s: bars[s].ticker):
-            self._apply_management(security, self._managers[security].on_close(bars[security]), at)
+            manager=self._managers[security]
+            result=manager.complete_interval(bars[security]) if intervals is not None else manager.on_close(bars[security])
+            self._apply_management(security,result,at)
             if self.state.status != PortfolioStatus.ACTIVE:
                 self._sync()
                 return self._result(start)
@@ -419,14 +447,25 @@ class PortfolioEngine:
                 or any(bar.timestamp != at or bar.classification not in (K.TRADED, K.NO_TRADE)
                        for bar in replacements)):
             raise ValueError('Supply trustworthy exact-interval replacements for every paused held security')
+        if self._pause_phase == 'COMPLETION':
+            checkpoint_managers = self._checkpoint[1]
+            for security, bar in changed.items():
+                original = checkpoint_managers[security]._pending
+                if bar.classification != original.classification or bar.open != original.open or bar.ticker != original.ticker:
+                    raise ValueError('Completion replay cannot revise the already-known OPEN')
         start = len(self._records)
         (self.state, self._managers, self.constructor, self.completed,
          self._quarantines, self._consumed, self._next) = self._checkpoint
         self._pending = None
         self._replay_generation += 1
-        self._audit('PORTFOLIO_SHARED_CHECKPOINT_REPLAY', at,
+        replay_at = at+timedelta(minutes=1) if self._pause_phase == 'COMPLETION' else at
+        self._audit('PORTFOLIO_SHARED_CHECKPOINT_REPLAY', replay_at,
                     replaced='|'.join(sorted(changed)), historical_replacement=True)
-        result = self.on_open(at, tuple(changed.get(bar.security_id, bar) for bar in bars), approvals)
+        if self._pause_phase=='COMPLETION':
+            self._pending=at,tuple(changed.get(bar.security_id,bar) for bar in bars),approvals
+            result=self.on_close(at+timedelta(minutes=1),self._pending[1])
+        else:
+            result = self.on_open(at, tuple(changed.get(bar.security_id, bar) for bar in bars), approvals)
         return self._result(start, result.candidates)
 
     def mark_data_incomplete(self) -> PortfolioStep:

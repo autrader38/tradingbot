@@ -25,14 +25,15 @@ class EligibilityInputs:
 
     No market-cap, ADV, ADR or corporate-action derivation is performed here.
     """
-    prior_regular_close: Decimal
+    prior_regular_close: Decimal | Fraction
     static_eligible: bool
     share_basis_id: str
 
     def __post_init__(self) -> None:
-        if type(self.prior_regular_close) is not Decimal:
-            raise TypeError("Prior close requires an exact Decimal")
-        if decimal(self.prior_regular_close) <= 0:
+        if type(self.prior_regular_close) not in (Decimal, Fraction):
+            raise TypeError("Prior close requires an exact Decimal or Fraction")
+        if ((isinstance(self.prior_regular_close, Decimal)
+             and not self.prior_regular_close.is_finite()) or self.prior_regular_close <= 0):
             raise ValueError("Prior close must be trustworthy and positive")
         if (type(self.static_eligible) is not bool or not isinstance(self.share_basis_id, str)
                 or not self.share_basis_id.strip()):
@@ -55,7 +56,7 @@ class ABState:
     impulse_qualified: bool = False
     confirmation_candles: tuple[MarketInterval, ...] = ()
     logical_b_confirmation_timestamp: datetime | None = None
-    impulse_volumes: tuple[Decimal, ...] = ()
+    impulse_volumes: tuple[Decimal | Fraction, ...] = ()
     impulse_volume_average: Fraction | None = None
     frozen_impulse_volume_average: Fraction | None = None
     termination: SetupTermination | None = None

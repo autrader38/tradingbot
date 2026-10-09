@@ -16,6 +16,7 @@ A long-only ABCD Breakout research project. **Strategy Spec v1.0 is frozen:** ap
 - [Phase 5 entry validation](docs/phase-5-entry-validation.md): opening-only checks, mandatory 15-minute/weekly context and approved candidates without fills.
 - [Phase 6 trade construction](docs/phase-6-trade-construction.md): supplied ticks/account state, exact levels/sizing and simulated zero-friction opening entries.
 - [Phase 7 position management](docs/phase-7-position-management.md): single-position stops/2R/runner/EOD exits, data pause/incomplete outputs and final-exit quarantine.
+- [Phase 8 portfolio engine](docs/phase-8-portfolio-engine.md): shared OPEN/completion ordering, current-OPEN allocation, daily risk locks, cash/P&L and incomplete-run propagation.
 
 **RESEARCH BACKTEST MODEL — V1.0**
 
@@ -27,9 +28,9 @@ Freezing the rules does not prove suitable historical data are available or esta
 
 ## Current repository
 
-The repository contains frozen documentation, a dependency-free Python foundation, A/B/C/D detection, opening/context validation, simulated entry construction and single-position exit management with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). A completed historical backtester, scanner and portfolio/integration service remain unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
+The repository contains frozen documentation, a dependency-free Python foundation, A/B/C/D detection, opening/context validation, simulated entry/exit management and a shared portfolio/session engine with offline tests, a reference image, and a [historical chart-only Pine prototype](strategy/README.md). Historical universe discovery, bulk dataset ingestion, a completed data-backed backtest runner and integration services remain unimplemented. The prototype's labels, parameters, pivots and moving-average filters do not implement frozen v1.0. Do not use it as the canonical strategy or connect its output to a broker.
 
-The user separately authorized Phases 1–7: foundation, A/B/C/D detection, opening/context validation and single-position simulated entries/exits. This does not authorize a portfolio event loop, IBKR/TradingView connections or broker order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
+The user separately authorized Phases 1–8: foundation, A/B/C/D detection, opening/context validation, simulated entries/exits and offline portfolio orchestration. This does not authorize historical scanning, bulk backtest ingestion, IBKR/TradingView connections or broker order placement. Later phases require separate authorization; paper and live execution require separately reviewed data, execution and integration readiness.
 
 ## Safety and next phases
 

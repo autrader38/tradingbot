@@ -149,7 +149,8 @@ def _order_id(order):
 
 
 def _make_client(api, owner, generation):
-    allowed = frozenset(_read_opcodes(api.OUT).values())
+    read_opcodes = _read_opcodes(api.OUT)
+    allowed = frozenset(read_opcodes.values())
     # SDK logs may contain account identifiers/raw payloads. No propagation to app logs.
     for name in ('ibapi', *tuple(logging.Logger.manager.loggerDict)):
         if name == 'ibapi' or name.startswith('ibapi.'):
@@ -199,7 +200,25 @@ def _make_client(api, owner, generation):
         def sendMsgProtoBuf(self, *args, **kwargs):
             # A new SDK encoding must receive its own reviewed read allowlist.
             raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
-        def sendMsg(self, message):
+        def sendMsg(self, msgId, *payload):
+            if payload:
+                if len(payload) != 1 or type(payload[0]) is not str:
+                    raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
+                if type(msgId) is int:
+                    opcode = msgId
+                elif (isinstance(api.OUT, type) and issubclass(api.OUT, Enum)
+                      and isinstance(msgId, api.OUT) and msgId.name in read_opcodes
+                      and getattr(api.OUT, msgId.name) is msgId):
+                    opcode = msgId.value
+                else:
+                    raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
+                if type(opcode) is not int or opcode <= 0 or opcode not in allowed:
+                    raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
+                # Preserve the SDK's original enum/int argument for its own framing.
+                return super().sendMsg(msgId, payload[0])
+
+            # Older SDK/test doubles carry the opcode inside one string message.
+            message = msgId
             try:
                 if type(message) is not str:
                     raise ValueError

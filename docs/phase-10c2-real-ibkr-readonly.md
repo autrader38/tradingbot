@@ -59,6 +59,15 @@ floats, booleans and arbitrary coercible objects are rejected. Both the wire all
 and read-only metadata contain plain integer opcodes. This is compatibility handling,
 not an expansion of the outbound allowlist; protobuf remains blocked.
 
+Official TWS API 10.50.2 uses `sendMsg(msgId, msg)`, including for START_API.
+The adapter validates the supplied opcode against the same approved read names,
+normalizes a matching SDK OUT enum member only for validation, and requires an exact
+string payload. It then delegates the original enum/int and payload as two arguments
+to the SDK's framing implementation. Older single-string calls remain guarded.
+The unchanged connection/socket guard still checks the final bytes: this signature
+compatibility does not enable additional broker actions, protobuf or unsupported
+binary message-ID framing. Such encodings continue to fail closed.
+
 The guarded connection installs a socket descriptor before the SDK creates its
 socket. The socket view exposes no raw socket or file descriptor. It accepts only
 one legacy-framed read message at a time, or the initial bounded version-negotiation

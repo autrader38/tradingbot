@@ -48,6 +48,8 @@ Phase 10C3C2A adds an [internal offline atomic NEW-entry bridge](docs/phase-10c3
 
 Phase 10C3C2B adds [offline callback attribution and confirmation](docs/phase-10c3c2b-paper-callback-confirmation.md): exact validated orderRef, immutable pending identity, sanitized bounded callback evidence and transport-lifetime sequence. Strong broker observation keeps further entries blocked for local state reconciliation; executions, conflicts and generation loss invalidate authorization and require reconciliation. **BROKER_OBSERVED DOES NOT MEAN STRATEGY ACCEPTANCE.** No real connection/order, PAPER attestation, reconciliation clear or production write route is provided. Gateway Read-Only remains unchanged.
 
+Phase 10C3C2C1 adds [private read-side reconciliation evidence](docs/phase-10c3c2c1-read-reconciliation-evidence.md): immutable exact identity, protobuf presence, bounded capture and explicit collection completeness. Public snapshots remain unchanged. **CAPTURE DOES NOT CLEAR RECONCILIATION OR ENABLE ORDERS.** Future C3C2C2 must consume a fresh post-dispatch collection; completed/execution history remains coverage-limited.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

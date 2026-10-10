@@ -1,13 +1,14 @@
 """Optional official TWS SDK, read requests only; no network on module import."""
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, replace, fields
+from decimal import Decimal
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import importlib
 import logging
 import os
 import socket
-from threading import Condition, Thread, RLock
+from threading import Condition, Thread, RLock, get_ident
 from time import monotonic
 from types import SimpleNamespace
 from zoneinfo import ZoneInfo
@@ -167,6 +168,284 @@ def _order_id(order):
     return f'ibkr-client-{order.clientId}-order-{order.orderId}'
 
 
+_RECONCILIATION_CAPACITY = 1024  # Combined order/execution records per collection.
+_RECONCILIATION_SOURCES = ('orders', 'completed', 'executions')
+
+
+class _PrivateReconciliationValue:
+    __slots__ = ()
+
+    def __repr__(self):
+        return '<PrivateReadReconciliationEvidence>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationPresence(_PrivateReconciliationValue):
+    supplied: frozenset[str]
+    order_id: bool
+    client_id: bool
+    perm_id: bool
+    order_ref: bool
+    top_order_id: bool = False
+    nested_order_id: bool = False
+    order_state: bool = False
+    status: bool = False
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationOrderEvidence(_PrivateReconciliationValue):
+    generation: int
+    sequence: int
+    source: str
+    encoding: str
+    order_id: int | None
+    client_id: int | None
+    perm_id: int | None
+    order_ref: str | None
+    con_id: int
+    sec_type: str
+    exchange: str
+    symbol: str
+    currency: str
+    action: str
+    quantity: Decimal
+    order_type: str
+    tif: str
+    status: str | None
+    presence: _ReconciliationPresence
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationExecutionEvidence(_PrivateReconciliationValue):
+    generation: int
+    sequence: int
+    encoding: str
+    order_id: int | None
+    client_id: int | None
+    perm_id: int | None
+    order_ref: str | None
+    exec_id: str
+    con_id: int
+    sec_type: str
+    exchange: str
+    symbol: str
+    currency: str
+    side: str
+    shares: Decimal
+    price: Decimal
+    cumulative_quantity: Decimal | None
+    execution_time: str | None
+    presence: _ReconciliationPresence
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationCollectionState(_PrivateReconciliationValue):
+    source: str
+    supported: bool | None
+    requested: bool
+    request_id: int | None
+    state: str
+    coverage: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationReadSnapshot(_PrivateReconciliationValue):
+    generation: int
+    start_marker: int
+    completion_marker: int
+    started_monotonic: float
+    completed_monotonic: float
+    last_sequence: int
+    outcome: str
+    collections: tuple[_ReconciliationCollectionState, ...]
+    orders: tuple[_ReconciliationOrderEvidence, ...]
+    executions: tuple[_ReconciliationExecutionEvidence, ...]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationProtoEnvelope(_PrivateReconciliationValue):
+    generation: int
+    source: str
+    thread_id: int
+    values: tuple
+    supplied: frozenset[str]
+
+
+def _reconciliation_text(value, *, reference=False):
+    if type(value) is not str or len(value) > 100:
+        raise ValueError()
+    if not value.isascii() or any(ord(c) < 32 or ord(c) > 126 for c in value):
+        raise ValueError()
+    if not value and not reference:
+        raise ValueError()
+    return value or None
+
+
+def _reconciliation_integer(value, *, positive=False, wide=False):
+    maximum = 2**63 - 1 if wide else 2_147_483_647
+    if type(value) is not int or not (1 if positive else 0) <= value <= maximum:
+        raise ValueError()
+    return value
+
+
+def _reconciliation_amount(value, *, positive=False, price=False):
+    if not price and type(value) not in (Decimal, str, int):
+        raise ValueError()
+    value = broker_decimal(value)
+    parts = value.as_tuple()
+    if (value < 0 or positive and value == 0 or len(parts.digits) > 64
+            or not -64 <= parts.exponent <= 64):
+        raise ValueError()
+    return value
+
+
+def _reconciliation_field(name, value):
+    if name in ('order_id', 'top_order_id', 'client_id'):
+        return _reconciliation_integer(value)
+    if name == 'perm_id':
+        return _reconciliation_integer(value, wide=True) or None
+    if name == 'con_id':
+        return _reconciliation_integer(value, positive=True, wide=True)
+    if name in ('quantity', 'shares'):
+        return _reconciliation_amount(value, positive=True)
+    if name == 'cumulative_quantity':
+        return _reconciliation_amount(value)
+    if name == 'price':
+        return _reconciliation_amount(value, price=True)
+    return _reconciliation_text(value, reference=name == 'order_ref')
+
+
+_RECONCILIATION_CONTRACT_FIELDS = (('con_id', 'conId'), ('sec_type', 'secType'),
+    ('exchange', 'exchange'), ('symbol', 'symbol'), ('currency', 'currency'))
+_RECONCILIATION_ID_FIELDS = (('order_id', 'orderId'), ('client_id', 'clientId'),
+    ('perm_id', 'permId'), ('order_ref', 'orderRef'))
+_RECONCILIATION_ORDER_FIELDS = (('action', 'action'), ('quantity', 'totalQuantity'),
+    ('order_type', 'orderType'), ('tif', 'tif'))
+_RECONCILIATION_EXECUTION_FIELDS = (('exec_id', 'execId'), ('side', 'side'),
+    ('shares', 'shares'), ('price', 'price'), ('cumulative_quantity', 'cumQty'),
+    ('execution_time', 'time'))
+
+
+def _reconciliation_has_field(raw, name):
+    present = raw.HasField(name)
+    if type(present) is not bool:
+        raise ValueError()
+    return present
+
+
+def _reconciliation_proto_copy(generation, source, raw):
+    values, supplied = {}, set()
+    payload_name = 'execution' if source == 'executions' else 'order'
+    for group, specification in (
+        ('contract', _RECONCILIATION_CONTRACT_FIELDS),
+        (payload_name, _RECONCILIATION_ID_FIELDS + (
+            _RECONCILIATION_EXECUTION_FIELDS if source == 'executions'
+            else _RECONCILIATION_ORDER_FIELDS))):
+        if not _reconciliation_has_field(raw, group):
+            raise ValueError()
+        payload = getattr(raw, group)
+        for field, sdk_name in specification:
+            if _reconciliation_has_field(payload, sdk_name):
+                values[field] = _reconciliation_field(field, getattr(payload, sdk_name))
+                supplied.add(field)
+    if source == 'orders' and _reconciliation_has_field(raw, 'orderId'):
+        values['top_order_id'] = _reconciliation_field('top_order_id', raw.orderId)
+        supplied.add('top_order_id')
+        if 'order_id' in supplied and values['order_id'] != values['top_order_id']:
+            raise ValueError()
+    if source != 'executions':
+        # Both order sources require lifecycle structure. Open orders may omit
+        # status explicitly; completed-order lifecycle evidence may not.
+        if not _reconciliation_has_field(raw, 'orderState'):
+            raise ValueError()
+        supplied.add('order_state')
+        lifecycle = raw.orderState
+        if _reconciliation_has_field(lifecycle, 'status'):
+            status = lifecycle.status
+            _reconciliation_text(status, reference=True)  # Validate without normalizing.
+            if source == 'completed' and not status:
+                raise ValueError()
+            values['status'] = status
+            supplied.add('status')
+        elif source == 'completed':
+            raise ValueError()
+    required = {n for n, _ in _RECONCILIATION_CONTRACT_FIELDS}
+    required.update(('exec_id', 'side', 'shares', 'price') if source == 'executions'
+                    else (n for n, _ in _RECONCILIATION_ORDER_FIELDS))
+    if not required <= supplied:
+        raise ValueError()
+    return _ReconciliationProtoEnvelope(generation, source, get_ident(),
+        tuple(sorted(values.items())), frozenset(supplied))
+
+
+def _reconciliation_decoded_copy(generation, sequence, source, contract, payload,
+                                  state, callback_order_id, envelope):
+    specification = _RECONCILIATION_CONTRACT_FIELDS + (
+        _RECONCILIATION_EXECUTION_FIELDS if source == 'executions'
+        else _RECONCILIATION_ORDER_FIELDS)
+    # Contract fields live on Contract, not the SDK Order/Execution object.
+    contract_names = {n for n, _ in _RECONCILIATION_CONTRACT_FIELDS}
+    values, supplied = {}, set()
+    raw_values = {} if envelope is None else dict(envelope.values)
+    for field, sdk_name in specification + _RECONCILIATION_ID_FIELDS:
+        if source == 'completed' and envelope is None and field in ('order_id', 'client_id'):
+            continue  # Legacy decoder does NOT supply these IDs. Never inspect defaults.
+        if envelope is not None and field not in envelope.supplied:
+            continue  # Never read absent protobuf defaults as supplied identity.
+        obj = contract if field in contract_names else payload
+        value = getattr(obj, sdk_name, None)
+        if value is None and envelope is None and field in (
+                'order_ref', 'cumulative_quantity', 'execution_time'):
+            continue
+        values[field] = _reconciliation_field(field, value)
+        supplied.add(field)
+        if envelope is not None and values[field] != raw_values[field]:
+            raise ValueError()
+    if source == 'orders':
+        if envelope is None:
+            if _reconciliation_integer(callback_order_id) != values['order_id']:
+                raise ValueError()
+        elif 'top_order_id' in envelope.supplied:
+            top = raw_values['top_order_id']
+            if (_reconciliation_integer(callback_order_id) != top
+                    or _reconciliation_integer(payload.orderId) != top):
+                raise ValueError()
+            values['order_id'] = top
+    if envelope is not None:
+        supplied = set(envelope.supplied)
+    status = None
+    if source != 'executions':
+        if envelope is None:
+            status = getattr(state, 'status', '')
+            if type(status) is not str:
+                raise ValueError()
+            if state is not None:
+                supplied.update(('order_state', 'status'))  # Legacy decoder contract.
+        elif 'status' in envelope.supplied:
+            status = getattr(state, 'status', None)
+            if type(status) is not str or status != raw_values['status']:
+                raise ValueError()
+        # Absent protobuf status never reads or promotes a decoded default.
+        if status is not None:
+            _reconciliation_text(status, reference=True)
+            status = status if status in _STATES else 'UNKNOWN'
+    presence = _ReconciliationPresence(frozenset(supplied),
+        'order_id' in supplied or 'top_order_id' in supplied, 'client_id' in supplied,
+        'perm_id' in supplied, 'order_ref' in supplied, 'top_order_id' in supplied,
+        envelope is not None and 'order_id' in supplied,
+        'order_state' in supplied, 'status' in supplied)
+    identity = tuple(values.get(n) for n in ('order_id', 'client_id', 'perm_id', 'order_ref'))
+    common = tuple(values[n] for n, _ in _RECONCILIATION_CONTRACT_FIELDS)
+    encoding = 'LEGACY' if envelope is None else 'PROTOBUF'
+    if source == 'executions':
+        return _ReconciliationExecutionEvidence(generation, sequence, encoding,
+            *identity, values['exec_id'], *common, values['side'], values['shares'],
+            values['price'], values.get('cumulative_quantity'), values.get('execution_time'), presence)
+    return _ReconciliationOrderEvidence(generation, sequence,
+        'OPEN_ORDER' if source == 'orders' else 'COMPLETED_ORDER', encoding,
+        *identity, *common, *(values[n] for n, _ in _RECONCILIATION_ORDER_FIELDS), status, presence)
+
+
 def _make_client(api, owner, generation):
     read_opcodes = _read_opcodes(api.OUT)
     allowed = frozenset(read_opcodes.values())
@@ -190,13 +469,26 @@ def _make_client(api, owner, generation):
         def position(self, account, contract, pos, avgCost):
             owner._callback(generation, 'position', account, contract, pos, avgCost)
         def positionEnd(self): owner._callback(generation, 'positions_end')
+        def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
+                        permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
+            owner._reconciliation_intervening(generation)
+            inherited = getattr(super(), 'orderStatus', None)
+            if inherited is not None:
+                return inherited(orderId, status, filled, remaining, avgFillPrice,
+                    permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice)
+        def openOrderProtoBuf(self, raw): owner._reconciliation_proto(generation, 'orders', raw)
+        def completedOrderProtoBuf(self, raw): owner._reconciliation_proto(generation, 'completed', raw)
+        def executionDetailsProtoBuf(self, raw): owner._reconciliation_proto(generation, 'executions', raw)
         def openOrder(self, orderId, contract, order, orderState):
+            owner._reconciliation_decoded(generation, 'orders', contract, order, orderState, orderId)
             owner._callback(generation, 'order', contract, order, orderState, False)
         def openOrderEnd(self): owner._callback(generation, 'orders_end')
         def completedOrder(self, contract, order, orderState):
+            owner._reconciliation_decoded(generation, 'completed', contract, order, orderState)
             owner._callback(generation, 'order', contract, order, orderState, True)
         def completedOrdersEnd(self): owner._callback(generation, 'completed_end')
         def execDetails(self, reqId, contract, execution):
+            owner._reconciliation_decoded(generation, 'executions', contract, execution, request_id=reqId)
             owner._callback(generation, 'execution', reqId, contract, execution)
         def execDetailsEnd(self, reqId): owner._callback(generation, 'executions_end', reqId)
         def commissionReport(self, commissionReport): owner._callback(generation, 'commission', commissionReport)
@@ -290,6 +582,10 @@ class ReadOnlyTWSTransport:
         self._event_sequence = 0
         self._snapshot = None
         self._diagnostics = []
+        self._reconciliation_sequence = 0  # Transport lifetime, never reset.
+        self._reconciliation_marker = 0
+        self._reconciliation_result = None
+        self._reconciliation_failure = None
         self._reset()
 
     def _reset(self):
@@ -309,6 +605,181 @@ class ReadOnlyTWSTransport:
         self._collecting = True
         self._phase = {name: 'NOT_REQUESTED' for name in
                        ('accounts', 'summary', 'positions', 'orders', 'completed', 'executions', 'time')}
+        self._reconciliation_begin()
+
+    def _reconciliation_begin(self):
+        if hasattr(self, '_reconciliation_collections') and self._reconciliation_result is None:
+            self._reconciliation_fail('GENERATION_LOST')
+        self._reconciliation_marker += 1
+        self._reconciliation_start_marker = self._reconciliation_marker
+        self._reconciliation_started = monotonic()
+        self._reconciliation_generation = self._generation
+        self._reconciliation_result = None
+        self._reconciliation_failure = None
+        self._reconciliation_envelope = None  # Capacity ONE across all callback types.
+        self._reconciliation_encodings = {}
+        self._reconciliation_orders = []
+        self._reconciliation_executions = {}
+        self._reconciliation_collections = {
+            name: _ReconciliationCollectionState(name, None if name == 'completed' else True,
+                False, None, 'NOT_REQUESTED',
+                'CURRENT_OPEN_ORDERS' if name == 'orders' else 'HISTORY_LIMITED')
+            for name in _RECONCILIATION_SOURCES}
+
+    def _reconciliation_finish(self, outcome):
+        if self._reconciliation_result is not None:
+            return
+        if self._reconciliation_failure is not None and outcome != self._reconciliation_failure:
+            return
+        if outcome == 'COLLECTED' and any(
+                state.state not in ('COMPLETED', 'UNAVAILABLE')
+                for state in self._reconciliation_collections.values()):
+            self._reconciliation_fail('FAILED')
+            return
+        if self._reconciliation_envelope is not None:
+            self._reconciliation_fail('MALFORMED', self._reconciliation_envelope.source)
+            return
+        self._reconciliation_marker += 1
+        self._reconciliation_result = _ReconciliationReadSnapshot(
+            self._reconciliation_generation, self._reconciliation_start_marker,
+            self._reconciliation_marker, self._reconciliation_started, monotonic(),
+            self._reconciliation_sequence, outcome,
+            tuple(self._reconciliation_collections[n] for n in _RECONCILIATION_SOURCES),
+            tuple(self._reconciliation_orders), tuple(self._reconciliation_executions.values()))
+
+    def _reconciliation_fail(self, outcome, source=None):
+        # Caller holds condition. Safety committed before constructing/reporting a result.
+        if self._reconciliation_result is not None or self._reconciliation_failure is not None:
+            return
+        self._reconciliation_failure = outcome
+        self._reconciliation_envelope = None
+        for name, state in self._reconciliation_collections.items():
+            if name == source or state.state == 'ACTIVE':
+                self._reconciliation_collections[name] = replace(state, state=outcome)
+        try:
+            self._reconciliation_finish(outcome)
+        except Exception:
+            # Reporting failure cannot undo the latch or replace an interruption.
+            # Private snapshot access stays unavailable rather than claiming success.
+            pass
+
+    def _reconciliation_snapshot(self):
+        """Private immutable terminal capture only. Never connect, refresh or clear."""
+        with self._condition:
+            if self._reconciliation_result is None:
+                raise ReadOnlyError('RECONCILIATION_READ_INCOMPLETE')
+            return self._reconciliation_result
+
+    def _reconciliation_intervening(self, generation):
+        """Boundary only: no status arguments, evidence or earlier-plane locks."""
+        with self._condition:
+            if type(generation) is not int or generation != self._generation:
+                return
+            if self._reconciliation_envelope is not None:
+                self._reconciliation_fail('MALFORMED', self._reconciliation_envelope.source)
+
+    def _reconciliation_request(self, name, request_id=None):
+        if (name not in _RECONCILIATION_SOURCES or self._reconciliation_result is not None
+                or self._reconciliation_failure is not None):
+            return
+        prior = self._reconciliation_collections[name]
+        if name == 'executions':
+            try:
+                _reconciliation_integer(request_id)
+            except Exception:
+                self._reconciliation_fail('MALFORMED', name)
+                return
+        self._reconciliation_collections[name] = replace(prior, supported=True,
+            requested=True, request_id=request_id, state='ACTIVE')
+
+    def _reconciliation_complete(self, name):
+        if self._reconciliation_result is not None or self._reconciliation_failure is not None:
+            return
+        if self._reconciliation_envelope is not None:
+            self._reconciliation_fail('MALFORMED', self._reconciliation_envelope.source)
+            return
+        if name not in _RECONCILIATION_SOURCES:
+            return
+        state = self._reconciliation_collections[name]
+        if state.state == 'ACTIVE':
+            self._reconciliation_collections[name] = replace(state, state='COMPLETED')
+
+    def _reconciliation_proto(self, generation, source, raw):
+        with self._condition:
+            if (type(generation) is not int or generation != self._generation
+                    or not self._collecting or self._reconciliation_result is not None
+                    or self._reconciliation_failure is not None):
+                return  # Do not touch stale raw objects.
+            try:
+                if (source not in _RECONCILIATION_SOURCES or self._phase[source] != 'ACTIVE'
+                        or self._reconciliation_envelope is not None
+                        or self._reconciliation_encodings.get(source) == 'LEGACY'):
+                    raise ValueError()
+                envelope = _reconciliation_proto_copy(generation, source, raw)
+                self._reconciliation_encodings[source] = 'PROTOBUF'
+                self._reconciliation_envelope = envelope
+            except BaseException as error:
+                self._reconciliation_fail('MALFORMED' if isinstance(error, Exception) else 'INTERRUPTED', source)
+                if not isinstance(error, Exception):
+                    raise
+
+    def _reconciliation_decoded(self, generation, source, contract, payload,
+                                state=None, callback_order_id=None, request_id=None):
+        with self._condition:
+            if (type(generation) is not int or generation != self._generation
+                    or not self._collecting or self._reconciliation_result is not None
+                    or self._reconciliation_failure is not None):
+                return
+            try:
+                envelope = self._reconciliation_envelope
+                if source not in _RECONCILIATION_SOURCES or self._phase[source] != 'ACTIVE':
+                    if envelope is not None:
+                        raise ValueError()
+                    return
+                if envelope is not None:
+                    if (envelope.generation != generation or envelope.source != source
+                            or envelope.thread_id != get_ident()):
+                        raise ValueError()
+                    self._reconciliation_envelope = None  # One-shot, even on later failure.
+                elif self._reconciliation_encodings.get(source) == 'PROTOBUF':
+                    raise ValueError()  # Replayed decoded callback is NOT legacy proof.
+                else:
+                    self._reconciliation_encodings[source] = 'LEGACY'
+                if source == 'executions':
+                    if type(request_id) is not int or request_id != self._execution_id:
+                        if envelope is not None:
+                            raise ValueError()
+                        return
+                    account = payload.acctNumber
+                else:
+                    account = payload.account
+                if type(account) is not str:
+                    raise ValueError()
+                if account not in self._accounts:
+                    return  # Existing private account filtering; never retain the identifier.
+                event = _reconciliation_decoded_copy(generation, self._reconciliation_sequence + 1,
+                    source, contract, payload, state, callback_order_id, envelope)
+                if source == 'executions':
+                    prior = self._reconciliation_executions.get(event.exec_id)
+                    if prior is not None:
+                        if any(getattr(prior, f.name) != getattr(event, f.name)
+                               for f in fields(event) if f.name != 'sequence'):
+                            raise ValueError()
+                        self._reconciliation_sequence += 1
+                        return
+                if (len(self._reconciliation_orders) + len(self._reconciliation_executions)
+                        >= _RECONCILIATION_CAPACITY):
+                    self._reconciliation_fail('OVERFLOW', source)
+                    return
+                self._reconciliation_sequence += 1
+                if source == 'executions':
+                    self._reconciliation_executions[event.exec_id] = event
+                else:
+                    self._reconciliation_orders.append(event)
+            except BaseException as error:
+                self._reconciliation_fail('MALFORMED' if isinstance(error, Exception) else 'INTERRUPTED', source)
+                if not isinstance(error, Exception):
+                    raise
 
     @property
     def connected(self):
@@ -416,10 +887,15 @@ class ReadOnlyTWSTransport:
         with self._condition:
             if generation != self._generation:
                 return  # Obsolete socket generation can never restore this session.
+            if self._reconciliation_envelope is not None:
+                # Qualified decoder pairing is immediate. An intervening callback
+                # cannot leave an envelope available for a later, unrelated event.
+                self._reconciliation_fail('MALFORMED', self._reconciliation_envelope.source)
             now = self._clock()
             validate_timestamp(now)
             try:
                 if kind == 'closed' or (kind == 'error' and args[0] in _DISCONNECT_CODES):
+                    self._reconciliation_fail('FAILED')
                     if self._disconnect_emitted:
                         return
                     self._disconnect_emitted = True
@@ -435,6 +911,7 @@ class ReadOnlyTWSTransport:
                     self._diagnostics.append(('INFORMATIONAL' if code in _INFO_CODES else 'BROKER_ERROR', code))
                     if code not in _INFO_CODES:
                         self._failure = 'IB_GATEWAY_REQUEST_FAILED'
+                        self._reconciliation_fail('FAILED')
                 elif not self._collecting:
                     return
                 elif kind not in ('ready', 'commission') and not self._active_callback(kind, args):
@@ -486,7 +963,8 @@ class ReadOnlyTWSTransport:
                         broker_decimal(execution.price), contract.currency, stamp)
                     self._put(self._fills_read, fill.fill_id, fill)
                 elif kind == 'executions_end':
-                    if args[0] == self._execution_id: self._complete('executions')
+                    if type(args[0]) is int and args[0] == self._execution_id:
+                        self._complete('executions')
                 elif kind == 'commission':
                     report = args[0]
                     value = getattr(report, 'commission', None)
@@ -502,6 +980,7 @@ class ReadOnlyTWSTransport:
                 self._last_observed = now
             except (ValueError, TypeError, AttributeError, KeyError, OverflowError) as error:
                 self._failure = error.code if isinstance(error, ReadOnlyError) else 'MALFORMED_BROKER_CALLBACK'
+                self._reconciliation_fail('MALFORMED')
             finally:
                 self._condition.notify_all()
 
@@ -514,6 +993,7 @@ class ReadOnlyTWSTransport:
         return collection is not None and self._phase[collection] == 'ACTIVE'
 
     def _complete(self, name):
+        self._reconciliation_complete(name)
         self._phase[name] = 'COMPLETED'
         self._done.add(name)
 
@@ -522,18 +1002,30 @@ class ReadOnlyTWSTransport:
             if generation != self._generation:
                 raise ReadOnlyError('OBSOLETE_IBKR_GENERATION')
             self._phase[name] = 'ACTIVE'
+            self._reconciliation_request(name, args[0] if name == 'executions' else None)
             client = self._client
-        method = getattr(client, method)
-        method(*args)
+        try:
+            method = getattr(client, method)
+            method(*args)
+        except BaseException as error:
+            with self._condition:
+                self._reconciliation_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED', name)
+            raise
 
     def _wait(self, predicate, deadline):
         with self._condition:
             while not predicate():
-                if self._failure: raise ReadOnlyError(self._failure)
+                if self._failure:
+                    self._reconciliation_fail('FAILED')
+                    raise ReadOnlyError(self._failure)
                 remaining = deadline - monotonic()
-                if remaining <= 0: raise ReadOnlyError('IB_GATEWAY_TIMEOUT')
+                if remaining <= 0:
+                    self._reconciliation_fail('TIMED_OUT')
+                    raise ReadOnlyError('IB_GATEWAY_TIMEOUT')
                 self._condition.wait(min(remaining, 0.25))
-            if self._failure: raise ReadOnlyError(self._failure)
+            if self._failure:
+                self._reconciliation_fail('FAILED')
+                raise ReadOnlyError(self._failure)
 
     def _run(self, client, generation):
         try:
@@ -585,7 +1077,13 @@ class ReadOnlyTWSTransport:
             completed_available = (self._client.serverVersion() >= self._api.completed_min_version and
                                    hasattr(self._api.OUT, 'REQ_COMPLETED_ORDERS'))
             if completed_available: self._request(generation, 'completed', 'reqCompletedOrders', False)
-            else: self._done.add('completed')
+            else:
+                with self._condition:
+                    if self._reconciliation_result is None:
+                        prior = self._reconciliation_collections['completed']
+                        self._reconciliation_collections['completed'] = replace(
+                            prior, supported=False, state='UNAVAILABLE')
+                self._done.add('completed')
             self._request(generation, 'executions', 'reqExecutions', self._execution_id, self._execution_filter())
             self._request(generation, 'time', 'reqCurrentTime')
             self._wait(lambda: {'summary', 'positions', 'orders', 'completed', 'executions', 'time'} <= self._done, deadline)
@@ -609,10 +1107,13 @@ class ReadOnlyTWSTransport:
                     tuple(self._completed_read[k] for k in sorted(self._completed_read)),
                     tuple(self._fills_read[k] for k in sorted(self._fills_read)), commissions,
                     self._broker_time, self._client.serverVersion(), completed_available)
+                self._reconciliation_finish('COLLECTED')
                 self._collecting = False
                 return self._snapshot
         except Exception as error:
             code = error.code if isinstance(error, ReadOnlyError) else 'IB_GATEWAY_CONNECTION_FAILED'
+            with self._condition:
+                self._reconciliation_fail('FAILED')
             self.disconnect()
             raise ReadOnlyError(code) from None
 
@@ -622,6 +1123,7 @@ class ReadOnlyTWSTransport:
 
     def _disconnect(self):
         with self._condition:
+            self._reconciliation_fail('GENERATION_LOST')
             self._generation += 1
             client, self._client = self._client, None
             thread, self._thread = self._thread, None

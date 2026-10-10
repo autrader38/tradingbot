@@ -44,6 +44,8 @@ Phase 10C3B adds [memory-only session authorization](docs/phase-10c3b-paper-auth
 
 Phase 10C3C1 adds a [separate offline paper write-transport foundation](docs/phase-10c3c1-paper-write-transport.md): exact SDK/wire contracts, generation-bound order IDs and internal dispatch outcomes. **NO REAL CONNECTION OR ORDER TRANSMISSION.** The existing read-only path remains unchanged; production authorization/risk/dispatch integration is deferred to Phase 10C3C2.
 
+Phase 10C3C2A adds an [internal offline atomic NEW-entry bridge](docs/phase-10c3c2a-atomic-paper-entry-dispatch.md), combining explicit PLACE_ORDER authorization, authenticated enrollment, existing risk gates, controls and verified contracts with C1 private dispatch. One coordinator is permanently bound to each transport; exact challenge/proof validation occurs inside final dispatch commitment, and reconciliation outranks pending confirmation. **NO REAL PAPER TRADING IS ENABLED.** AccountMode remains UNKNOWN; SDK normal return means pending confirmation only. Production Broker APIs remain read-only, Gateway settings remain unchanged, and callback confirmation/reconciliation is deferred to Phase 10C3C2B.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

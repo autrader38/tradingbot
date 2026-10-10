@@ -260,6 +260,7 @@ Private session/dispatch methods support offline qualification only in this phas
         self._callback_generation = 0
         self._lifetime_order_floor = MIN_ORDER_ID
         self._lifetime_order_ids_exhausted = False
+        self.__dispatch_binding = None  # Strong lifetime owner + captured methods.
         self._create_client = lambda generation: sdk_call('SDK_CLIENT_CONSTRUCTION_FAILED', _make_paper_client, api, self, generation)
         self._build_order = lambda spec: self._sdk_order(api, spec)
         self._build_cancel = lambda: sdk_call('SDK_OBJECT_CONSTRUCTION_FAILED', api.OrderCancel)
@@ -269,6 +270,33 @@ Private session/dispatch methods support offline qualification only in this phas
 
     @property
     def account_mode(self): return AccountMode.UNKNOWN
+
+    def __setattr__(self, name, value):
+        if name == '_PaperTWSTransport__dispatch_binding' and hasattr(self, name):
+            raise ReadOnlyError('PAPER_COORDINATOR_BINDING_IMMUTABLE')
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        if name == '_PaperTWSTransport__dispatch_binding':
+            raise ReadOnlyError('PAPER_COORDINATOR_BINDING_IMMUTABLE')
+        super().__delattr__(name)
+
+    @property
+    def _dispatch_coordinator_owner(self):
+        return None if self.__dispatch_binding is None else self.__dispatch_binding[0]
+
+    def _claim_dispatch_coordinator(self, owner):
+        from .paper_dispatch import _PaperOrderDispatchCoordinator
+        if type(owner) is not _PaperOrderDispatchCoordinator:
+            raise ReadOnlyError('EXACT_PAPER_COORDINATOR_REQUIRED')
+        with self._lock:
+            if self.__dispatch_binding is not None:
+                raise ReadOnlyError('PAPER_COORDINATOR_ALREADY_BOUND')
+            # Capture reviewed methods, not mutable per-instance hook attributes.
+            binding = (owner,
+                _PaperOrderDispatchCoordinator._prepare_commit.__get__(owner),
+                _PaperOrderDispatchCoordinator._validate_commit.__get__(owner))
+            object.__setattr__(self, '_PaperTWSTransport__dispatch_binding', binding)
 
     def __repr__(self): return '<PaperTWSTransport offline-foundation>'
 
@@ -427,6 +455,9 @@ Private session/dispatch methods support offline qualification only in this phas
             try:
                 if self._requires_reconciliation() or not self._connected():
                     raise ReadOnlyError('PAPER_SESSION_NOT_READY')
+                binding = self.__dispatch_binding
+                if binding is not None and operation is not _Operation.PLACE_ORDER:
+                    raise ReadOnlyError('PAPER_COORDINATOR_NEW_ENTRY_ONLY')
                 if operation is _Operation.PLACE_ORDER:
                     contract, order = self._build_order(argument)
                     order_id = self._allocate_order_id(generation)
@@ -440,12 +471,16 @@ Private session/dispatch methods support offline qualification only in this phas
                     raise ReadOnlyError('INVALID_PAPER_OPERATION')
                 if generation != self._generation or not self._connected():
                     raise ReadOnlyError('PAPER_SESSION_NOT_READY')
+                # Refresh authenticated local evidence outside the arrival lock.
+                # The permanently bound owner already holds all outer locks.
+                if binding is not None:
+                    binding[1]()
             except Exception:
                 return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
                     _Reason.PREFLIGHT_FAILED, generation, order_id,
                     reconciliation_required=self._requires_reconciliation())
             # Final dispatch commitment is ordered against callback arrival.
-            # No blocking operation occurs under the arrival lock. An error that
+            # No file I/O/callback wait occurs under the arrival lock. An error that
             # latches before commitment prevents this invocation; after commitment
             # it revokes all later writes without waiting for SDK return.
             with self._arrival_lock:
@@ -453,6 +488,20 @@ Private session/dispatch methods support offline qualification only in this phas
                     return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
                         _Reason.PREFLIGHT_FAILED, generation, order_id,
                         reconciliation_required=True)
+                if binding is not None:
+                    challenge = object()  # Local, fresh; no retained/replayable proof.
+                    try:
+                        proof = binding[2](challenge)
+                        if proof is not challenge:
+                            raise ReadOnlyError('PAPER_COMMIT_PROOF_INVALID')
+                    except Exception:
+                        return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
+                            _Reason.PREFLIGHT_FAILED, generation, order_id,
+                            reconciliation_required=self._reconciliation_required)
+                    if self._reconciliation_required:
+                        return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
+                            _Reason.PREFLIGHT_FAILED, generation, order_id,
+                            reconciliation_required=True)
                 if operation is _Operation.PLACE_ORDER:
                     self._known.add(order_id)
                 self._write_invocation_started = True

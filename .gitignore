@@ -7,3 +7,5 @@ __pycache__/
 *.py[cod]
 *.db
 *.sqlite*
+ibkr-paper-enrollment.json
+ibkr-paper-enrollment-auth.key

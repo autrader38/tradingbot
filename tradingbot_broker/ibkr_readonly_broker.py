@@ -4,6 +4,7 @@ from .broker import SimulatedBroker, BrokerOperationError
 from .models import (BrokerReason as R, ConnectionStatus, EventKind, TradingMode)
 from .readonly_models import AccountMode, ReadOnlyError
 from .ibkr_readonly import ReadOnlyTWSTransport, utc_now
+from .paper_enrollment import PaperEnrollmentStatus, require_confirmation
 from tradingbot_backtest.market import validate_timestamp
 
 
@@ -21,6 +22,25 @@ class ReadOnlyIBKRBroker(SimulatedBroker):
     @property
     def account_mode(self):
         return AccountMode.UNKNOWN
+
+    @property
+    def paper_enrollment_status(self):
+        with self._lock:
+            try:
+                self.account_summary()
+                return self._transport.paper_enrollment_status
+            except Exception:
+                return PaperEnrollmentStatus.INVALID
+
+    def enroll_paper_account(self, confirmation, *, replace_existing=False):
+        require_confirmation(confirmation)
+        with self._lock:
+            self.account_summary()
+            status = self._transport.enroll_paper_account(confirmation, replace_existing=replace_existing)
+            self._record('PAPER_ACCOUNT_ENROLLED', self._processing_time(), details=(
+                ('enrollment_status', status.value), ('replaced_existing', replace_existing),
+                ('account_mode', self.account_mode.value)))
+            return status
 
     def poll(self, at=None):
         with self._lock:

@@ -36,7 +36,9 @@ The user separately authorized Phases 1–9: foundation, A/B/C/D detection, open
 
 Separately authorized Phase 10C1 adds an isolated offline broker foundation. **NO REAL BROKER ORDERS ARE ENABLED BY THIS PHASE.** LIVE submission is hard blocked; the IBKR adapter accepts only the bundled in-memory transport. No IBKR session, provider connection, credentials or external dependency is added. The historical backtester remains unchanged.
 
-Phase 10C2 adds an optional [local IB Gateway read-only transport and diagnostics](docs/phase-10c2-real-ibkr-readonly.md), with lazy official TWS API dependency loading. **ORDER TRANSMISSION REMAINS DISABLED.** Account mode remains independently UNKNOWN; no successful real connection is claimed. Local Gateway setup and SDK compatibility verification remain user steps.
+Phase 10C2 adds an optional [local IB Gateway read-only transport and diagnostics](docs/phase-10c2-real-ibkr-readonly.md), with lazy official TWS API dependency loading. **ORDER TRANSMISSION REMAINS DISABLED.** Account mode remains independently UNKNOWN. The user reported successful local qualification with official IBKR TWS API 10.50.2; this phase makes no real connection from Codex.
+
+Phase 10C3A adds [explicit local paper-account enrollment](docs/phase-10c3a-paper-enrollment.md), a salted account fingerprint and separately authenticated local record. Enrollment status remains separate from account mode: **UNKNOWN and UNUSABLE remain unchanged even when enrollment is MATCHED.** All broker writes remain blocked; no account identifier is persisted.
 
 ## Safety and next phases
 

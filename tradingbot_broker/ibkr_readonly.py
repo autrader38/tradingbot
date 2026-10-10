@@ -261,10 +261,14 @@ def _make_client(api, owner, generation):
 
 class ReadOnlyTWSTransport:
     """SDK held privately; only named read requests and disconnect are dispatched."""
-    def __init__(self, config: TWSReadOnlyConfig, *, clock=utc_now):
+    def __init__(self, config: TWSReadOnlyConfig, *, clock=utc_now, enrollment_store=None):
         if not isinstance(config, TWSReadOnlyConfig):
             raise ReadOnlyError('INVALID_IBKR_CONFIGURATION')
         self.config = config
+        from .paper_enrollment import PaperEnrollmentStore
+        if enrollment_store is not None and type(enrollment_store) is not PaperEnrollmentStore:
+            raise ReadOnlyError('INVALID_PAPER_ENROLLMENT_STORE')
+        self._enrollment_store = enrollment_store
         api = sdk_call('SDK_INITIALIZATION_FAILED', _load_official_api)
         # Metadata only: no raw SDK client/connection class is exposed by transport.
         def metadata():
@@ -320,6 +324,42 @@ class ReadOnlyTWSTransport:
     def diagnostics(self):
         with self._condition:
             return tuple(self._diagnostics)
+
+    def _enrollment_identity(self):
+        # Called under lifecycle AND callback locks; identity never leaves this boundary.
+        if (not self.connected or not self._ready or self._snapshot is None
+                or self._collecting or len(self._accounts) != 1):
+            raise ReadOnlyError('PAPER_ENROLLMENT_CONNECTION_UNUSABLE')
+        now = self._clock()
+        validate_timestamp(now)
+        if not self._snapshot.account.available_at <= now < self._snapshot.account.valid_until:
+            raise ReadOnlyError('PAPER_ENROLLMENT_SNAPSHOT_STALE')
+        if not self._snapshot.account.verified or self._snapshot.account.mode is not None:
+            raise ReadOnlyError('PAPER_ENROLLMENT_CONNECTION_UNUSABLE')
+        return self._accounts[0], now
+
+    def _local_enrollment_store(self):
+        from .paper_enrollment import PaperEnrollmentStore
+        return self._enrollment_store if self._enrollment_store is not None else PaperEnrollmentStore()
+
+    @property
+    def paper_enrollment_status(self):
+        from .paper_enrollment import PaperEnrollmentStatus
+        with self._lifecycle, self._condition:
+            try:
+                account, _ = self._enrollment_identity()
+                return self._local_enrollment_store()._match_account(account)
+            except Exception:
+                return PaperEnrollmentStatus.INVALID
+
+    def enroll_paper_account(self, confirmation, *, replace_existing=False):
+        from .paper_enrollment import require_confirmation
+        require_confirmation(confirmation)
+        with self._lifecycle, self._condition:
+            account, now = self._enrollment_identity()
+            store = self._local_enrollment_store()
+            store._enroll_account(account, now, confirmation, replace_existing=replace_existing)
+            return store._match_account(account)
 
     def _put(self, table, key, value):
         if key in table and table[key] != value:

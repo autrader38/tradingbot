@@ -17,6 +17,7 @@ def main():
         account = broker.account_summary()
         print(f'IBKR connection: {broker.connection_status.value}')
         print(f'Account mode: {broker.account_mode.value} (not independently attested)')
+        print(f'Paper enrollment: {broker.paper_enrollment_status.value}')
         print('Account: account-1 (masked)')
         print(f'Net liquidation: {account.equity} {account.currency}')
         print(f'Cash: {account.cash} {account.currency}')

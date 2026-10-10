@@ -50,7 +50,9 @@ Phase 10C3C2B adds [offline callback attribution and confirmation](docs/phase-10
 
 Phase 10C3C2C1 adds [private read-side reconciliation evidence](docs/phase-10c3c2c1-read-reconciliation-evidence.md): immutable exact identity, protobuf presence, bounded capture and explicit collection completeness. Public snapshots remain unchanged. **CAPTURE DOES NOT CLEAR RECONCILIATION OR ENABLE ORDERS.** Future C3C2C2 must consume a fresh post-dispatch collection; completed/execution history remains coverage-limited.
 
-Phase 10C3C2C2A adds a [private one-shot fresh collection handshake](docs/phase-10c3c2c2a-reconciliation-handshake.md), binding retained pending state to a later read collection and its exact public/private snapshot pair. It captures provenance only; order-state evaluation, recovery and barrier clearing remain deferred. No real connection or broker write is enabled.
+Phase 10C3C2C2A adds a [private one-shot fresh collection handshake](docs/phase-10c3c2c2a-reconciliation-handshake.md), binding retained pending state to a later read collection and its exact public/private snapshot pair. It captures provenance only; recovery and barrier clearing remain deferred. No real connection or broker write is enabled.
+
+Phase 10C3C2C2 adds a [pure offline reconciliation evaluator](docs/phase-10c3c2c2-paper-reconciliation-evaluator.md) over consumed immutable handshake bundles. Its frozen lifecycle/quantity assessment is evidence only: no collection, callback acknowledgement, portfolio recovery, barrier clearing, PAPER attestation or trading permission.
 
 ## Safety and next phases
 

@@ -564,7 +564,8 @@ class OutcomeTests(BridgeFixture):
         self.assertTrue(self.coordinator._pending_confirmation)
         other=request('second')
         outcome=self.invoke(other,permission(other))
-        self.assertIs(outcome.reason,Reason.PENDING_CONFIRMATION)
+        self.assertIs(outcome.reason,Reason.RECONCILIATION_REQUIRED)
+        self.assertTrue(outcome.reconciliation_required)
         self.assertEqual(len(self.write_calls()),1)
 
 
@@ -1046,10 +1047,14 @@ class EscalationCorrections(BridgeFixture):
         self.build();self.invoke();old=self.client
         self.write._begin_generation()
         old.wrapper.error(10,550,'anonymous')
+        self.assertFalse(self.write._requires_reconciliation())
         other=request('other')
         outcome=self.invoke(other,permission(other))
-        self.assertIs(outcome.reason,Reason.PENDING_CONFIRMATION)
-        self.assertFalse(outcome.reconciliation_required)
+        # The old callback is ignored; losing the pending write generation still
+        # requires reconciliation when the coordinator next synchronizes it.
+        self.assertIs(outcome.reason,Reason.RECONCILIATION_REQUIRED)
+        self.assertTrue(outcome.reconciliation_required)
+        self.assertEqual(len(self.write_calls()),1)
 
     def test_malformed_current_error_latches_safely(self):
         self.build();self.invoke()

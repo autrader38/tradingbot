@@ -13,7 +13,9 @@ from .ibkr import IBKRContract
 from .ibkr_readonly import TWSReadOnlyConfig
 from .ibkr_readonly_broker import ReadOnlyIBKRBroker
 from .ibkr_paper_transport import (PaperTWSTransport, PaperTWSConfig,
-    _StockMarketSpec, _DispatchResult, _DispatchState, _Operation, _valid_order_id)
+    _StockMarketSpec, _DispatchResult, _DispatchState, _Operation, _valid_order_id,
+    _OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence, _evidence_identity,
+    _sum_callback_amounts)
 from .models import (OrderRequest, RiskPermission, TradingMode, Side, OrderType,
     OrderIntent, TimeInForce, BrokerReason, AccountSnapshot, identifier)
 from .paper_execution import (PaperExecutionScope, PaperExecutionAuthorizationStatus,
@@ -35,6 +37,7 @@ class _BridgeReason(StrEnum):
     RECONCILIATION_REQUIRED = 'RECONCILIATION_REQUIRED'
     SDK_RETURNED = 'SDK_RETURNED'
     DISPATCH_UNCERTAIN = 'DISPATCH_UNCERTAIN'
+    BROKER_STATE_RECONCILIATION_REQUIRED = 'BROKER_STATE_RECONCILIATION_REQUIRED'
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +70,75 @@ class _Attempt:
 
     def __repr__(self):
         return '<PrivatePaperDispatchAttempt>'
+
+
+class _CallbackState(StrEnum):
+    NO_CHANGE = 'NO_CHANGE'
+    PENDING_CONFIRMATION = 'PENDING_CONFIRMATION'
+    BROKER_OBSERVED = 'BROKER_OBSERVED'
+    BROKER_TERMINAL = 'BROKER_TERMINAL'
+    EXECUTION_OBSERVED = 'EXECUTION_OBSERVED'
+    RECONCILIATION_REQUIRED = 'RECONCILIATION_REQUIRED'
+
+
+@dataclass(frozen=True, slots=True)
+class _CallbackSyncResult:
+    state: _CallbackState
+    observed_state: _CallbackState
+    processed_sequence: int
+    client_order_id: str | None
+    order_id: int | None
+    broker_observed: bool
+    reconciliation_required: bool
+    broker_state_reconciliation_required: bool
+
+    def __post_init__(self):
+        if (type(self.state) is not _CallbackState or type(self.observed_state) is not _CallbackState
+                or type(self.processed_sequence) is not int or self.processed_sequence < 0
+                or self.order_id is not None and not _valid_order_id(self.order_id)
+                or any(type(v) is not bool for v in (self.broker_observed,
+                    self.reconciliation_required, self.broker_state_reconciliation_required))):
+            raise ReadOnlyError('INVALID_PAPER_CALLBACK_RESULT')
+        if self.client_order_id is not None:
+            identifier(self.client_order_id)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _PendingOrder:
+    client_order_id: str
+    order_id: int
+    generation: int
+    client_id: int
+    con_id: int
+    security_id: str
+    symbol: str
+    currency: str
+    side: str
+    quantity: Decimal
+    order_type: str
+    tif: str
+    dispatched_at: datetime
+    commit_sequence: int
+
+    def __post_init__(self):
+        identifier(self.client_order_id)
+        if (not _valid_order_id(self.order_id) or type(self.generation) is not int
+                or self.generation <= 0 or type(self.client_id) is not int or self.client_id <= 0
+                or type(self.con_id) is not int or self.con_id <= 0
+                or type(self.quantity) is not Decimal or not self.quantity.is_finite()
+                or self.quantity <= 0 or type(self.commit_sequence) is not int
+                or self.commit_sequence < 0 or self.side != 'BUY'
+                or self.order_type != 'MKT' or self.tif != 'DAY'):
+            raise ReadOnlyError('INVALID_PENDING_PAPER_ORDER')
+        _timestamp_value(self.dispatched_at)
+
+    def __repr__(self):
+        return '<PrivatePendingPaperOrder>'
+
+
+_TERMINAL_STATUSES = frozenset(('Filled', 'Cancelled', 'ApiCancelled', 'Inactive', 'Expired'))
+_STATUS_RANK = {'PendingSubmit': 0, 'PreSubmitted': 1, 'Submitted': 2,
+                **{s: 3 for s in _TERMINAL_STATUSES}}
 
 
 _ORDER_TYPES = dict(client_order_id=str, security_id=str, symbol=str, mode=TradingMode,
@@ -138,6 +210,18 @@ class _PaperOrderDispatchCoordinator:
         self._lock = RLock()
         self._attempts = set()
         self._pending_confirmation = False
+        self._pending_order = None
+        self._callback_cursor = 0
+        self._observed_state = _CallbackState.PENDING_CONFIRMATION
+        self._broker_observed = False
+        self._strong_open_order_identity_established = False
+        self._broker_state_reconciliation_required = False
+        self._last_status = None
+        self._last_filled = Decimal(0)
+        self._last_remaining = None
+        self._economic_observation = False
+        self._executions = {}
+        self._execution_total = Decimal(0)
         self._reconciliation_required = False
         self._active_attempt = None
         self._prepared_attempt = None
@@ -181,7 +265,7 @@ class _PaperOrderDispatchCoordinator:
         contract = next((c for c in self._contracts if c.security_id == order.security_id), None)
         if contract is None:
             raise ReadOnlyError('PAPER_CONTRACT_UNAVAILABLE')
-        return _StockMarketSpec(contract.con_id, order.side, order.quantity)
+        return _StockMarketSpec(contract.con_id, order.side, order.quantity, order.client_order_id)
 
     def _check(self, order, permission, capability, snapshots, binding=None, *, collect=True):
         control, read, write = self._control, self._control._transport, self._write
@@ -190,7 +274,8 @@ class _PaperOrderDispatchCoordinator:
             self._mark_reconciliation()
             raise ReadOnlyError('PAPER_WRITE_RECONCILIATION_REQUIRED')
         pair = self._pairing(validate=collect)
-        if (self._pending_confirmation or len(pair) != len(self._pair_values)
+        if (self._pending_confirmation or self._broker_state_reconciliation_required
+                or len(pair) != len(self._pair_values)
                 or any(type(current) is not type(original)
                        for current, original in zip(pair, self._pair_values))
                 or pair != self._pair_values):
@@ -308,6 +393,153 @@ class _PaperOrderDispatchCoordinator:
             except Exception:
                 pass
 
+    def _observe_status(self, status, filled=None, remaining=None):
+        if status not in _STATUS_RANK:
+            raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+        previous = self._last_status
+        if previous is not None and (previous in _TERMINAL_STATUSES and status != previous
+                or _STATUS_RANK[status] < _STATUS_RANK[previous]):
+            raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+        if filled is not None:
+            quantity = self._pending_order.quantity
+            if (_sum_callback_amounts(filled, remaining) != quantity
+                    or filled > quantity or remaining > quantity
+                    or filled < self._last_filled
+                    or self._last_remaining is not None and remaining > self._last_remaining
+                    or status == 'Filled' and (filled != quantity or remaining != 0)):
+                raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+            self._last_filled, self._last_remaining = filled, remaining
+            if filled > 0:
+                self._economic_observation = True
+        if status == 'Filled':
+            self._economic_observation = True
+        self._last_status = status
+
+    def _process_callback(self, event):
+        pending = self._pending_order
+        if event.order_id != pending.order_id:
+            return  # Other well-formed orders cannot confirm this pending entry.
+        if event.client_id is not None and event.client_id != pending.client_id:
+            raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+        if type(event) is _OpenOrderEvidence:
+            if (event.con_id != pending.con_id or event.security_type != 'STK'
+                    or event.exchange not in (None, 'SMART')
+                    or event.symbol not in (None, pending.symbol)
+                    or event.currency not in (None, pending.currency)
+                    or event.side != pending.side or event.order_type != pending.order_type
+                    or event.quantity != pending.quantity or event.tif != pending.tif):
+                raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+            if event.order_ref is None:
+                return  # Missing reference cannot establish strong identity.
+            if event.order_ref != pending.client_order_id:
+                raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+            self._observe_status(event.status)
+            self._strong_open_order_identity_established = True
+            self._broker_observed = True
+        elif type(event) is _OrderStatusEvidence:
+            # Numeric-ID correlation is secondary; it never establishes identity.
+            self._observe_status(event.status, event.filled, event.remaining)
+            if (not self._strong_open_order_identity_established
+                    and (event.status in _TERMINAL_STATUSES or event.filled > 0)):
+                # Numeric correlation cannot establish identity, but terminal
+                # or economic truth cannot safely remain ordinary pending.
+                self._broker_state_reconciliation_required = True
+                self._mark_reconciliation()
+        elif type(event) is _ExecutionEvidence:
+            if (event.con_id != pending.con_id or event.side != 'BOT'
+                    or event.order_ref is not None and event.order_ref != pending.client_order_id
+                    or event.order_ref is None and not self._strong_open_order_identity_established):
+                raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+            # Missing reference needs the already established openOrder identity
+            # AND a supplied exact client ID, not a numeric-ID guess.
+            if event.order_ref is None and event.client_id != pending.client_id:
+                raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+            identity = _evidence_identity(event)
+            previous = self._executions.get(event.execution_id)
+            if previous is not None:
+                if previous != identity:
+                    raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+                return
+            total = _sum_callback_amounts(self._execution_total, event.shares)
+            if total > pending.quantity:
+                raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+            self._executions[event.execution_id] = identity
+            self._execution_total = total
+            self._broker_observed = True
+            self._economic_observation = True
+        else:
+            raise ReadOnlyError('PAPER_CALLBACK_CONFLICT')
+        if self._broker_observed:
+            self._pending_confirmation = False
+            self._broker_state_reconciliation_required = True
+            if self._economic_observation:
+                self._observed_state = _CallbackState.EXECUTION_OBSERVED
+            elif self._last_status in _TERMINAL_STATUSES:
+                self._observed_state = _CallbackState.BROKER_TERMINAL
+            else:
+                self._observed_state = _CallbackState.BROKER_OBSERVED
+
+    def _sync_callbacks_locked(self):
+        """Caller owns coordinator/broker. Callbacks never enter these locks."""
+        control, read, write = self._control, self._control._transport, self._write
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            before = (self._observed_state, self._broker_observed, self._last_status,
+                      self._last_filled, self._execution_total)
+            batch = write._evidence_since(self, self._callback_cursor)
+            if (self._reconciliation_required or control._reconciliation_required
+                    or write._requires_reconciliation()):
+                self._mark_reconciliation()
+            elif self._pending_order is not None:
+                pending = self._pending_order
+                try:
+                    connected = write._connected() is True
+                except Exception:
+                    connected = False
+                if (write._generation != pending.generation or write._closed or not connected):
+                    self._mark_reconciliation()
+                else:
+                    try:
+                        for event in batch.events:
+                            if event.sequence != self._callback_cursor + 1:
+                                raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_GAP')
+                            if (event.generation == pending.generation
+                                    and event.sequence > pending.commit_sequence):
+                                self._process_callback(event)
+                            if self._economic_observation:
+                                # Secure effects for THIS event before acknowledging
+                                # its sequence. Later exact evidence in this snapshot
+                                # may be observed, but never clears the safety barrier.
+                                self._broker_state_reconciliation_required = True
+                                self._mark_reconciliation()
+                            self._callback_cursor = event.sequence
+                        if (not batch.events
+                                and batch.through_sequence > self._callback_cursor):
+                            raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_GAP')
+                    except Exception:
+                        self._mark_reconciliation()
+            else:
+                # Pre-dispatch evidence is explicitly consumed as ineligible for
+                # confirmation; it cannot later confirm a newly reserved order.
+                for event in batch.events:
+                    if event.sequence != self._callback_cursor + 1:
+                        self._mark_reconciliation()
+                        break
+                    self._callback_cursor = event.sequence
+            changed = before != (self._observed_state, self._broker_observed, self._last_status,
+                                self._last_filled, self._execution_total)
+            state = (_CallbackState.RECONCILIATION_REQUIRED if self._reconciliation_required
+                     else self._observed_state if changed and self._broker_observed
+                     else _CallbackState.NO_CHANGE)
+            pending = self._pending_order
+            return _CallbackSyncResult(state, self._observed_state, self._callback_cursor,
+                None if pending is None else pending.client_order_id,
+                None if pending is None else pending.order_id, self._broker_observed,
+                self._reconciliation_required, self._broker_state_reconciliation_required)
+
+    def _sync_broker_callbacks(self):
+        with self._lock, self._control._lock:
+            return self._sync_callbacks_locked()
+
     def _dispatch_entry(self, order, permission, capability):
         # A typed bounded request ID is consumed even if later gates deny it.
         if type(order) is not OrderRequest:
@@ -326,6 +558,7 @@ class _PaperOrderDispatchCoordinator:
             control, read, write = self._control, self._control._transport, self._write
             # Fatal transport state outranks EVERY duplicate/pending fast return.
             with control._lock:
+                self._sync_callbacks_locked()
                 if (self._reconciliation_required or control._reconciliation_required
                         or write._requires_reconciliation()):
                     self._attempts.add(client_id)
@@ -333,6 +566,9 @@ class _PaperOrderDispatchCoordinator:
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.RECONCILIATION_REQUIRED)
                 if client_id in self._attempts:
                     return result(_BridgeState.DENIED, _BridgeReason.DUPLICATE_ORDER)
+                if self._broker_state_reconciliation_required:
+                    self._attempts.add(client_id)
+                    return result(_BridgeState.DENIED, _BridgeReason.BROKER_STATE_RECONCILIATION_REQUIRED)
                 if self._pending_confirmation:
                     self._attempts.add(client_id)
                     return result(_BridgeState.DENIED, _BridgeReason.PENDING_CONFIRMATION)
@@ -352,6 +588,12 @@ class _PaperOrderDispatchCoordinator:
                 except Exception:
                     return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED)
                 self._active_attempt = _Attempt(order, permission, capability, snapshots, binding)
+                selected = next(c for c in self._contracts if c.security_id == order.security_id)
+                # Copy expected identity BEFORE SDK invocation. Caller-held models
+                # are never reread to establish callback identity after dispatch.
+                expected = (order.client_order_id, write._generation, write._config.client_id,
+                    selected.con_id, order.security_id, order.symbol, order.currency, 'BUY',
+                    order.quantity, 'MKT', 'DAY', control._processing_time())
                 try:
                     outcome = write._dispatch_new(spec)
                 except BaseException as error:
@@ -381,5 +623,12 @@ class _PaperOrderDispatchCoordinator:
                     self._mark_reconciliation()
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN)
                 self._pending_confirmation = True  # Secure before result construction.
+                try:
+                    self._pending_order = _PendingOrder(expected[0], outcome.order_id,
+                        *expected[1:], write._commit_callback_sequence)
+                except Exception:
+                    self._mark_reconciliation()
+                    return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN,
+                                  outcome.order_id)
                 return result(_BridgeState.DISPATCHED_PENDING_CONFIRMATION, _BridgeReason.SDK_RETURNED,
                               outcome.order_id)

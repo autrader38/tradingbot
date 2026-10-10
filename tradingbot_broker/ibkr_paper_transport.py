@@ -1,11 +1,12 @@
-"""10C3C1 isolated SDK foundation. No connect API or production write dispatch.
+"""Isolated offline SDK foundation and private callback evidence.
 
 All dispatch primitives are private and exercised only with offline SDK doubles.
-An authorization/risk/dispatch bridge and real connection are deferred to 10C3C2.
+The C3C2 coordinator is internal only. Real connection and production writes remain
+unsupported; callbacks cannot attest PAPER account mode or grant authorization.
 """
 
-from dataclasses import dataclass
-from decimal import Decimal
+from dataclasses import dataclass, fields, replace
+from decimal import Decimal, Context, localcontext
 from enum import Enum, StrEnum
 import importlib
 import inspect
@@ -16,7 +17,7 @@ from .ibkr_readonly import _load_official_api, _read_opcodes, _PROTOBUF_READ_BAS
 from .ibkr_readonly_wire import sdk_call
 from .ibkr_paper_wire import (_guarded_connection, _LEGACY_POLICY, _PROTOBUF_POLICY,
                               _LEGACY_WRITES, _PROTOBUF_WRITES)
-from .models import Side
+from .models import Side, identifier
 from .readonly_models import AccountMode, ReadOnlyError
 
 
@@ -98,12 +99,169 @@ class _StockMarketSpec:
     con_id: int
     side: Side
     quantity: Decimal
+    order_ref: str | None = None
 
     def __post_init__(self):
         if (type(self.con_id) is not int or self.con_id <= 0 or type(self.side) is not Side
                 or type(self.quantity) is not Decimal or not self.quantity.is_finite()
                 or self.quantity <= 0):
             raise ReadOnlyError('INVALID_PAPER_ORDER_SPECIFICATION')
+        if self.order_ref is not None:
+            try:
+                identifier(self.order_ref)
+            except Exception:
+                raise ReadOnlyError('INVALID_PAPER_ORDER_REFERENCE') from None
+
+
+_EVIDENCE_CAPACITY = 128
+_STATUSES = frozenset(('PendingSubmit', 'PreSubmitted', 'Submitted', 'Filled',
+                       'Cancelled', 'ApiCancelled', 'Inactive', 'Expired'))
+
+
+class _PrivateEvidence:
+    __slots__ = ()
+
+    def __repr__(self):
+        return '<SanitizedPaperCallbackEvidence>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _OpenOrderEvidence(_PrivateEvidence):
+    generation: int
+    sequence: int
+    order_id: int
+    client_id: int | None
+    order_ref: str | None
+    con_id: int
+    security_type: str
+    exchange: str | None
+    symbol: str | None
+    currency: str | None
+    side: str
+    order_type: str
+    quantity: Decimal
+    tif: str
+    status: str
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _OrderStatusEvidence(_PrivateEvidence):
+    generation: int
+    sequence: int
+    order_id: int
+    client_id: int
+    status: str
+    filled: Decimal
+    remaining: Decimal
+    average_price: Decimal
+    last_price: Decimal
+    parent_id: int
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ExecutionEvidence(_PrivateEvidence):
+    generation: int
+    sequence: int
+    order_id: int
+    client_id: int | None
+    order_ref: str | None
+    execution_id: str
+    con_id: int
+    side: str
+    shares: Decimal
+    price: Decimal
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _EvidenceBatch(_PrivateEvidence):
+    through_sequence: int
+    events: tuple
+
+
+def _callback_text(value, *, optional=False, reference=False):
+    if optional and (value is None or type(value) is str and value == ''):
+        return None
+    if type(value) is not str or not 0 < len(value) <= 100:
+        raise ValueError()
+    if reference:
+        identifier(value)
+    elif not value.isascii() or any(ord(c) < 32 or ord(c) > 126 for c in value):
+        raise ValueError()
+    return value
+
+
+def _callback_id(value, *, optional=False, contract=False):
+    if optional and value is None:
+        return None
+    # conId is not an API orderId: do not apply the orderId int32 bound to it.
+    if type(value) is not int or value < (1 if contract else 0):
+        raise ValueError()
+    if not contract and not _valid_order_id(value):
+        raise ValueError()
+    if contract and value.bit_length() > 64:  # Internal bounded evidence storage.
+        raise ValueError()
+    return value
+
+
+def _callback_amount(value, *, positive=False, price=False):
+    if price and type(value) in (float, int):
+        value = Decimal(str(value))
+    if (type(value) is not Decimal or not value.is_finite()
+            or value < 0 or positive and value == 0):
+        raise ValueError()
+    # Bound copied evidence, not the SDK's unrelated numeric identifier contracts.
+    parts = value.as_tuple()
+    if len(parts.digits) > 64 or not -64 <= parts.exponent <= 64:
+        raise ValueError()
+    return value
+
+
+def _callback_status(value):
+    return value if type(value) is str and value in _STATUSES else 'UNKNOWN'
+
+
+def _copy_callback(generation, sequence, kind, value):
+    """Copy only qualified primitive fields; never inspect account/whyHeld text."""
+    if kind == 'open':
+        order_id, contract, order, state = value
+        return _OpenOrderEvidence(generation, sequence, _callback_id(order_id),
+            _callback_id(getattr(order, 'clientId', None), optional=True),
+            _callback_text(getattr(order, 'orderRef', None), optional=True, reference=True),
+            _callback_id(contract.conId, contract=True), _callback_text(contract.secType),
+            _callback_text(getattr(contract, 'exchange', None), optional=True),
+            _callback_text(getattr(contract, 'symbol', None), optional=True),
+            _callback_text(getattr(contract, 'currency', None), optional=True),
+            _callback_text(order.action), _callback_text(order.orderType),
+            _callback_amount(order.totalQuantity, positive=True), _callback_text(order.tif),
+            _callback_status(state.status))
+    if kind == 'status':
+        order_id, status, filled, remaining, average, parent, last, client_id = value
+        return _OrderStatusEvidence(generation, sequence, _callback_id(order_id),
+            _callback_id(client_id), _callback_status(status),
+            _callback_amount(filled), _callback_amount(remaining),
+            _callback_amount(average, price=True), _callback_amount(last, price=True),
+            _callback_id(parent))
+    contract, execution = value
+    return _ExecutionEvidence(generation, sequence, _callback_id(execution.orderId),
+        _callback_id(getattr(execution, 'clientId', None), optional=True),
+        _callback_text(getattr(execution, 'orderRef', None), optional=True, reference=True),
+        _callback_text(execution.execId, reference=True),
+        _callback_id(contract.conId, contract=True), _callback_text(execution.side),
+        _callback_amount(execution.shares, positive=True),
+        _callback_amount(execution.price, price=True))
+
+
+def _evidence_identity(event):
+    return (type(event), tuple(getattr(event, f.name) for f in fields(event)
+                              if f.name != 'sequence'))
+
+
+def _sum_callback_amounts(left, right):
+    # Accepted evidence has at most 64 digits and exponents in [-64, 64].
+    # 256 digits preserve exact sums across the entire bounded 128-event ledger;
+    # application Decimal context must not round away an execution overfill.
+    with localcontext(Context(prec=256)):
+        return left + right
 
 
 _WRITE_BASES = (('PLACE_ORDER', 3), ('CANCEL_ORDER', 4), ('REQ_GLOBAL_CANCEL', 58))
@@ -173,11 +331,12 @@ def _make_paper_client(api, owner, generation):
         def logAnswer(self, *args, **kwargs): pass
         def nextValidId(self, orderId): owner._callback(generation, 'next', orderId)
         def openOrder(self, orderId, contract, order, orderState):
-            owner._callback(generation, 'observed', orderId)
+            owner._callback(generation, 'open', (orderId, contract, order, orderState))
         def openOrderEnd(self): owner._callback(generation, 'open_end')
         def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
                         permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
-            owner._callback(generation, 'observed', orderId)
+            owner._callback(generation, 'status', (orderId, status, filled, remaining,
+                avgFillPrice, parentId, lastFillPrice, clientId))
         def error(self, *args):
             # Legacy fixture: reqId,code,text. Modern: reqId,time,code,text[,advanced].
             # Never reinterpret a malformed modern code as its timestamp.
@@ -189,7 +348,7 @@ def _make_paper_client(api, owner, generation):
                 code = None
             owner._callback(generation, 'error', code)
         def execDetails(self, reqId, contract, execution):
-            owner._callback(generation, 'execution')
+            owner._callback(generation, 'execution', (contract, execution))
         def execDetailsEnd(self, reqId): owner._callback(generation, 'executions_end')
         def commissionReport(self, report): owner._callback(generation, 'commission')
         def commissionAndFeesReport(self, report): owner._callback(generation, 'commission')
@@ -258,6 +417,11 @@ Private session/dispatch methods support offline qualification only in this phas
         self._reconciliation_required = False  # Instance lifetime; no clear API.
         self._write_invocation_started = False  # Never reset by reconnect.
         self._callback_generation = 0
+        self._callback_sequence = 0  # Transport lifetime; never reset.
+        self._callback_evidence = []
+        self._callback_run_ends = []  # Exact duplicate sequence spans, bounded with the ledger.
+        self._last_callback_identity = None
+        self._commit_callback_sequence = 0
         self._lifetime_order_floor = MIN_ORDER_ID
         self._lifetime_order_ids_exhausted = False
         self.__dispatch_binding = None  # Strong lifetime owner + captured methods.
@@ -334,14 +498,46 @@ Private session/dispatch methods support offline qualification only in this phas
             # Never cancel/global-cancel in cleanup; no reader thread is joined.
 
     def _callback(self, generation, kind, value=None):
-        if kind == 'error':
+        if kind in ('error', 'open', 'status', 'execution'):
             # Announce before waiting on the dispatch lock. No fairness assumption
             # about RLock acquisition can let a later writer absorb this error.
             with self._arrival_lock:
-                if type(generation) is not int or generation != self._callback_generation:
+                if (type(generation) is not int or generation != self._callback_generation
+                        or kind != 'error' and self._closed):
                     return
-                if self._write_invocation_started:
+                if kind == 'error' and self._write_invocation_started:
                     self._reconciliation_required = True
+                elif kind != 'error' and self.__dispatch_binding is not None:
+                    try:
+                        event = _copy_callback(generation, self._callback_sequence + 1, kind, value)
+                        # Accepted observed IDs enter lifetime history NOW, before
+                        # deferred dispatch bookkeeping or generation reset.
+                        self._raise_observed_floor(event.order_id)
+                        self._callback_sequence += 1
+                        identity = _evidence_identity(event)
+                        # Consecutive exact duplicates have new sequence numbers
+                        # but need no storage. Interleaved repeats are retained:
+                        # Submitted -> Cancelled -> Submitted is a conflict.
+                        if identity != self._last_callback_identity:
+                            if len(self._callback_evidence) >= _EVIDENCE_CAPACITY:
+                                self._reconciliation_required = True
+                            else:
+                                self._callback_evidence.append(event)
+                                self._callback_run_ends.append(event.sequence)
+                                self._last_callback_identity = identity
+                        else:
+                            self._callback_run_ends[-1] = event.sequence
+                    except BaseException as error:
+                        if not isinstance(error, Exception):
+                            # Interrupted current-generation truth collection is
+                            # uncertain. Secure local safety BEFORE propagation.
+                            self._reconciliation_required = True
+                            raise
+                        if self._write_invocation_started:
+                            self._reconciliation_required = True
+            # Release arrival BEFORE dispatch bookkeeping; never reverse nesting.
+        if kind in ('open', 'status'):
+            kind, value = 'observed', value[0]
         with self._lock:
             if type(generation) is not int or generation != self._generation or self._closed:
                 return
@@ -349,22 +545,22 @@ Private session/dispatch methods support offline qualification only in this phas
                 if not _valid_order_id(value):
                     self._invalid_callback = True
                     return
-                if kind == 'next':
-                    self._initialized = True
-                    lower = value
-                else:
-                    self._known.add(value)
-                    if value == MAX_ORDER_ID:
-                        self._lifetime_order_ids_exhausted = True
-                        self._lifetime_order_floor = MAX_ORDER_ID
-                        self._exhausted = True
-                        self._boundary = None
-                        return
-                    lower = value + 1
-                self._lifetime_order_floor = max(self._lifetime_order_floor, lower)
-                if not self._lifetime_order_ids_exhausted:
-                    self._boundary = max(self._lifetime_order_floor,
-                        lower if self._boundary is None else self._boundary)
+                with self._arrival_lock:
+                    if kind == 'next':
+                        self._initialized = True
+                        lower = value
+                    else:
+                        self._known.add(value)
+                        self._raise_observed_floor(value)
+                        if value == MAX_ORDER_ID:
+                            self._exhausted = True
+                            self._boundary = None
+                            return
+                        lower = value + 1
+                    self._lifetime_order_floor = max(self._lifetime_order_floor, lower)
+                    if not self._lifetime_order_ids_exhausted:
+                        self._boundary = max(self._lifetime_order_floor,
+                            lower if self._boundary is None else self._boundary)
             elif kind == 'open_end':
                 if self._sync == 'ACTIVE': self._sync = 'COMPLETED'
             elif kind == 'closed':
@@ -377,6 +573,32 @@ Private session/dispatch methods support offline qualification only in this phas
                     self._error_sequence += 1
             elif kind in ('execution', 'executions_end', 'commission'):
                 self._callback_kinds.add(kind)
+
+    def _raise_observed_floor(self, order_id):
+        # Caller owns arrival. Only lifetime safety state changes here; current
+        # generation readiness/known IDs remain under dispatch bookkeeping.
+        if order_id == MAX_ORDER_ID:
+            self._lifetime_order_ids_exhausted = True
+            self._lifetime_order_floor = MAX_ORDER_ID
+        else:
+            self._lifetime_order_floor = max(self._lifetime_order_floor, order_id + 1)
+
+    def _evidence_since(self, owner, cursor):
+        """Immutable, owner-bound snapshot. No acknowledgement/clear/reset API."""
+        with self._arrival_lock:
+            if (self.__dispatch_binding is None or owner is not self.__dispatch_binding[0]
+                    or type(cursor) is not int or not 0 <= cursor <= self._callback_sequence):
+                raise ReadOnlyError('PAPER_CALLBACK_CURSOR_INVALID')
+            # Expand exact duplicate spans into bounded immutable event pages.
+            # Every sequence is explicitly processed; a fetch upper bound is
+            # never an acknowledgement of unseen/coalesced events.
+            events = []
+            for event, end in zip(self._callback_evidence, self._callback_run_ends):
+                for sequence in range(max(event.sequence, cursor + 1), end + 1):
+                    events.append(replace(event, sequence=sequence))
+                    if len(events) == _EVIDENCE_CAPACITY:
+                        return _EvidenceBatch(self._callback_sequence, tuple(events))
+            return _EvidenceBatch(self._callback_sequence, tuple(events))
 
     def _connected(self):
         if self._client is None or self._closed or self._invalid_callback:
@@ -434,6 +656,8 @@ Private session/dispatch methods support offline qualification only in this phas
             contract.conId, contract.secType, contract.exchange = spec.con_id, 'STK', 'SMART'
             order.action, order.orderType, order.tif = spec.side.value, 'MKT', 'DAY'
             order.totalQuantity = spec.quantity
+            if spec.order_ref is not None:
+                order.orderRef = spec.order_ref
             return contract, order
         return sdk_call('SDK_OBJECT_CONSTRUCTION_FAILED', build)
 
@@ -504,6 +728,7 @@ Private session/dispatch methods support offline qualification only in this phas
                             reconciliation_required=True)
                 if operation is _Operation.PLACE_ORDER:
                     self._known.add(order_id)
+                self._commit_callback_sequence = self._callback_sequence
                 self._write_invocation_started = True
             errors_before = self._error_sequence
             try:

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import importlib
 import logging
+import math
 import os
 import socket
 from threading import Condition, Thread, RLock, get_ident
@@ -260,6 +261,38 @@ class _ReconciliationReadSnapshot(_PrivateReconciliationValue):
     collections: tuple[_ReconciliationCollectionState, ...]
     orders: tuple[_ReconciliationOrderEvidence, ...]
     executions: tuple[_ReconciliationExecutionEvidence, ...]
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationReadRequest(_PrivateReconciliationValue):
+    request_id: int
+    baseline_generation: int
+    baseline_start_marker: int
+    issuance_marker: int
+    issued_monotonic: float
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ReconciliationReadReceipt(_PrivateReconciliationValue):
+    request_id: int
+    baseline_generation: int
+    baseline_start_marker: int
+    issuance_marker: int
+    issued_monotonic: float
+    generation: int
+    start_marker: int
+    started_monotonic: float
+    completion_marker: int
+    completed_monotonic: float
+    private_snapshot: _ReconciliationReadSnapshot
+    public_snapshot: ReadOnlySnapshot | None
+    outcome: str
+
+
+def _reconciliation_clock(value):
+    if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
+        raise ReadOnlyError('INVALID_RECONCILIATION_READ_CLOCK')
+    return value
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -586,6 +619,10 @@ class ReadOnlyTWSTransport:
         self._reconciliation_marker = 0
         self._reconciliation_result = None
         self._reconciliation_failure = None
+        self._reconciliation_read_sequence = 0
+        self._reconciliation_read_request = None
+        self._reconciliation_read_binding = None
+        self._reconciliation_read_receipt = None
         self._reset()
 
     def _reset(self):
@@ -618,6 +655,7 @@ class ReadOnlyTWSTransport:
         self._reconciliation_failure = None
         self._reconciliation_envelope = None  # Capacity ONE across all callback types.
         self._reconciliation_encodings = {}
+        self._reconciliation_publication = None
         self._reconciliation_orders = []
         self._reconciliation_executions = {}
         self._reconciliation_collections = {
@@ -625,8 +663,21 @@ class ReadOnlyTWSTransport:
                 False, None, 'NOT_REQUESTED',
                 'CURRENT_OPEN_ORDERS' if name == 'orders' else 'HISTORY_LIMITED')
             for name in _RECONCILIATION_SOURCES}
+        request = self._reconciliation_read_request
+        if (request is not None and self._reconciliation_read_binding is None
+                and self._generation > request.baseline_generation
+                and self._reconciliation_start_marker > request.issuance_marker):
+            # First later READ collection only; disconnect alone never binds.
+            self._reconciliation_read_binding = (
+                self._reconciliation_generation, self._reconciliation_start_marker)
+            try:
+                started = _reconciliation_clock(self._reconciliation_started)
+                if started < request.issued_monotonic:
+                    raise ReadOnlyError('INVALID_RECONCILIATION_READ_CLOCK')
+            except Exception:
+                self._reconciliation_fail('FAILED')
 
-    def _reconciliation_finish(self, outcome):
+    def _reconciliation_finish(self, outcome, *, public_snapshot=None):
         if self._reconciliation_result is not None:
             return
         if self._reconciliation_failure is not None and outcome != self._reconciliation_failure:
@@ -640,12 +691,99 @@ class ReadOnlyTWSTransport:
             self._reconciliation_fail('MALFORMED', self._reconciliation_envelope.source)
             return
         self._reconciliation_marker += 1
-        self._reconciliation_result = _ReconciliationReadSnapshot(
-            self._reconciliation_generation, self._reconciliation_start_marker,
-            self._reconciliation_marker, self._reconciliation_started, monotonic(),
-            self._reconciliation_sequence, outcome,
-            tuple(self._reconciliation_collections[n] for n in _RECONCILIATION_SOURCES),
-            tuple(self._reconciliation_orders), tuple(self._reconciliation_executions.values()))
+        try:
+            snapshot = _ReconciliationReadSnapshot(
+                self._reconciliation_generation, self._reconciliation_start_marker,
+                self._reconciliation_marker, self._reconciliation_started, monotonic(),
+                self._reconciliation_sequence, outcome,
+                tuple(self._reconciliation_collections[n] for n in _RECONCILIATION_SOURCES),
+                tuple(self._reconciliation_orders), tuple(self._reconciliation_executions.values()))
+            receipt = self._reconciliation_receipt_for(snapshot, public_snapshot)
+        except BaseException as error:
+            # Publication is transactional. Never leave COLLECTED authority after
+            # an interrupted/failed snapshot or receipt constructor.
+            if self._reconciliation_failure is None:
+                self._reconciliation_failure = 'FAILED' if isinstance(error, Exception) else 'INTERRUPTED'
+            self._reconciliation_envelope = None
+            for name, state in self._reconciliation_collections.items():
+                if state.state in ('ACTIVE', 'COMPLETED'):
+                    self._reconciliation_collections[name] = replace(
+                        state, state=self._reconciliation_failure)
+            raise
+        self._reconciliation_result = snapshot
+        if receipt is not None:
+            self._reconciliation_read_receipt = receipt
+
+    def _prepare_reconciliation_read_request(self):
+        """Arm one future capture. No SDK call, refresh or safety-state mutation."""
+        with self._condition:
+            if type(self) is not ReadOnlyTWSTransport:
+                raise ReadOnlyError('EXACT_RECONCILIATION_READ_TRANSPORT_REQUIRED')
+            if self._reconciliation_read_request is not None:
+                raise ReadOnlyError('RECONCILIATION_READ_REQUEST_OUTSTANDING')
+            try:
+                issued = _reconciliation_clock(monotonic())
+                previous = (self._reconciliation_result.completed_monotonic
+                    if self._reconciliation_result is not None else self._reconciliation_started)
+                if issued < _reconciliation_clock(previous):
+                    raise ReadOnlyError('INVALID_RECONCILIATION_READ_CLOCK')
+                request = _ReconciliationReadRequest(self._reconciliation_read_sequence + 1,
+                    self._generation, self._reconciliation_start_marker,
+                    self._reconciliation_marker + 1, issued)
+            except ReadOnlyError:
+                raise
+            except Exception:
+                raise ReadOnlyError('RECONCILIATION_READ_REQUEST_UNAVAILABLE') from None
+            # All fallible work precedes publication; interrupted construction
+            # leaves neither a half-issued request nor a replayable authority.
+            self._reconciliation_read_sequence = request.request_id
+            self._reconciliation_marker = request.issuance_marker
+            self._reconciliation_read_request = request
+            return request
+
+    def _reconciliation_receipt_for(self, snapshot, public_snapshot):
+        request = self._reconciliation_read_request
+        if (request is None or self._reconciliation_read_receipt is not None
+                or self._reconciliation_read_binding != (snapshot.generation, snapshot.start_marker)):
+            return None
+        started = _reconciliation_clock(snapshot.started_monotonic)
+        completed = _reconciliation_clock(snapshot.completed_monotonic)
+        if snapshot.outcome == 'COLLECTED':
+            publication = self._reconciliation_publication
+            if (type(public_snapshot) is not ReadOnlySnapshot
+                    or public_snapshot is not self._snapshot
+                    or publication is None
+                    or publication[:2] != (snapshot.generation, snapshot.start_marker)
+                    or publication[2] is not public_snapshot
+                    or snapshot.generation != self._generation
+                    or not request.issued_monotonic <= started <= completed):
+                raise ReadOnlyError('RECONCILIATION_READ_PUBLICATION_UNPROVEN')
+        else:
+            public_snapshot = None
+        return _ReconciliationReadReceipt(request.request_id, request.baseline_generation,
+            request.baseline_start_marker, request.issuance_marker, request.issued_monotonic,
+            snapshot.generation, snapshot.start_marker, started, snapshot.completion_marker,
+            completed, snapshot, public_snapshot, snapshot.outcome)
+
+    def _consume_reconciliation_read_receipt(self, request):
+        with self._condition:
+            receipt = self._peek_reconciliation_read_receipt(request)
+            self._reconciliation_read_request = None
+            self._reconciliation_read_binding = None
+            self._reconciliation_read_receipt = None
+            return receipt
+
+    def _peek_reconciliation_read_receipt(self, request):
+        # Internal transactional preparation; the caller holds the read condition.
+        if not self._condition._is_owned():
+            raise ReadOnlyError('RECONCILIATION_READ_LOCK_REQUIRED')
+        if (type(self) is not ReadOnlyTWSTransport
+                or type(request) is not _ReconciliationReadRequest
+                or request is not self._reconciliation_read_request):
+            raise ReadOnlyError('INVALID_RECONCILIATION_READ_REQUEST')
+        if self._reconciliation_read_receipt is None:
+            raise ReadOnlyError('RECONCILIATION_READ_INCOMPLETE')
+        return self._reconciliation_read_receipt
 
     def _reconciliation_fail(self, outcome, source=None):
         # Caller holds condition. Safety committed before constructing/reporting a result.
@@ -1107,7 +1245,9 @@ class ReadOnlyTWSTransport:
                     tuple(self._completed_read[k] for k in sorted(self._completed_read)),
                     tuple(self._fills_read[k] for k in sorted(self._fills_read)), commissions,
                     self._broker_time, self._client.serverVersion(), completed_available)
-                self._reconciliation_finish('COLLECTED')
+                self._reconciliation_publication = (
+                    generation, self._reconciliation_start_marker, self._snapshot)
+                self._reconciliation_finish('COLLECTED', public_snapshot=self._snapshot)
                 self._collecting = False
                 return self._snapshot
         except Exception as error:

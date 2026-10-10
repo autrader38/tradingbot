@@ -10,7 +10,8 @@ from enum import StrEnum
 from threading import RLock
 
 from .ibkr import IBKRContract
-from .ibkr_readonly import TWSReadOnlyConfig
+from .ibkr_readonly import (TWSReadOnlyConfig, _ReconciliationReadRequest,
+    _ReconciliationReadReceipt)
 from .ibkr_readonly_broker import ReadOnlyIBKRBroker
 from .ibkr_paper_transport import (PaperTWSTransport, PaperTWSConfig,
     _StockMarketSpec, _DispatchResult, _DispatchState, _Operation, _valid_order_id,
@@ -141,6 +142,53 @@ _STATUS_RANK = {'PendingSubmit': 0, 'PreSubmitted': 1, 'Submitted': 2,
                 **{s: 3 for s in _TERMINAL_STATUSES}}
 
 
+class _PrivateBrokerReconciliation:
+    __slots__ = ()
+
+    def __repr__(self):
+        return '<PrivateBrokerReconciliationHandshake>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _BrokerReconciliationLocalState(_PrivateBrokerReconciliation):
+    pending: _PendingOrder
+    pending_confirmation: bool
+    callback_cursor: int
+    observed_state: _CallbackState
+    broker_observed: bool
+    strong_open_order_identity_established: bool
+    broker_state_reconciliation_required: bool
+    last_status: str | None
+    last_filled: Decimal
+    last_remaining: Decimal | None
+    economic_observation: bool
+    execution_observations: tuple[tuple[str, tuple], ...]
+    execution_total: Decimal
+    coordinator_reconciliation_required: bool
+    control_reconciliation_required: bool
+    write_reconciliation_required: bool
+    write_generation: int
+    write_closed: bool
+    write_callback_watermark: int
+    unread_through_sequence: int
+    unread_events: tuple
+    authorization_status: PaperExecutionAuthorizationStatus
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _BrokerReconciliationAttempt(_PrivateBrokerReconciliation):
+    attempt_id: int
+    initial_local: _BrokerReconciliationLocalState
+    read_request: _ReconciliationReadRequest
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _BrokerReconciliationBundle(_PrivateBrokerReconciliation):
+    attempt: _BrokerReconciliationAttempt
+    read_receipt: _ReconciliationReadReceipt
+    final_local: _BrokerReconciliationLocalState
+
+
 _ORDER_TYPES = dict(client_order_id=str, security_id=str, symbol=str, mode=TradingMode,
     side=Side, order_type=OrderType, quantity=Decimal, currency=str, created_at=datetime,
     expires_at=datetime, intent=OrderIntent, time_in_force=TimeInForce,
@@ -225,6 +273,8 @@ class _PaperOrderDispatchCoordinator:
         self._reconciliation_required = False
         self._active_attempt = None
         self._prepared_attempt = None
+        self._broker_reconciliation_sequence = 0
+        self._broker_reconciliation_attempt = None
         self._pair_values = self._pairing()
         read = control._transport
         with self._lock, control._lock, read._lifecycle, read._condition, write_transport._lock:
@@ -539,6 +589,99 @@ class _PaperOrderDispatchCoordinator:
     def _sync_broker_callbacks(self):
         with self._lock, self._control._lock:
             return self._sync_callbacks_locked()
+
+    def _freeze_broker_reconciliation_local(self):
+        self._require_outer_locks()
+        if not self._write._arrival_lock._is_owned():
+            raise ReadOnlyError('PAPER_RECONCILIATION_LOCKS_REQUIRED')
+        if (type(self) is not _PaperOrderDispatchCoordinator
+                or self._write._dispatch_coordinator_owner is not self):
+            raise ReadOnlyError('EXACT_PAPER_COORDINATOR_REQUIRED')
+        pending = self._pending_order
+        if type(pending) is not _PendingOrder:
+            raise ReadOnlyError('PAPER_RECONCILIATION_IDENTITY_UNAVAILABLE')
+        authorization = self._control._paper_authority.status
+        if (type(authorization) is not PaperExecutionAuthorizationStatus
+                or type(self._observed_state) is not _CallbackState
+                or self._last_status is not None and self._last_status not in _STATUS_RANK
+                or any(type(v) is not bool for v in (self._pending_confirmation,
+                    self._broker_observed, self._strong_open_order_identity_established,
+                    self._broker_state_reconciliation_required, self._economic_observation,
+                    self._reconciliation_required, self._control._reconciliation_required,
+                    self._write._reconciliation_required, self._write._closed))
+                or any(type(v) is not Decimal or not v.is_finite() or v < 0
+                    for v in (self._last_filled, self._execution_total))
+                or self._last_remaining is not None and (type(self._last_remaining) is not Decimal
+                    or not self._last_remaining.is_finite() or self._last_remaining < 0)):
+            raise ReadOnlyError('PAPER_RECONCILIATION_LOCAL_STATE_INVALID')
+        # Existing processed identities contain a model TYPE plus primitive values.
+        # Retain only the copied primitive tuple, never a class/client/raw object.
+        executions = []
+        for exec_id, identity in sorted(self._executions.items()):
+            if (type(identity) is not tuple or len(identity) != 2
+                    or identity[0] is not _ExecutionEvidence or type(identity[1]) is not tuple
+                    or any(type(v) not in (str, int, Decimal, type(None)) for v in identity[1])):
+                raise ReadOnlyError('PAPER_RECONCILIATION_LOCAL_STATE_INVALID')
+            executions.append((exec_id, identity[1]))
+        batch = self._write._evidence_since(self, self._callback_cursor)
+        return _BrokerReconciliationLocalState(pending, self._pending_confirmation,
+            self._callback_cursor, self._observed_state, self._broker_observed,
+            self._strong_open_order_identity_established,
+            self._broker_state_reconciliation_required, self._last_status,
+            self._last_filled, self._last_remaining, self._economic_observation,
+            tuple(executions), self._execution_total, self._reconciliation_required,
+            self._control._reconciliation_required, self._write._requires_reconciliation(),
+            self._write._generation, self._write._closed, self._write._callback_sequence,
+            batch.through_sequence, batch.events, authorization)
+
+    def _begin_broker_reconciliation_attempt(self):
+        control, read, write = self._control, self._control._transport, self._write
+        with self._lock, control._lock, read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            if self._broker_reconciliation_attempt is not None:
+                raise ReadOnlyError('PAPER_RECONCILIATION_ATTEMPT_OUTSTANDING')
+            local = self._freeze_broker_reconciliation_local()
+            if not (local.broker_state_reconciliation_required
+                    or local.coordinator_reconciliation_required
+                    or local.control_reconciliation_required or local.write_reconciliation_required):
+                raise ReadOnlyError('PAPER_RECONCILIATION_BARRIER_REQUIRED')
+            request = None
+            try:
+                request = read._prepare_reconciliation_read_request()
+                attempt = _BrokerReconciliationAttempt(
+                    self._broker_reconciliation_sequence + 1, local, request)
+            except BaseException as error:
+                # Construction failed before publication. Undo ONLY this newly
+                # issued, still-unbound bookkeeping, without resetting counters.
+                if (request is not None and read._reconciliation_read_request is request
+                        and read._reconciliation_read_binding is None):
+                    read._reconciliation_read_request = None
+                if not isinstance(error, Exception):
+                    raise
+                if isinstance(error, ReadOnlyError):
+                    raise
+                raise ReadOnlyError('PAPER_RECONCILIATION_ATTEMPT_UNAVAILABLE') from None
+            self._broker_reconciliation_sequence = attempt.attempt_id
+            self._broker_reconciliation_attempt = attempt
+            return attempt
+
+    def _consume_broker_reconciliation_attempt(self, attempt):
+        control, read, write = self._control, self._control._transport, self._write
+        with self._lock, control._lock, read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            if (type(attempt) is not _BrokerReconciliationAttempt
+                    or attempt is not self._broker_reconciliation_attempt):
+                raise ReadOnlyError('INVALID_PAPER_RECONCILIATION_ATTEMPT')
+            if self._pending_order is not attempt.initial_local.pending:
+                raise ReadOnlyError('PAPER_RECONCILIATION_LOCAL_STATE_CHANGED')
+            final = self._freeze_broker_reconciliation_local()
+            receipt = read._peek_reconciliation_read_receipt(attempt.read_request)
+            # Finish all fallible capture/construction BEFORE consuming authority.
+            try:
+                bundle = _BrokerReconciliationBundle(attempt, receipt, final)
+            except Exception:
+                raise ReadOnlyError('PAPER_RECONCILIATION_BUNDLE_UNAVAILABLE') from None
+            read._consume_reconciliation_read_receipt(attempt.read_request)
+            self._broker_reconciliation_attempt = None
+            return bundle
 
     def _dispatch_entry(self, order, permission, capability):
         # A typed bounded request ID is consumed even if later gates deny it.

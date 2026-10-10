@@ -56,6 +56,8 @@ Phase 10C3C2C2 adds a [pure offline reconciliation evaluator](docs/phase-10c3c2c
 
 Phase 10C3C2C3A adds a [pure offline advisory recovery planner](docs/phase-10c3c2c3a-paper-recovery-planner.md), recomputing that assessment and reporting independent evidence, control, portfolio, order-management, session and authorization requirements. FILLED does not establish portfolio recoverability. No recovery application, barrier clearing, transport replacement, authorization re-arm or trading permission is added.
 
+Phase 10C3C4A adds a [private execution journal contract and pure replay model](docs/phase-10c3c4a-paper-execution-journal.md), preserving immutable ownership, consumed IDs, invocation uncertainty and sanitized observations. **THIS IS NOT DURABLE STORAGE.** No file/database, dispatch hook, restart recovery, barrier clearing or PAPER write is added. Transactional storage and write-ahead integration require separate phases.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

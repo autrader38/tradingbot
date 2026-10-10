@@ -42,6 +42,8 @@ Phase 10C3A adds [explicit local paper-account enrollment](docs/phase-10c3a-pape
 
 Phase 10C3B adds [memory-only session authorization](docs/phase-10c3b-paper-authorization.md) with explicit arming, scoped capabilities and lifecycle revocation. **ARMED DOES NOT ENABLE BROKER WRITES.** AccountMode remains UNKNOWN; all six legacy/protobuf write IDs remain blocked. The user reported successful Windows enrollment persistence across a fresh process; this does not establish broker PAPER attestation.
 
+Phase 10C3C1 adds a [separate offline paper write-transport foundation](docs/phase-10c3c1-paper-write-transport.md): exact SDK/wire contracts, generation-bound order IDs and internal dispatch outcomes. **NO REAL CONNECTION OR ORDER TRANSMISSION.** The existing read-only path remains unchanged; production authorization/risk/dispatch integration is deferred to Phase 10C3C2.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

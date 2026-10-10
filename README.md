@@ -40,6 +40,8 @@ Phase 10C2 adds an optional [local IB Gateway read-only transport and diagnostic
 
 Phase 10C3A adds [explicit local paper-account enrollment](docs/phase-10c3a-paper-enrollment.md), a salted account fingerprint and separately authenticated local record. Enrollment status remains separate from account mode: **UNKNOWN and UNUSABLE remain unchanged even when enrollment is MATCHED.** All broker writes remain blocked; no account identifier is persisted.
 
+Phase 10C3B adds [memory-only session authorization](docs/phase-10c3b-paper-authorization.md) with explicit arming, scoped capabilities and lifecycle revocation. **ARMED DOES NOT ENABLE BROKER WRITES.** AccountMode remains UNKNOWN; all six legacy/protobuf write IDs remain blocked. The user reported successful Windows enrollment persistence across a fresh process; this does not establish broker PAPER attestation.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

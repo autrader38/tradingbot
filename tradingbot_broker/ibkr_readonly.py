@@ -342,6 +342,52 @@ class ReadOnlyTWSTransport:
         from .paper_enrollment import PaperEnrollmentStore
         return self._enrollment_store if self._enrollment_store is not None else PaperEnrollmentStore()
 
+    def _paper_execution_binding(self):
+        # Private authenticated revision evidence; never an account-mode assertion.
+        import hmac
+        from .paper_enrollment import _fingerprint
+        with self._lifecycle, self._condition:
+            if type(self.config) is not TWSReadOnlyConfig:
+                raise ReadOnlyError('INVALID_IBKR_CONFIGURATION')
+            self.config.__post_init__()
+            account, _ = self._enrollment_identity()
+            record = self._local_enrollment_store()._read_record()
+            if record is None:
+                raise ReadOnlyError('PAPER_EXECUTION_ENROLLMENT_UNENROLLED')
+            if not hmac.compare_digest(_fingerprint(record['salt'], account), record['fingerprint']):
+                raise ReadOnlyError('PAPER_EXECUTION_ENROLLMENT_MISMATCH')
+            return self._generation, record['authentication'], self._snapshot.account.valid_until
+
+    def _current_sdk_connection_evidence(self, generation):
+        # EClient.isConnected is a local state inspection, not a broker request.
+        # Exact bool only; None means unavailable. Never return an SDK object/error.
+        with self._lifecycle, self._condition:
+            client = self._client
+            if generation != self._generation or client is None:
+                return None
+            if self._failure is not None or self._disconnect_emitted:
+                return False
+            try:
+                connected = client.isConnected()
+            except Exception:
+                return None
+            if (type(connected) is not bool or generation != self._generation
+                    or client is not self._client):
+                return None
+            return connected
+
+    def _validate_paper_execution_observation(self, generation, at):
+        # Final cheap check under the same lifecycle/callback locks. No SDK or file read.
+        self.config.__post_init__()
+        if (generation != self._generation or self._client is None or self._failure is not None
+                or self._disconnect_emitted or not self._ready or self._snapshot is None
+                or self._collecting or len(self._accounts) != 1):
+            raise ReadOnlyError('PAPER_EXECUTION_CONNECTION_UNUSABLE')
+        account = self._snapshot.account
+        if (not account.verified or account.mode is not None
+                or not account.available_at <= at < account.valid_until):
+            raise ReadOnlyError('PAPER_EXECUTION_ACCOUNT_STALE')
+
     @property
     def paper_enrollment_status(self):
         from .paper_enrollment import PaperEnrollmentStatus

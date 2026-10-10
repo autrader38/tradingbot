@@ -110,9 +110,13 @@ re-enrollment can recover it. Loss of both files requires fresh enrollment.
 These guarantees rely on the local OS user boundary and trust anchor. They do not
 protect against an attacker controlling that user's process or both the record
 and authentication key. They do not establish broker PAPER attestation, durable
-rollback protection, or production execution permission. Windows DPAPI/Gateway
-behavior still requires verification on the user's Windows machine; offline tests
-exercise its protection boundary using a simulated protector.
+rollback protection, or production execution permission. The user reported
+successful local Windows qualification: enrollment completed, DPAPI-protected
+state survived a fresh Python process, and fresh read-only diagnostics returned
+MATCHED. AccountMode remained UNKNOWN, trading remained UNUSABLE, and no orders
+were transmitted. This is local enrollment qualification, not independent broker
+PAPER attestation. Codex offline tests use a simulated protector and do not claim
+to have run Windows DPAPI or connected to the user's Gateway.
 
 Writes use a complete flushed/fsynced temporary file in the destination directory.
 Initial installation uses atomic create-if-absent linking; explicit replacement
@@ -142,6 +146,8 @@ flattening remain blocked. LIVE remains disabled. No real connection is made by
 offline validation; no dependency, account credential or provider is added.
 Frozen strategy and research economics are unchanged.
 
-Phase 10C3B requires separate authorization and review before any PAPER order
-transmission, including execution permissions, risk/account-state reconciliation
-and lifecycle gates. Enrollment alone grants none of those permissions.
+Separately authorized [Phase 10C3B](phase-10c3b-paper-authorization.md) models
+ephemeral session authorization only; it enables no writes. Phase 10C3C requires
+separate authorization and review before any PAPER order transmission, including
+execution permissions, risk/account-state reconciliation and lifecycle gates.
+Enrollment alone grants none of those permissions.

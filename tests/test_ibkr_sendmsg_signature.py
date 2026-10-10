@@ -225,12 +225,13 @@ class LegacyAndEncodingTests(unittest.TestCase):
         with self.assertRaises(ReadOnlyError): api.clients[-1].sendMsg('3\0forbidden')
         self.assertEqual(tuple(api.calls), before)
 
-    def test_binary_message_id_framing_remains_blocked(self):
+    def test_raw_message_id_startup_passes_socket_guard(self):
         api = sdk_10502(binary_ids=True)
         t, _, _ = transport(api)
-        with self.assertRaisesRegex(ReadOnlyError, '^IB_GATEWAY_REQUEST_FAILED$'): t.connect()
-        self.assertFalse(any(call[0] == 'socket-send' for call in api.calls))
-        self.assertIn(('BROKER_ERROR', 550), t.diagnostics)
+        t.connect(); self.addCleanup(t.disconnect)
+        self.assertTrue(t.connected)
+        self.assertIn(('socket-send', b'\x00\x00\x00\x09\x00\x00\x00G2\x001\x00\x00'), api.calls)
+        self.assertNotIn(('BROKER_ERROR', 550), t.diagnostics)
 
 
 if __name__ == '__main__':

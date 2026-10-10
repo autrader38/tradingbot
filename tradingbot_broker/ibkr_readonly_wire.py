@@ -49,10 +49,21 @@ def guarded_socket(raw, socket_type, allowed):
                 raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
             negotiated = True
         else:
-            if b'\0' not in body:
-                raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
-            opcode = body.split(b'\0', 1)[0]
-            if not opcode.isdigit() or int(opcode) not in allowed:
+            if body[:1].isdigit():
+                # Legacy SDK framing: ASCII message ID followed by a NUL.
+                if b'\0' not in body:
+                    raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+                field = body.split(b'\0', 1)[0]
+                if not field.isdigit():
+                    raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
+                opcode = int(field)
+            else:
+                # Modern SDK framing: exactly four bytes encode the message ID.
+                # The remaining SDK payload stays opaque; no extra headers parsed.
+                if len(body) < 4:
+                    raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+                opcode = struct.unpack('!I', body[:4])[0]
+            if opcode <= 0 or opcode not in allowed:
                 raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
         return data
 

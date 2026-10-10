@@ -64,13 +64,16 @@ The adapter validates the supplied opcode against the same approved read names,
 normalizes a matching SDK OUT enum member only for validation, and requires an exact
 string payload. It then delegates the original enum/int and payload as two arguments
 to the SDK's framing implementation. Older single-string calls remain guarded.
-The unchanged connection/socket guard still checks the final bytes: this signature
-compatibility does not enable additional broker actions, protobuf or unsupported
-binary message-ID framing. Such encodings continue to fail closed.
+The connection/socket guard still checks the final bytes. Official API 10.50.2 uses
+raw four-byte unsigned big-endian message IDs when the negotiated server version is
+at least 201. The boundary supports both these raw IDs and legacy ASCII IDs; decoded
+IDs in either format must belong to the same ten approved read-only operations.
+Raw integer message-ID framing does **not** enable protobuf support:
+`sendMsgProtoBuf` remains blocked with `UNSUPPORTED_IBAPI_WIRE_ENCODING`.
 
 The guarded connection installs a socket descriptor before the SDK creates its
 socket. The socket view exposes no raw socket or file descriptor. It accepts only
-one legacy-framed read message at a time, or the initial bounded version-negotiation
+one length-framed read message at a time, or the initial bounded version-negotiation
 frame; unknown opcodes, combined frames and unsupported encodings fail closed.
 Partial writes may continue only with the exact unsent suffix. The official SDK's
 Python `Connection.socket` and framed-wire contracts must be verified locally;

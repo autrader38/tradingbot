@@ -70,7 +70,9 @@ class TWSReadOnlyConfig:
 def _load_official_api():
     # No pip fallback and no dependency installation/download here.
     try:
-        return SimpleNamespace(Client=importlib.import_module('ibapi.client').EClient,
+        client = importlib.import_module('ibapi.client')
+        return SimpleNamespace(Client=client.EClient,
+            PROTOBUF_MSG_ID=getattr(client, 'PROTOBUF_MSG_ID', None),
             Wrapper=importlib.import_module('ibapi.wrapper').EWrapper,
             ExecutionFilter=importlib.import_module('ibapi.execution').ExecutionFilter,
             OUT=importlib.import_module('ibapi.message').OUT,
@@ -87,6 +89,11 @@ _READ_MESSAGES = ('START_API', 'REQ_MANAGED_ACCTS', 'REQ_ACCOUNT_SUMMARY',
                   'CANCEL_ACCOUNT_SUMMARY', 'REQ_POSITIONS', 'CANCEL_POSITIONS',
                   'REQ_ALL_OPEN_ORDERS', 'REQ_EXECUTIONS', 'REQ_CURRENT_TIME',
                   'REQ_COMPLETED_ORDERS')
+# Qualified official 10.50.2 contract. No other OUT name grants protobuf access.
+_PROTOBUF_READ_BASES = (('START_API', 71), ('REQ_MANAGED_ACCTS', 17),
+    ('REQ_ACCOUNT_SUMMARY', 62), ('CANCEL_ACCOUNT_SUMMARY', 63),
+    ('REQ_POSITIONS', 61), ('CANCEL_POSITIONS', 64), ('REQ_ALL_OPEN_ORDERS', 16),
+    ('REQ_EXECUTIONS', 7), ('REQ_CURRENT_TIME', 49), ('REQ_COMPLETED_ORDERS', 99))
 _INFO_CODES = frozenset((2103, 2104, 2105, 2106, 2107, 2108, 2158))
 _DISCONNECT_CODES = frozenset((1100, 1101, 1102, 1300, 502, 504))
 _STATES = {'PendingSubmit': OrderState.SUBMITTED, 'PreSubmitted': OrderState.ACKNOWLEDGED,
@@ -111,6 +118,18 @@ def _read_opcodes(out):
             raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
         result[name] = value
     return result
+
+
+def _protobuf_read_opcodes(out, offset):
+    """Qualify SDK evidence before translating the existing named read set."""
+    if offset is None:
+        return {}  # Older/unqualified SDK: legacy reads only, protobuf fails closed.
+    if type(offset) is not int or offset != 200:
+        raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+    bases = _read_opcodes(out)
+    if bases != dict(_PROTOBUF_READ_BASES) or set(bases) != set(_READ_MESSAGES):
+        raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+    return {name: value + offset for name, value in bases.items()}
 
 
 def execution_timestamp(text, configured_zone):
@@ -151,6 +170,8 @@ def _order_id(order):
 def _make_client(api, owner, generation):
     read_opcodes = _read_opcodes(api.OUT)
     allowed = frozenset(read_opcodes.values())
+    protobuf_allowed = frozenset(_protobuf_read_opcodes(
+        api.OUT, getattr(api, 'PROTOBUF_MSG_ID', None)).values())
     # SDK logs may contain account identifiers/raw payloads. No propagation to app logs.
     for name in ('ibapi', *tuple(logging.Logger.manager.loggerDict)):
         if name == 'ibapi' or name.startswith('ibapi.'):
@@ -195,11 +216,13 @@ def _make_client(api, owner, generation):
         @conn.setter
         def conn(self, value):
             nonlocal connection
-            connection = None if value is None else guarded_connection(value, api, allowed)
+            connection = None if value is None else guarded_connection(value, api, allowed, protobuf_allowed)
         def logRequest(self, *args, **kwargs): pass
-        def sendMsgProtoBuf(self, *args, **kwargs):
-            # A new SDK encoding must receive its own reviewed read allowlist.
-            raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+        def sendMsgProtoBuf(self, msgId, msg):
+            if (type(msgId) is not int or msgId <= 0 or msgId not in protobuf_allowed
+                    or type(msg) is not bytes):
+                raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
+            return super().sendMsgProtoBuf(msgId, msg)
         def sendMsg(self, msgId, *payload):
             if payload:
                 if len(payload) != 1 or type(payload[0]) is not str:
@@ -246,6 +269,8 @@ class ReadOnlyTWSTransport:
         # Metadata only: no raw SDK client/connection class is exposed by transport.
         def metadata():
             return SimpleNamespace(OUT=SimpleNamespace(**_read_opcodes(api.OUT)),
+                PROTOBUF_OUT=SimpleNamespace(**_protobuf_read_opcodes(
+                    api.OUT, getattr(api, 'PROTOBUF_MSG_ID', None))),
                 completed_min_version=api.completed_min_version)
         self._api = sdk_call('SDK_INITIALIZATION_FAILED', metadata)
         self._create_client = lambda generation: sdk_call('SDK_CLIENT_CONSTRUCTION_FAILED', _make_client, api, self, generation)

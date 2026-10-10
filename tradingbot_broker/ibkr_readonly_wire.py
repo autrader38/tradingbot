@@ -20,7 +20,7 @@ def sdk_call(code, function, *args, **kwargs):
         raise ReadOnlyError(code) from None
 
 
-def guarded_socket(raw, socket_type, allowed):
+def guarded_socket(raw, socket_type, allowed, protobuf_allowed=frozenset()):
     if not isinstance(raw, socket_type):
         raise ReadOnlyError('UNSUPPORTED_IBAPI_CONNECTION')
     lock = RLock()
@@ -49,7 +49,8 @@ def guarded_socket(raw, socket_type, allowed):
                 raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
             negotiated = True
         else:
-            if body[:1].isdigit():
+            raw_id = not body[:1].isdigit()
+            if not raw_id:
                 # Legacy SDK framing: ASCII message ID followed by a NUL.
                 if b'\0' not in body:
                     raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
@@ -63,7 +64,8 @@ def guarded_socket(raw, socket_type, allowed):
                 if len(body) < 4:
                     raise ReadOnlyError('UNSUPPORTED_IBAPI_WIRE_ENCODING')
                 opcode = struct.unpack('!I', body[:4])[0]
-            if opcode <= 0 or opcode not in allowed:
+            if (opcode <= 0 or (opcode not in allowed
+                    and (not raw_id or opcode not in protobuf_allowed))):
                 raise ReadOnlyError('READ_ONLY_BROKER_TRANSPORT')
         return data
 
@@ -110,7 +112,7 @@ def guarded_socket(raw, socket_type, allowed):
     return SocketView()
 
 
-def guarded_connection(connection, api, allowed):
+def guarded_connection(connection, api, allowed, protobuf_allowed=frozenset()):
     if not isinstance(connection, api.Connection) or not hasattr(connection, '__dict__'):
         raise ReadOnlyError('UNSUPPORTED_IBAPI_CONNECTION')
     initial_socket = connection.__dict__.pop('socket', None)
@@ -124,7 +126,7 @@ def guarded_connection(connection, api, allowed):
         @socket.setter
         def socket(self, value):
             nonlocal view
-            view = None if value is None else guarded_socket(value, api.SocketType, allowed)
+            view = None if value is None else guarded_socket(value, api.SocketType, allowed, protobuf_allowed)
         def __repr__(self): return '<ReadOnlyTWSConnection>'
 
     # Install before SDK Connection.connect creates a socket or sends any bytes.

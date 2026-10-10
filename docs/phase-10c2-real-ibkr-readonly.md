@@ -47,8 +47,8 @@ positions, all open orders, supported completed orders, executions and broker ti
 account-summary/position subscription cancellation is read-stream cleanup, not order
 cancellation. Client ID zero is prohibited; order auto-binding and `reqOpenOrders`
 are not used. No raw client or arbitrary request dispatcher is part of the public API.
-Protobuf/unknown message encodings fail closed with
-`UNSUPPORTED_IBAPI_WIRE_ENCODING`; they need a separately reviewed read allowlist.
+Unknown/unqualified protobuf requests fail closed with
+`UNSUPPORTED_IBAPI_WIRE_ENCODING` at client dispatch.
 The exact locally installed official SDK/Gateway version must pass local read testing.
 
 Local inspection of the official TWS API 10.50.2 found that its OUT message IDs are
@@ -57,7 +57,7 @@ approved read-message members belonging to that OUT enum, with matching names an
 exact positive integer values. Plain integer constants remain supported; strings,
 floats, booleans and arbitrary coercible objects are rejected. Both the wire allowlist
 and read-only metadata contain plain integer opcodes. This is compatibility handling,
-not an expansion of the outbound allowlist; protobuf remains blocked.
+not permission for additional broker operations.
 
 Official TWS API 10.50.2 uses `sendMsg(msgId, msg)`, including for START_API.
 The adapter validates the supplied opcode against the same approved read names,
@@ -68,8 +68,20 @@ The connection/socket guard still checks the final bytes. Official API 10.50.2 u
 raw four-byte unsigned big-endian message IDs when the negotiated server version is
 at least 201. The boundary supports both these raw IDs and legacy ASCII IDs; decoded
 IDs in either format must belong to the same ten approved read-only operations.
-Raw integer message-ID framing does **not** enable protobuf support:
-`sendMsgProtoBuf` remains blocked with `UNSUPPORTED_IBAPI_WIRE_ENCODING`.
+Raw integer framing alone does not grant protobuf permission. Local official
+10.50.2 inspection separately qualified protobuf requests for the same ten read
+operations. The adapter requires the SDK's exact integer `PROTOBUF_MSG_ID = 200`
+(loaded from the official client module) and the qualified named base opcodes,
+then derives a separate read-only protobuf set:
+`207,216,217,249,261,262,263,264,271,299`.
+`sendMsgProtoBuf` accepts only these exact integer IDs and exact `bytes` payloads,
+delegating serialization/framing to the SDK. The final socket independently checks
+the same set for raw-ID frames; ASCII frames accept only legacy IDs.
+This is strict read-only translation, not general protobuf enablement. Write IDs
+`203` (PLACE_ORDER), `204` (CANCEL_ORDER), and `258` (REQ_GLOBAL_CANCEL) remain
+blocked at both boundaries. Unknown offsets/mappings fail closed; an SDK without
+offset evidence remains legacy-only. No protobuf payload parser or request class
+was added, and no raw SDK client/connection/socket is exposed.
 
 The guarded connection installs a socket descriptor before the SDK creates its
 socket. The socket view exposes no raw socket or file descriptor. It accepts only

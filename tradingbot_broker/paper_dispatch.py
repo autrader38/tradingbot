@@ -7,7 +7,7 @@ from dataclasses import dataclass, fields
 from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
-from threading import RLock
+from threading import RLock, current_thread
 
 from .ibkr import IBKRContract
 from .ibkr_readonly import (TWSReadOnlyConfig, _ReconciliationReadRequest,
@@ -468,6 +468,7 @@ class _PaperOrderDispatchCoordinator:
             raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
         with self._write._arrival_lock:
             self._check_reservation(attempt, reservation)
+            self._require_journal_owner()._require_persistence_current(self)
         self._check(attempt.order, attempt.permission, attempt.capability,
                     attempt.snapshots, attempt.binding)
         owner = self._require_journal_owner()
@@ -510,6 +511,7 @@ class _PaperOrderDispatchCoordinator:
             raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
         self._check_reservation(attempt, reservation)
         owner = self._require_journal_owner()
+        owner._require_persistence_current(self)
         owner._require_marker(self, attempt, reservation, self._prepared_journal_proof)
         # Enrollment was freshly authenticated under the same held read locks.
         # Recheck that binding and current evidence; no file read in commitment.
@@ -707,7 +709,28 @@ class _PaperOrderDispatchCoordinator:
 
     def _sync_broker_callbacks(self):
         with self._lock, self._control._lock:
-            return self._sync_callbacks_locked()
+            if self._active_attempt is not None:
+                pending = self._pending_order
+                return _CallbackSyncResult(_CallbackState.NO_CHANGE, self._observed_state,
+                    self._callback_cursor, None if pending is None else pending.client_order_id,
+                    None if pending is None else pending.order_id, self._broker_observed,
+                    self._reconciliation_required, self._broker_state_reconciliation_required)
+            result = self._sync_callbacks_locked()
+            owner = self.__journal_owner
+            # Existing memory-only sync remains thread-neutral. It grants no
+            # durability; explicit persistence/entry on the wrong thread fails.
+            if type(owner) is _PaperDispatchJournalOwner and current_thread() is owner._thread:
+                persisted = owner._drain_callbacks(self)
+                if persisted.state.value == 'FAILED':
+                    return self._sync_callbacks_locked()
+            return result
+
+    def _sync_callback_persistence(self):
+        """Private evidence-only owner-thread drain; does not process/clear controls."""
+        with self._lock, self._control._lock:
+            if type(self.__journal_owner) is not _PaperDispatchJournalOwner:
+                raise ReadOnlyError('PAPER_DISPATCH_JOURNAL_UNAVAILABLE')
+            return self.__journal_owner._drain_callbacks(self)
 
     def _freeze_broker_reconciliation_local(self):
         self._require_outer_locks()
@@ -755,6 +778,7 @@ class _PaperOrderDispatchCoordinator:
 
     def _begin_broker_reconciliation_attempt(self):
         control, read, write = self._control, self._control._transport, self._write
+        self._sync_callback_persistence()
         with self._lock, control._lock, read._lifecycle, read._condition, write._lock, write._arrival_lock:
             if self._broker_reconciliation_attempt is not None:
                 raise ReadOnlyError('PAPER_RECONCILIATION_ATTEMPT_OUTSTANDING')
@@ -860,6 +884,17 @@ class _PaperOrderDispatchCoordinator:
                 return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.RECONCILIATION_REQUIRED)
             # Fatal transport state outranks EVERY duplicate/pending fast return.
             with control._lock:
+                owner._drain_callbacks(self)
+                persistence_current = True
+                with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+                    try:
+                        owner._require_persistence_current(self)
+                    except Exception:
+                        persistence_current = False
+                if not persistence_current:
+                    newly_consumed = client_id not in self._attempts
+                    self._attempts.add(client_id)
+                    return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED)
                 self._sync_callbacks_locked()
                 if (self._reconciliation_required or control._reconciliation_required
                         or write._requires_reconciliation()):

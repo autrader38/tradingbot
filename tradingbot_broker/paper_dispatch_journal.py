@@ -8,6 +8,7 @@ Private Python isolation does not protect against hostile interpreter access.
 from dataclasses import dataclass, fields
 from datetime import date, datetime
 from decimal import Decimal
+from enum import StrEnum
 import secrets
 from threading import current_thread
 
@@ -17,6 +18,8 @@ from .paper_dispatch_journal_context import _DispatchJournalContext
 from .paper_execution import _timestamp_value
 from .readonly_models import ReadOnlyError
 from .ibkr_readonly import _JournalAccountBindingReceipt, _JournalAccountAssociation
+from .ibkr_paper_transport import (PaperTWSTransport, _OpenOrderEvidence,
+    _OrderStatusEvidence, _ExecutionEvidence, _CommissionEvidence, _EVIDENCE_CAPACITY)
 
 
 _ERROR = 'PAPER_DISPATCH_JOURNAL_UNAVAILABLE'
@@ -64,10 +67,87 @@ class _DurableInvocationProof:
         return '<PrivateDurableInvocationProof>'
 
 
+class _CallbackPersistenceState(StrEnum):
+    CURRENT = 'CURRENT'
+    PENDING = 'PENDING'
+    DEFERRED = 'DEFERRED'
+    FAILED = 'FAILED'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CallbackPersistenceResult:
+    state: _CallbackPersistenceState
+    cursor: int
+    through_sequence: int
+    staged_count: int
+
+    def __repr__(self):
+        return '<PrivateCallbackPersistenceResult>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _StagedCallback:
+    evidence: object
+    values: tuple
+
+    def __repr__(self):
+        return '<PrivateStagedCallback>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CallbackCoverage:
+    staged: _StagedCallback
+    event: object
+    committed: object
+
+    def __repr__(self):
+        return '<PrivateCallbackCoverage>'
+
+
+_CALLBACK_TYPES = (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence, _CommissionEvidence)
+_STATUS = {'PendingSubmit': j._LifecycleStatus.PENDING_SUBMIT, 'PreSubmitted': j._LifecycleStatus.PRE_SUBMITTED,
+    'Submitted': j._LifecycleStatus.SUBMITTED,
+    'Filled': j._LifecycleStatus.FILLED, 'Cancelled': j._LifecycleStatus.CANCELLED,
+    'ApiCancelled': j._LifecycleStatus.API_CANCELLED, 'Inactive': j._LifecycleStatus.INACTIVE,
+    'Expired': j._LifecycleStatus.EXPIRED, 'UNKNOWN': j._LifecycleStatus.UNKNOWN}
+
+
+def _callback_values(event):
+    _require(type(event) in _CALLBACK_TYPES)
+    return tuple((field.name, _values(getattr(event, field.name))) for field in fields(type(event)))
+
+
+def _callback_projection(event, key, session):
+    # Constructors revalidate exact primitives even for otherwise unrelated facts.
+    _require(type(event.generation) is int and event.generation == session.write_generation
+             and type(event.sequence) is int and event.sequence > 0)
+    if type(event) is _CommissionEvidence:
+        _CommissionEvidence.__post_init__(event)
+        return j._CommissionReceived(key, event.exec_id, event.report_id,
+            event.amount, event.currency, event.received_at)
+    source = j._CallbackSource(session.session_id, event.generation, event.sequence)
+    if type(event) is _OpenOrderEvidence:
+        _require(type(event.status) is str and event.status in _STATUS)
+        return j._OpenOrderObserved(key, source, event.order_id, event.client_id,
+            event.order_ref, event.con_id, event.security_type, event.exchange, event.symbol,
+            event.currency, event.side, event.quantity, event.order_type, event.tif, _STATUS[event.status])
+    if type(event) is _OrderStatusEvidence:
+        _require(type(event.status) is str and event.status in _STATUS)
+        return j._OrderStatusObserved(key, source, event.order_id, event.client_id,
+            _STATUS[event.status], event.filled, event.remaining, event.average_price,
+            event.last_price, event.parent_id)
+    _require(type(event) is _ExecutionEvidence)
+    return j._ExecutionObserved(key, source, event.order_id, event.client_id, event.order_ref,
+        event.execution_id, event.con_id, event.side, event.shares, event.price)
+
+
 class _PaperDispatchJournalOwner:
     __slots__ = ('__association', '__components', '__identity', '__append', '__load', '__close',
                  '__history', '__consumed', '__inhibited', '__closed',
-                 '__proof', '__proof_parts', '__proof_values', '__marker_possible', '__attempt')
+                 '__proof', '__proof_parts', '__proof_values', '__marker_possible', '__attempt',
+                 '__persistence_cursor', '__persistence_failed', '__staged', '__covered',
+                 '__executions', '__commissions', '__foreign_executions', '__anchors', '__draining',
+                 '__invocation_boundaries', '__adjacent_observation')
 
     def __init__(self, *args, **kwargs):
         # Only the controlled setup factory publishes a registered owner.
@@ -106,6 +186,12 @@ class _PaperDispatchJournalOwner:
 
     @property
     def _inhibited(self): return self.__inhibited
+
+    @property
+    def _persistence_cursor(self): return self.__persistence_cursor
+
+    @property
+    def _persistence_failed(self): return self.__persistence_failed
 
     def _thread_check(self):
         _require(current_thread() is self._thread)
@@ -220,11 +306,13 @@ class _PaperDispatchJournalOwner:
         return attempt is self.__attempt and self.__marker_possible
 
     def _returned(self, coordinator, attempt, reservation, proof):
+        self._record_callback_boundary(coordinator, attempt)
         self._require_marker(coordinator, attempt, reservation, proof)
         self._append_event(j._SdkReturnedNormally(attempt.order.client_order_id))
 
     def _uncertain(self, coordinator, reason, attempt=None):
         # Safety precedes every optional persistence call and every publication.
+        self._record_callback_boundary(coordinator, attempt)
         self._inhibit()
         coordinator._mark_reconciliation(audit=False)
         if current_thread() is not self._thread:
@@ -260,6 +348,261 @@ class _PaperDispatchJournalOwner:
         self._local_check(self.__association[0], current=False, healthy=False)
         _require(not self.__association[3]._arrival_lock._is_owned())
         return self.__load()
+
+    def _require_persistence_current(self, coordinator):
+        """Pure gate; caller holds arrival. No store, clock or authentication call."""
+        self._local_check(coordinator)
+        write = self.__association[3]
+        _require(write._arrival_lock._is_owned() and not self.__persistence_failed
+                 and not self.__staged and not self.__covered
+                 and not write._arrival_unusable
+                 and self.__persistence_cursor == write._callback_sequence)
+
+    def _record_callback_boundary(self, coordinator, attempt):
+        write = self.__association[3]
+        if (attempt is not None and attempt is self.__attempt
+                and coordinator is self.__association[0] and write._bound_invocation_may_occur):
+            self.__invocation_boundaries[attempt.order.client_order_id] = write._commit_callback_sequence
+
+    def _callback_snapshot(self, coordinator):
+        _, control, read, write = self.__association[:4]
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            self._local_check(coordinator, current=False, healthy=False)
+            _require(write._generation == self._session.write_generation)
+            # Validate retained span metadata BEFORE paging can expand/renumber
+            # it. A malformed start must never become a fabricated occurrence.
+            _require(len(write._callback_evidence) == len(write._callback_run_ends)
+                     and len(write._callback_evidence) <= _EVIDENCE_CAPACITY)
+            expected_start = 1
+            for retained, end in zip(write._callback_evidence, write._callback_run_ends):
+                _require(type(retained) in _CALLBACK_TYPES and type(retained.sequence) is int
+                         and retained.sequence == expected_start and type(end) is int
+                         and end >= retained.sequence)
+                expected_start = end + 1
+            _require(type(write._callback_sequence) is int
+                     and expected_start == write._callback_sequence + 1)
+            batch = PaperTWSTransport._evidence_since(write, coordinator, self.__persistence_cursor)
+            _require(type(batch.through_sequence) is int
+                     and batch.through_sequence >= self.__persistence_cursor
+                     and type(batch.events) is tuple and len(batch.events) <= _EVIDENCE_CAPACITY)
+            expected = self.__persistence_cursor + 1
+            for event in batch.events:
+                _require(type(event) in _CALLBACK_TYPES and type(event.sequence) is int
+                         and event.sequence == expected and event.sequence <= batch.through_sequence)
+                _callback_projection(event, 'validation-only', self._session)
+                expected += 1
+            _require(batch.events or batch.through_sequence == self.__persistence_cursor)
+            # Arrival failure is never concealed by an unchanged evidence sequence.
+            _require(not write._arrival_unusable and not write._invalid_callback)
+            pending = coordinator._pending_order
+            pending_values = None if pending is None else tuple(
+                (f.name, _values(getattr(pending, f.name))) for f in fields(type(pending)))
+            state = (pending, pending_values, write._generation, write._closed,
+                     write._reconciliation_required, write._arrival_unusable)
+            return batch, state
+
+    def _callback_revalidate(self, coordinator, state, through, *, publish=None):
+        _, _, read, write = self.__association[:4]
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            self._local_check(coordinator, current=False, healthy=False)
+            pending = coordinator._pending_order
+            values = None if pending is None else tuple(
+                (f.name, _values(getattr(pending, f.name))) for f in fields(type(pending)))
+            _require(pending is state[0] and values == state[1]
+                     and write._generation == state[2] == self._session.write_generation
+                     and (write._closed, write._reconciliation_required, write._arrival_unusable) == state[3:]
+                     and not write._invalid_callback and write._callback_sequence >= through)
+            page = PaperTWSTransport._evidence_since(write, coordinator, self.__persistence_cursor)
+            for event in page.events:
+                staged = self.__staged.get(event.sequence)
+                if staged is not None:
+                    _require(_callback_values(event) == staged.values)
+            for sequence, staged in self.__staged.items():
+                _require(staged.evidence.sequence == sequence
+                         and _callback_values(staged.evidence) == staged.values)
+            if publish is not None:
+                self._publish_callback_cursor(publish)
+
+    def _append_callback(self, coordinator, event, staged):
+        # Restricted evidence-only path; inhibition remains monotonic. No general
+        # invocation/attempt/authorization event may enter through this method.
+        _require(type(event) in (j._OpenOrderObserved, j._OrderStatusObserved,
+                    j._ExecutionObserved, j._CommissionReceived)
+                 and self.__staged.get(staged.evidence.sequence) is staged
+                 and _callback_values(staged.evidence) == staged.values)
+        self._callback_io_boundary(coordinator)
+        return self._append_event(event, diagnostic=True)
+
+    def _callback_io_boundary(self, coordinator):
+        self._local_check(coordinator, current=False, healthy=False)
+        _, _, read, write = self.__association[:4]
+        _require(not self.__persistence_failed and coordinator._active_attempt is None
+                 and not write._arrival_lock._is_owned() and not write._lock._is_owned()
+                 and not read._lifecycle._is_owned() and not read._condition._is_owned())
+
+    def _cover_callback(self, coordinator, staged, attempts):
+        event = staged.evidence
+        _require(self.__staged.get(event.sequence) is staged
+                 and _callback_values(event) == staged.values)
+        if type(event) is _CommissionEvidence:
+            owned = self.__executions.get(event.exec_id)
+            foreign = self.__foreign_executions.get(event.exec_id)
+            _require(owned is None or foreign is None)
+            if foreign is not None:
+                return _CallbackCoverage(staged, None, None)  # Proven unrelated execution.
+            if owned is None:
+                return None  # Bounded staging, never a fabricated target label.
+            execution, _ = owned
+            _require(event.sequence > self.__invocation_boundaries[execution.client_order_id])
+            mapped = _callback_projection(event, execution.client_order_id, self._session)
+            prior = self.__commissions.get(event.exec_id)
+            if prior is not None:
+                original, committed = prior
+                _require((mapped.client_order_id, mapped.exec_id, mapped.report_id, mapped.amount, mapped.currency) ==
+                         (original.client_order_id, original.exec_id, original.report_id, original.amount, original.currency))
+                return _CallbackCoverage(staged, original, committed)
+            committed = self._append_callback(coordinator, mapped, staged)
+            self.__commissions[event.exec_id] = (mapped, committed)
+            return _CallbackCoverage(staged, mapped, committed)
+        related_exec = self.__executions.get(event.execution_id) if type(event) is _ExecutionEvidence else None
+        target = next((a for a in attempts if a.order_id == event.order_id), None)
+        if related_exec is not None:
+            _require(target is not None and target.consumed.client_order_id == related_exec[0].client_order_id)
+        if target is None:
+            # Exact lifetime numeric reservations define the current order owner.
+            # A copied reference alone cannot adopt another numeric broker order.
+            # A known execId relationship was checked BEFORE this filtering.
+            if type(event) is _ExecutionEvidence:
+                prior = self.__foreign_executions.get(event.execution_id)
+                identity = tuple((f.name, _values(getattr(event, f.name))) for f in fields(type(event))
+                                 if f.name not in ('sequence', 'generation'))
+                _require(prior is None or prior == identity)
+                self.__foreign_executions[event.execution_id] = identity
+            return _CallbackCoverage(staged, None, None)
+        key = target.consumed.client_order_id
+        _require(target.invocation_may_have_occurred and key in self.__invocation_boundaries
+                 and event.sequence > self.__invocation_boundaries[key])
+        mapped = _callback_projection(event, key, self._session)
+        if type(event) is _ExecutionEvidence:
+            _require(event.execution_id not in self.__foreign_executions)
+            if event.order_ref is None:
+                anchor = self.__anchors.get(key)
+                _require(anchor is not None and anchor < event.sequence
+                         and event.client_id == self._session.client_id)
+        identity = (type(event), tuple((name, value) for name, value in staged.values if name != 'sequence'))
+        previous = self.__adjacent_observation
+        if previous is not None and previous[0] + 1 == event.sequence and previous[1] == identity:
+            original, committed = previous[2:]
+            self.__adjacent_observation = (event.sequence, identity, original, committed)
+            return _CallbackCoverage(staged, original, committed)
+        committed = self._append_callback(coordinator, mapped, staged)
+        self.__adjacent_observation = (event.sequence, identity, mapped, committed)
+        if type(mapped) is j._OpenOrderObserved and mapped.order_ref == key and mapped.status is not j._LifecycleStatus.UNKNOWN:
+            self.__anchors[key] = min(self.__anchors.get(key, event.sequence), event.sequence)
+        if type(mapped) is j._ExecutionObserved:
+            self.__executions.setdefault(mapped.exec_id, (mapped, committed))
+        return _CallbackCoverage(staged, mapped, committed)
+
+    def _publish_callback_cursor(self, cursor):
+        # Private interruption seam AFTER verified progress, before publication.
+        self.__persistence_cursor = cursor
+        for sequence in tuple(self.__covered):
+            if sequence <= cursor:
+                del self.__covered[sequence]
+                del self.__staged[sequence]
+
+    def _drain_callbacks(self, coordinator):
+        """Owner-thread only, bounded evidence preservation; never trading recovery."""
+        _require(coordinator._lock._is_owned() and coordinator._control._lock._is_owned())
+        through = self.__persistence_cursor
+        entered = False
+        try:
+            self._thread_check()
+            if self.__persistence_failed:
+                self._inhibit()
+                coordinator._mark_reconciliation(audit=False)
+                return _CallbackPersistenceResult(_CallbackPersistenceState.FAILED,
+                    self.__persistence_cursor, through, len(self.__staged))
+            self._local_check(coordinator, current=False, healthy=False)
+            _require(not self.__persistence_failed)
+            if coordinator._active_attempt is not None or self.__draining:
+                return _CallbackPersistenceResult(_CallbackPersistenceState.DEFERRED,
+                    self.__persistence_cursor, through, len(self.__staged))
+            self._callback_io_boundary(coordinator)
+            self.__draining = True
+            entered = True
+            for _ in range(_EVIDENCE_CAPACITY):  # Bounded work even for very long compressed runs.
+                batch, state = self._callback_snapshot(coordinator)
+                through = batch.through_sequence
+                if not batch.events:
+                    break
+                self._callback_io_boundary(coordinator)
+                loaded = self._load()
+                _require(tuple(_values(r) for r in loaded.records) == self.__history)
+                attempts = tuple(a for a in loaded.replay.attempts
+                                 if a.consumed.session_id == self._session.session_id)
+                for event in batch.events:
+                    prior = self.__staged.get(event.sequence)
+                    if prior is None:
+                        _require(len(self.__staged) < _EVIDENCE_CAPACITY)
+                        self.__staged[event.sequence] = _StagedCallback(event, _callback_values(event))
+                    else:
+                        _require(prior.values == _callback_values(event))
+                # Lookahead records carry their ACTUAL sequence; no cursor changes.
+                for sequence in sorted(self.__staged):
+                    if sequence not in self.__covered:
+                        coverage = self._cover_callback(coordinator, self.__staged[sequence], attempts)
+                        if coverage is not None:
+                            self.__covered[sequence] = coverage
+                # A later durable execution can now qualify earlier commissions.
+                for sequence in sorted(self.__staged):
+                    if sequence not in self.__covered:
+                        coverage = self._cover_callback(coordinator, self.__staged[sequence], attempts)
+                        if coverage is not None:
+                            self.__covered[sequence] = coverage
+                cursor = self.__persistence_cursor
+                while cursor + 1 in self.__covered:
+                    cursor += 1
+                    coverage = self.__covered[cursor]
+                    _require(coverage.staged is self.__staged[cursor]
+                             and _callback_values(coverage.staged.evidence) == coverage.staged.values)
+                    if coverage.committed is not None:
+                        committed = coverage.committed
+                        _require(type(committed) is _CommittedRecord
+                                 and committed.record.payload is coverage.event
+                                 and 0 < committed.record.sequence <= len(self.__history)
+                                 and _values(committed.record) == self.__history[committed.record.sequence - 1])
+                        _CommittedRecord.__post_init__(committed)
+                self._callback_revalidate(coordinator, state, through)
+                if cursor == self.__persistence_cursor:
+                    _require(len(self.__staged) < _EVIDENCE_CAPACITY
+                             or through <= max(self.__staged))
+                    break
+                self._callback_io_boundary(coordinator)
+                self._append_event(j._CallbackProgress(self._session.session_id, cursor, through), diagnostic=True)
+                self._callback_revalidate(coordinator, state, through, publish=cursor)
+                if cursor == through:
+                    break
+            final_batch, _ = self._callback_snapshot(coordinator)
+            through = final_batch.through_sequence
+            result_state = (_CallbackPersistenceState.CURRENT if not self.__staged
+                and self.__persistence_cursor == through else _CallbackPersistenceState.PENDING)
+            return _CallbackPersistenceResult(result_state, self.__persistence_cursor, through, len(self.__staged))
+        except BaseException as error:
+            self.__persistence_failed = True
+            self._inhibit()
+            coordinator._mark_reconciliation(audit=False)
+            try:
+                self._uncertain(coordinator, j._ReconciliationReason.TRANSPORT_POISON)
+            except BaseException:
+                pass  # Diagnostics never replace the secured original failure.
+            if not isinstance(error, Exception):
+                raise
+            return _CallbackPersistenceResult(_CallbackPersistenceState.FAILED,
+                self.__persistence_cursor, through, len(self.__staged))
+        finally:
+            if entered:
+                self.__draining = False
 
 
 def _create_paper_dispatch_journal_owner(coordinator, path):
@@ -313,7 +656,11 @@ def _create_paper_dispatch_journal_owner(coordinator, path):
                 ('__close', _SQLiteJournalStore._close.__get__(store)),
                 ('__history', ()), ('__consumed', set()), ('__inhibited', False),
                 ('__closed', False), ('__proof', None), ('__proof_parts', None), ('__proof_values', None),
-                ('__marker_possible', False), ('__attempt', None)):
+                ('__marker_possible', False), ('__attempt', None),
+                ('__persistence_cursor', 0), ('__persistence_failed', False),
+                ('__staged', {}), ('__covered', {}), ('__executions', {}),
+                ('__commissions', {}), ('__foreign_executions', {}), ('__anchors', {}),
+                ('__draining', False), ('__invocation_boundaries', {}), ('__adjacent_observation', None)):
                 object.__setattr__(owner, prefix + name, value)
             owner._authenticate(c, setup=True)
             owner._append_event(session, setup=True)

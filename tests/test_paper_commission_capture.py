@@ -367,12 +367,12 @@ class RaceTests(CommissionFixture):
 
     def test_preexisting_commission_has_no_invented_numeric_id(self):
         self.build(); self.commission()
-        # Existing pre-dispatch synchronization treats this as ineligible for an
-        # entry confirmation; PRE1 neither attributes it nor changes dispatch.
+        # C3C4D: capture still assigns no numeric ID, and an unattributed,
+        # undurable commission now prohibits even preliminary entry reservation.
         self.invoke()
-        self.assertEqual(len(self.write_calls()), 1)
+        self.assertEqual(len(self.write_calls()), 0)
         self.assertFalse(hasattr(self.evidence(), 'order_id'))
-        self.assertEqual(self.write._lifetime_order_floor, 11)
+        self.assertEqual(self.write._lifetime_order_floor, 10)
 
     def blocked(self, *, malformed=False, interruption=None):
         announced, done = Event(), Event()

@@ -11,7 +11,8 @@ from .paper_dispatch import (_BrokerReconciliationBundle, _BrokerReconciliationA
 from .ibkr_readonly import (_ReconciliationReadRequest, _ReconciliationReadReceipt,
     _ReconciliationReadSnapshot, _ReconciliationCollectionState,
     _ReconciliationOrderEvidence, _ReconciliationExecutionEvidence, _ReconciliationPresence)
-from .ibkr_paper_transport import _OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence
+from .ibkr_paper_transport import (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence,
+                                  _CommissionEvidence)
 from .paper_execution import PaperExecutionAuthorizationStatus
 from .readonly_models import ReadOnlyError, ReadOnlySnapshot
 from .models import identifier
@@ -221,7 +222,13 @@ def _local(local, pending):
         _amount(price)
     _require(type(local.unread_events) is tuple and len(local.unread_events) <= 128)
     for event in local.unread_events:
-        _require(type(event) in (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence))
+        _require(type(event) in (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence,
+                                _CommissionEvidence))
+        if type(event) is _CommissionEvidence:
+            # Recheck exact producer primitives, fingerprint and UTC receipt time.
+            # Signed commissions have no order identity or nonnegative quantity semantics.
+            _CommissionEvidence.__post_init__(event)
+            continue
         # Exact model plus primitives only; no callback object/code is evaluated.
         for f in fields(event):
             value = getattr(event, f.name)
@@ -369,6 +376,11 @@ def _unread(local, pending):
             unresolved = True
         expected = event.sequence + 1
         if event.generation != pending.generation or event.sequence <= pending.commit_sequence:
+            continue
+        if type(event) is _CommissionEvidence:
+            # An unincorporated received fact is not an order/execution attribution.
+            # Preserve sequence coverage and uncertainty without accounting or acknowledgement.
+            unresolved = True
             continue
         ref = getattr(event, 'order_ref', None)
         related = ref == pending.client_order_id or event.order_id == pending.order_id

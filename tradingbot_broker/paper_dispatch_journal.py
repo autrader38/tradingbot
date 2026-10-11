@@ -147,7 +147,8 @@ class _PaperDispatchJournalOwner:
                  '__proof', '__proof_parts', '__proof_values', '__marker_possible', '__attempt',
                  '__persistence_cursor', '__persistence_failed', '__staged', '__covered',
                  '__executions', '__commissions', '__foreign_executions', '__anchors', '__draining',
-                 '__invocation_boundaries', '__adjacent_observation')
+                 '__invocation_boundaries', '__adjacent_observation',
+                 '__accounting_owner', '__accounting_setup_started', '__accounting_handoff')
 
     def __init__(self, *args, **kwargs):
         # Only the controlled setup factory publishes a registered owner.
@@ -159,7 +160,8 @@ class _PaperDispatchJournalOwner:
                     '_PaperDispatchJournalOwner__identity',
                     '_PaperDispatchJournalOwner__append',
                     '_PaperDispatchJournalOwner__load',
-                    '_PaperDispatchJournalOwner__close') and hasattr(self, name):
+                    '_PaperDispatchJournalOwner__close',
+                    '_PaperDispatchJournalOwner__accounting_owner') and hasattr(self, name):
             raise ReadOnlyError(_ERROR)
         object.__setattr__(self, name, value)
 
@@ -348,6 +350,140 @@ class _PaperDispatchJournalOwner:
         self._local_check(self.__association[0], current=False, healthy=False)
         _require(not self.__association[3]._arrival_lock._is_owned())
         return self.__load()
+
+    def _create_accounting_owner(self):
+        """One evidence consumer, never a replacement/adoption or dispatch gate."""
+        from .paper_execution_accounting import _PaperExecutionAccountingOwner
+        c, control, read, write = self.__association[:4]
+        self._thread_check()
+        with c._lock, control._lock:
+            self._local_check(c, healthy=False)
+            _require(not self.__accounting_setup_started)
+            self.__accounting_setup_started = True
+            try:
+                binding = read._validate_journal_account_binding(self._receipt)
+                _require(_values(binding) == _values(self._header.account_binding))
+                with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+                    self._local_check(c, healthy=False)
+                    _require(c._active_attempt is None and not self.__draining
+                             and not self.__persistence_failed)
+                    owner = object.__new__(_PaperExecutionAccountingOwner)
+                    owner._initialize((self,) + self.__components)
+                    object.__setattr__(self, '_PaperDispatchJournalOwner__accounting_owner', owner)
+                    return owner
+            except BaseException:
+                self._inhibit()
+                c._mark_reconciliation(audit=False)
+                raise
+
+    def _accounting_check(self, owner):
+        from .paper_execution_accounting import _PaperExecutionAccountingOwner
+        self._thread_check()
+        _require(type(owner) is _PaperExecutionAccountingOwner
+                 and owner is self.__accounting_owner
+                 and owner._matches_association((self,) + self.__components))
+        c = self.__association[0]
+        self._local_check(c, healthy=False)
+        _require(not self.__persistence_failed and not self.__draining
+                 and c._active_attempt is None)
+
+    def _accounting_state(self, owner):
+        # Capture-side only. No SQLite, no authentication I/O under arrival.
+        self._accounting_check(owner)
+        c, _, read, write = self.__association[:4]
+        _require(read._lifecycle._is_owned() and read._condition._is_owned()
+                 and write._lock._is_owned() and write._arrival_lock._is_owned())
+        batch, state = self._callback_snapshot(c)
+        cursor = self.__persistence_cursor
+        _require(type(cursor) is int and 0 <= cursor <= batch.through_sequence
+                 and set(self.__covered) <= set(self.__staged))
+        staged = []
+        for sequence, value in sorted(self.__staged.items()):
+            _require(type(sequence) is int and cursor < sequence <= batch.through_sequence
+                     and value.evidence.sequence == sequence
+                     and value.values == _callback_values(value.evidence))
+            staged.append((sequence, value.values))
+        covered = []
+        for sequence, value in sorted(self.__covered.items()):
+            _require(value.staged is self.__staged[sequence])
+            if value.committed is not None:
+                _CommittedRecord.__post_init__(value.committed)
+                _require(value.committed.record.payload is value.event
+                         and 0 < value.committed.record.sequence <= len(self.__history)
+                         and _values(value.committed.record) == self.__history[value.committed.record.sequence - 1])
+            covered.append((sequence, None if value.event is None else _values(value.event)))
+        return (self.__history, cursor, batch.through_sequence, tuple(staged), tuple(covered),
+                self.__inhibited, state, write._arrival_sequence)
+
+    def _capture_accounting_evidence(self, owner):
+        from .paper_execution_accounting import _AccountingEvidence
+        c, control, read, write = self.__association[:4]
+        _require(c._lock._is_owned() and control._lock._is_owned())
+        self._accounting_check(owner)
+        # Fresh issuer validation remains evidence-only; it cannot re-arm.
+        binding = read._validate_journal_account_binding(self._receipt)
+        _require(_values(binding) == _values(self._header.account_binding))
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            state = self._accounting_state(owner)
+        self._callback_io_boundary(c)
+        loaded = self._load()
+        _require(_values(loaded.header) == _values(self._header)
+                 and tuple(_values(r) for r in loaded.records) == state[0])
+        replay = j._replay_paper_execution_journal(loaded.header, loaded.records)
+        _require(tuple(_values(s) for s in replay.sessions) == (_values(self._session),))
+        progress = replay.callback_progress
+        _require(not progress and state[1] == 0 or len(progress) == 1
+                 and progress[0].session_id == self._session.session_id
+                 and progress[0].processed_sequence == state[1]
+                 and progress[0].through_sequence <= state[2])
+        evidence = _AccountingEvidence(loaded.header, loaded.records, self._session.session_id,
+            state[1], state[2], len(state[3]), len(state[4]), state[5])
+        self.__accounting_handoff = (owner, evidence, state, _values(evidence.header),
+                                     tuple(_values(r) for r in evidence.records))
+        return evidence
+
+    def _publish_accounting_snapshot(self, owner, evidence, candidate):
+        from .paper_execution_accounting import _snapshot_matches_evidence
+        c, control, read, write = self.__association[:4]
+        _require(c._lock._is_owned() and control._lock._is_owned())
+        self._accounting_check(owner)
+        self._callback_io_boundary(c)
+        durable = self._load()
+        _require(_values(durable.header) == _values(self._header)
+                 and tuple(_values(r) for r in durable.records) == self.__history)
+        binding = read._validate_journal_account_binding(self._receipt)
+        _require(_values(binding) == _values(self._header.account_binding))
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            handoff = self.__accounting_handoff
+            _require(handoff is not None and handoff[0] is owner and handoff[1] is evidence
+                     and self._accounting_state(owner) == handoff[2]
+                     and c._pending_order is handoff[2][6][0]
+                     and _values(evidence.header) == handoff[3]
+                     and tuple(_values(r) for r in evidence.records) == handoff[4]
+                     and _snapshot_matches_evidence(candidate, evidence))
+            owner._require_candidate(candidate, evidence)
+            self.__accounting_handoff = handoff + (candidate,)
+            owner._publish(candidate)  # One immutable pointer, final mutation.
+
+    def _consume_accounting_publication(self, owner, evidence, candidate):
+        c, control, read, write = self.__association[:4]
+        handoff = self.__accounting_handoff
+        _require(c._lock._is_owned() and control._lock._is_owned()
+                 and read._lifecycle._is_owned() and read._condition._is_owned()
+                 and write._lock._is_owned() and write._arrival_lock._is_owned()
+                 and handoff is not None and len(handoff) == 6
+                 and handoff[0] is owner and handoff[1] is evidence and handoff[5] is candidate)
+        self._accounting_check(owner)
+        self.__accounting_handoff = None
+
+    def _accounting_failure(self, owner):
+        # No persistence retry or diagnostic append. Existing safety first.
+        _require(owner is self.__accounting_owner)
+        c, control = owner._failure_controls()
+        with c._lock, control._lock:
+            self.__accounting_handoff = None
+            self._inhibit()
+            c._mark_reconciliation(audit=False)
 
     def _require_persistence_current(self, coordinator):
         """Pure gate; caller holds arrival. No store, clock or authentication call."""
@@ -660,7 +796,9 @@ def _create_paper_dispatch_journal_owner(coordinator, path):
                 ('__persistence_cursor', 0), ('__persistence_failed', False),
                 ('__staged', {}), ('__covered', {}), ('__executions', {}),
                 ('__commissions', {}), ('__foreign_executions', {}), ('__anchors', {}),
-                ('__draining', False), ('__invocation_boundaries', {}), ('__adjacent_observation', None)):
+                ('__draining', False), ('__invocation_boundaries', {}), ('__adjacent_observation', None),
+                ('__accounting_owner', None), ('__accounting_setup_started', False),
+                ('__accounting_handoff', None)):
                 object.__setattr__(owner, prefix + name, value)
             owner._authenticate(c, setup=True)
             owner._append_event(session, setup=True)

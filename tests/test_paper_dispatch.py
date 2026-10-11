@@ -5,6 +5,8 @@ from dataclasses import replace, FrozenInstanceError
 from datetime import timedelta
 from decimal import Decimal
 from threading import Event, Barrier
+from contextlib import contextmanager
+from pathlib import Path
 from unittest.mock import patch, PropertyMock
 import importlib
 import unittest
@@ -24,13 +26,16 @@ from tradingbot_broker.paper_execution import PaperExecutionScope as Scope, Pape
 from tradingbot_broker.safety import submission_gates
 from tests.test_paper_execution_authorization import AuthorizationFixture
 from tests.test_ibkr_paper_transport import sdk
-from tests.broker_fixtures import request, permission, contract
+from tests.dispatch_journal_fixtures import request, permission, contract, dispatch_clock
 from tests.test_ibkr_paper_enrollment import OTHER_ACCOUNT, ACCOUNT
+from tests.dispatch_journal_fixtures import dispatch_references
+from tradingbot_broker.paper_dispatch_journal import _create_paper_dispatch_journal_owner
 
 
 class BridgeFixture(AuthorizationFixture):
     def build(self, *, arm=True, scopes=(Scope.PLACE_ORDER,), paper_api=None, mappings=None):
-        self.ready()
+        with patch('tests.test_paper_execution_authorization.Clock', side_effect=dispatch_clock):
+            self.ready()
         self.capability = self.arm(scopes=scopes) if arm else None
         self.paper_api = sdk() if paper_api is None else paper_api
         with patch('tradingbot_broker.ibkr_paper_transport._load_paper_api', return_value=self.paper_api):
@@ -45,18 +50,45 @@ class BridgeFixture(AuthorizationFixture):
         defaults = (contract(exchange='SMART', con_id=17),)
         self.contracts = defaults if mappings is None else mappings(defaults) if callable(mappings) else mappings
         self.coordinator = Coordinator(self.broker, self.write, self.contracts)
+        self.approval, self.position = dispatch_references()
+        self._journal_count = getattr(self, '_journal_count', 0) + 1
+        self.journal = _create_paper_dispatch_journal_owner(self.coordinator,
+            Path(self.temporary.name) / f'dispatch-{self._journal_count}.db')
+        if self.journal is not None:
+            self.addCleanup(lambda owner=self.journal: None if owner._store._closed else owner._close())
         return self.coordinator
 
     def invoke(self, order=None, permission_value=None, capability=None):
         return self.coordinator._dispatch_entry(self.order if order is None else order,
             self.permission if permission_value is None else permission_value,
-            self.capability if capability is None else capability)
+            self.capability if capability is None else capability,
+            approval=self.approval, position=self.position)
 
     def write_calls(self):
         return [c for c in self.paper_api.calls if c[0] in ('place', 'cancel', 'global')]
 
+    @contextmanager
+    def owner_worker(self):
+        # Test scheduling only: production never hands SQLite to a worker queue.
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            pool.submit(self.build).result(timeout=5)
+            try:
+                yield pool
+            finally:
+                pool.submit(self.journal._close).result(timeout=5)
+
     def assert_denied(self, outcome):
-        self.assertIs(outcome.state, State.DENIED)
+        # C3C4C: once durable invocation intent exists, a failed final proof
+        # cannot be published as clean denial. Permanent owner inhibition also
+        # outranks denial when consumed memory cannot safely stay journaled.
+        uncertain = self.journal is not None and (self.journal._inhibited or
+            self.journal._PaperDispatchJournalOwner__marker_possible)
+        self.assertIs(outcome.state, State.OUTCOME_UNKNOWN if uncertain else State.DENIED)
+        if uncertain:
+            self.assertTrue(self.coordinator._reconciliation_required)
+            self.assertTrue(self.broker.reconciliation_required)
+            self.assertTrue(self.write._requires_reconciliation())
+            self.assertIs(self.broker._paper_authority.status, AuthStatus.INVALIDATED)
         self.assertFalse(self.write_calls())
         self.assertFalse(hasattr(outcome, 'accepted'))
 
@@ -590,7 +622,8 @@ def interruption_case(exception_type,preflight=False):
         self.assertEqual(self.write._lifetime_order_floor,11)
         if preflight:
             self.assertFalse(self.write_calls())
-            self.assertFalse(self.coordinator._reconciliation_required)
+            self.assertTrue(self.coordinator._reconciliation_required)
+            self.assertFalse(self.write._write_invocation_started)
         else:
             self.assert_reconciled()
         with ThreadPoolExecutor(max_workers=1) as pool:
@@ -612,26 +645,26 @@ class ConcurrencyTests(BridgeFixture):
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures=[pool.submit(self.invoke) for _ in range(2)]
             outcomes=[f.result(timeout=5) for f in futures]
-        self.assertEqual(sum(o.state is State.DISPATCHED_PENDING_CONFIRMATION for o in outcomes),1)
-        self.assertEqual(len(self.write_calls()),1)
+        self.assertTrue(all(o.state is State.OUTCOME_UNKNOWN for o in outcomes))
+        self.assertEqual(len(self.write_calls()),0)
+        self.assertTrue(self.journal._inhibited)
 
     def committed_control_race(self,action):
-        self.build()
-        inside,release,started=Event(),Event(),Event()
-        original=self.client.placeOrder
-        def paused(*args):
-            inside.set()
-            if not release.wait(5): raise AssertionError('offline coordination timeout')
-            return original(*args)
-        self.client.placeOrder=paused
-        def control():
-            started.set()
-            if action=='disarm': return self.broker.disarm_paper_execution()
-            if action=='disconnect': return self.broker.disconnect()
-            if action=='pause': return self.broker.pause_new_entries(self.clock())
-            return self.broker.emergency_stop(self.clock())
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            attempt=pool.submit(self.invoke)
+        with self.owner_worker() as owner, ThreadPoolExecutor(max_workers=1) as pool:
+            inside,release,started=Event(),Event(),Event()
+            original=self.client.placeOrder
+            def paused(*args):
+                inside.set()
+                if not release.wait(5): raise AssertionError('offline coordination timeout')
+                return original(*args)
+            self.client.placeOrder=paused
+            def control():
+                started.set()
+                if action=='disarm': return self.broker.disarm_paper_execution()
+                if action=='disconnect': return self.broker.disconnect()
+                if action=='pause': return self.broker.pause_new_entries(self.clock())
+                return self.broker.emergency_stop(self.clock())
+            attempt=owner.submit(self.invoke)
             try:
                 self.assertTrue(inside.wait(5))
                 transition=pool.submit(control)
@@ -643,15 +676,14 @@ class ConcurrencyTests(BridgeFixture):
         self.assertEqual(len(self.write_calls()),1)
 
     def test_control_wins_before_final_commit(self):
-        self.build()
-        translated,release=Event(),Event()
-        original=self.coordinator._translate
-        def paused(order):
-            result=original(order); translated.set()
-            if not release.wait(5): raise AssertionError('offline coordination timeout')
-            return result
-        self.coordinator._translate=paused
-        with ThreadPoolExecutor(max_workers=1) as pool:
+        with self.owner_worker() as pool:
+            translated,release=Event(),Event()
+            original=self.coordinator._translate
+            def paused(order):
+                result=original(order); translated.set()
+                if not release.wait(5): raise AssertionError('offline coordination timeout')
+                return result
+            self.coordinator._translate=paused
             attempt=pool.submit(self.invoke)
             try:
                 self.assertTrue(translated.wait(5))
@@ -798,18 +830,21 @@ class ProofCorrections(BridgeFixture):
         self.assert_denied(self.invoke())
         other=request('new-attempt')
         self.assert_denied(self.invoke(other,permission(other)))
-        self.assertEqual(len(challenges),2)
-        self.assertIsNot(challenges[0],challenges[1])
-        self.assertEqual(self.write._lifetime_order_floor,12)
+        self.assertEqual(len(challenges),1)
+        self.assertEqual(self.write._lifetime_order_floor,11)
+        self.assertTrue(self.coordinator._reconciliation_required)
+        self.assertTrue(self.broker.reconciliation_required)
+        self.assertTrue(self.write._requires_reconciliation())
 
-    def test_validator_ordinary_exception_denies_without_uncertainty(self):
+    def test_validator_exception_after_durable_marker_requires_reconciliation(self):
         def failed(owner,reservation,challenge):raise RuntimeError('anonymous-validator-secret')
         with patch.object(Coordinator,'_validate_commit',failed):self.build()
         outcome=self.invoke()
         self.assert_denied(outcome)
         self.assertEqual(outcome.order_id,10)
         self.assertEqual(self.write._lifetime_order_floor,11)
-        self.assertFalse(self.write._requires_reconciliation())
+        self.assertTrue(self.write._requires_reconciliation())
+        self.assertFalse(self.write._write_invocation_started)
         self.assertNotIn('anonymous-validator-secret',repr(outcome))
 
     def test_enrollment_io_is_outside_commitment_lock(self):
@@ -863,7 +898,8 @@ def wrong_proof(kind):
         self.assertEqual(outcome.order_id,10)
         self.assertEqual(self.write._lifetime_order_floor,11)
         self.assertIn(self.order.client_order_id,self.coordinator._attempts)
-        self.assertFalse(self.write._requires_reconciliation())
+        self.assertTrue(self.write._requires_reconciliation())
+        self.assertFalse(self.write._write_invocation_started)
     return test
 
 
@@ -880,8 +916,11 @@ def validator_interruption(exception_type):
         self.assertIs(caught.exception,interruption)
         if exception_type is SystemExit:self.assertEqual(caught.exception.code,37)
         self.assertFalse(self.write_calls())
-        self.assertFalse(self.write._requires_reconciliation())
-        self.assertFalse(self.coordinator._reconciliation_required)
+        self.assertTrue(self.write._requires_reconciliation())
+        self.assertTrue(self.coordinator._reconciliation_required)
+        self.assertTrue(self.broker.reconciliation_required)
+        self.assertIs(self.broker.paper_execution_status,AuthStatus.INVALIDATED)
+        self.assertFalse(self.write._write_invocation_started)
         self.assertEqual(self.write._lifetime_order_floor,11)
         self.assertIn(self.order.client_order_id,self.coordinator._attempts)
         self.assertIsNone(self.coordinator._active_attempt)
@@ -1075,37 +1114,37 @@ class EscalationCorrections(BridgeFixture):
             for future in futures:self.assert_escalated(future.result(timeout=5))
 
     def test_delayed_error_during_sdk_send_no_escape_or_deadlock(self):
-        self.build()
-        inside,release,announced=Event(),Event(),Event()
-        real=self.write._arrival_lock
-        write=self.write
-        class Announce:
-            def __enter__(lock):real.acquire();return lock
-            def __exit__(lock,*args):
-                latched=write._reconciliation_required
-                real.release()
-                if latched:announced.set()
-            def _is_owned(lock):return real._is_owned()
-        write._arrival_lock=Announce()
-        original=self.client.placeOrder
-        def paused(*args):
-            original(*args);inside.set()
-            if not release.wait(5):raise AssertionError('offline coordination failed')
-        self.client.placeOrder=paused
-        with ThreadPoolExecutor(max_workers=3) as pool:
-            first=pool.submit(self.invoke)
-            try:
-                self.assertTrue(inside.wait(5))
-                callback=pool.submit(self.client.wrapper.error,10,550,'anonymous')
-                self.assertTrue(announced.wait(5))
-                duplicate=pool.submit(self.invoke)
-            finally:release.set()
-            self.assertIs(first.result(timeout=5).state,State.OUTCOME_UNKNOWN)
-            self.assertIs(duplicate.result(timeout=5).state,State.OUTCOME_UNKNOWN)
-            callback.result(timeout=5)
-        self.assertEqual(len(self.write_calls()),1)
-        self.assertTrue(self.broker.reconciliation_required)
-        self.assertIs(self.broker._paper_authority.status,AuthStatus.INVALIDATED)
+        with self.owner_worker() as owner:
+            inside,release,announced=Event(),Event(),Event()
+            real=self.write._arrival_lock
+            write=self.write
+            class Announce:
+                def __enter__(lock):real.acquire();return lock
+                def __exit__(lock,*args):
+                    latched=write._reconciliation_required
+                    real.release()
+                    if latched:announced.set()
+                def _is_owned(lock):return real._is_owned()
+            write._arrival_lock=Announce()
+            original=self.client.placeOrder
+            def paused(*args):
+                original(*args);inside.set()
+                if not release.wait(5):raise AssertionError('offline coordination failed')
+            self.client.placeOrder=paused
+            with ThreadPoolExecutor(max_workers=3) as pool:
+                first=owner.submit(self.invoke)
+                try:
+                    self.assertTrue(inside.wait(5))
+                    callback=pool.submit(self.client.wrapper.error,10,550,'anonymous')
+                    self.assertTrue(announced.wait(5))
+                    duplicate=pool.submit(self.invoke)
+                finally:release.set()
+                self.assertIs(first.result(timeout=5).state,State.OUTCOME_UNKNOWN)
+                self.assertIs(duplicate.result(timeout=5).state,State.OUTCOME_UNKNOWN)
+                callback.result(timeout=5)
+            self.assertEqual(len(self.write_calls()),1)
+            self.assertTrue(self.broker.reconciliation_required)
+            self.assertIs(self.broker._paper_authority.status,AuthStatus.INVALIDATED)
 
 
 class AdditionalControlRaces(BridgeFixture):
@@ -1119,40 +1158,40 @@ class AdditionalControlRaces(BridgeFixture):
             fromlist=['CONFIRMATION']).CONFIRMATION,replace_existing=True)
 
     def race(self,action,commit_wins):
-        self.build()
-        inside,release,started=Event(),Event(),Event()
-        if commit_wins:
-            original=self.client.placeOrder
-            def paused(*args):
-                inside.set()
-                if not release.wait(5):raise AssertionError('offline coordination failed')
-                return original(*args)
-            self.client.placeOrder=paused
-        else:
-            original=self.coordinator._translate
-            def paused(order):
-                value=original(order);inside.set()
-                if not release.wait(5):raise AssertionError('offline coordination failed')
-                return value
-            self.coordinator._translate=paused
-        def control():
-            started.set()
-            return self.transition(action)
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            attempt=pool.submit(self.invoke)
-            try:
-                self.assertTrue(inside.wait(5))
-                change=pool.submit(control)
-                self.assertTrue(started.wait(5))
-                if commit_wins:self.assertFalse(change.done())
-                else:change.result(timeout=5)
-            finally:release.set()
-            outcome=attempt.result(timeout=5)
-            change.result(timeout=5)
-        if commit_wins:
-            self.assertIs(outcome.state,State.DISPATCHED_PENDING_CONFIRMATION)
-            self.assertEqual(len(self.write_calls()),1)
-        else:self.assert_denied(outcome)
+        with self.owner_worker() as owner:
+            inside,release,started=Event(),Event(),Event()
+            if commit_wins:
+                original=self.client.placeOrder
+                def paused(*args):
+                    inside.set()
+                    if not release.wait(5):raise AssertionError('offline coordination failed')
+                    return original(*args)
+                self.client.placeOrder=paused
+            else:
+                original=self.coordinator._translate
+                def paused(order):
+                    value=original(order);inside.set()
+                    if not release.wait(5):raise AssertionError('offline coordination failed')
+                    return value
+                self.coordinator._translate=paused
+            def control():
+                started.set()
+                return self.transition(action)
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                attempt=owner.submit(self.invoke)
+                try:
+                    self.assertTrue(inside.wait(5))
+                    change=pool.submit(control)
+                    self.assertTrue(started.wait(5))
+                    if commit_wins:self.assertFalse(change.done())
+                    else:change.result(timeout=5)
+                finally:release.set()
+                outcome=attempt.result(timeout=5)
+                change.result(timeout=5)
+            if commit_wins:
+                self.assertIs(outcome.state,State.DISPATCHED_PENDING_CONFIRMATION)
+                self.assertEqual(len(self.write_calls()),1)
+            else:self.assert_denied(outcome)
 
 
 for action in ('refresh','account','enrollment'):

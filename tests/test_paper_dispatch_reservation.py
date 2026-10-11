@@ -1,4 +1,4 @@
-"""PRE2: fake SDK only; deterministic arrival races, no journal or network."""
+"""PRE2 invariants under mandatory C3C4C journaling; fake SDK only."""
 
 import ast
 from concurrent.futures import ThreadPoolExecutor
@@ -17,7 +17,7 @@ from tradingbot_broker.paper_dispatch import _PaperOrderDispatchCoordinator as C
 from tradingbot_broker.paper_dispatch import _BridgeState as State
 from tradingbot_broker.paper_execution import PaperExecutionAuthorizationStatus as AuthStatus
 from tradingbot_broker.readonly_models import AccountMode, ReadOnlyError
-from tests.broker_fixtures import request, permission
+from tests.dispatch_journal_fixtures import request, permission
 from tests.test_paper_callback_confirmation import CallbackFixture
 from tests.test_ibkr_paper_transport import sdk
 
@@ -174,8 +174,10 @@ class ProvenanceTests(ReservationFixture):
         self.assert_denied(self.invoke())
         order = request('second-attempt')
         self.assert_denied(self.invoke(order, permission(order)))
-        self.assertEqual([r.order_id for r in saved], [10, 11])
-        self.assertEqual(self.write._lifetime_order_floor, 12)
+        self.assertEqual([r.order_id for r in saved], [10])
+        self.assertEqual(self.write._lifetime_order_floor, 11)
+        with self.outer(), self.assertRaises(ReadOnlyError):
+            self.write._validate_reservation(self.coordinator, saved[0])
 
     def test_commitment_cannot_be_consumed_twice(self):
         self.build()
@@ -201,13 +203,16 @@ class ProvenanceTests(ReservationFixture):
             other = request('recursive-attempt')
             active = owner._active_attempt
             result = self.invoke(other, permission(other))
-            self.assertIs(result.state, State.DENIED)
+            self.assertIs(result.state, State.OUTCOME_UNKNOWN)
             self.assertIs(owner._active_attempt, active)
             self.assertIs(owner._prepared_reservation, res)
             self.assertIn(other.client_order_id, owner._attempts)
         self.prepare(action)
-        self.assertIs(self.invoke().state, State.DISPATCHED_PENDING_CONFIRMATION)
-        self.assertEqual(len(self.write_calls()), 1)
+        self.assertIs(self.invoke().state, State.OUTCOME_UNKNOWN)
+        self.assertFalse(self.write_calls())
+        self.assertTrue(self.coordinator._reconciliation_required)
+        self.assertTrue(self.broker.reconciliation_required)
+        self.assertTrue(self.write._requires_reconciliation())
 
     def test_bound_direct_new_without_owner_locks_never_invokes(self):
         self.build()
@@ -348,9 +353,10 @@ class ThreadedArrivalTests(ReservationFixture):
         with ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(self.invoke, o, permission(o)) for o in orders]
             results = [f.result(timeout=5) for f in futures]
-        self.assertEqual(sum(r.state is State.DISPATCHED_PENDING_CONFIRMATION for r in results), 1)
-        self.assertEqual(len(self.write_calls()), 1)
-        self.assertEqual(self.write._lifetime_order_floor, 11)
+        self.assertTrue(all(r.state is State.OUTCOME_UNKNOWN for r in results))
+        self.assertEqual(len(self.write_calls()), 0)
+        self.assertEqual(self.write._lifetime_order_floor, 10)
+        self.assertTrue(self.journal._inhibited)
 
     def test_repeated_contention_cannot_bypass_reserved_id_collision(self):
         for _ in range(8):
@@ -454,10 +460,10 @@ def interrupted(seam, exc_type):
         self.assertIsNone(self.coordinator._prepared_reservation)
         post = seam in ('after_commit', 'sdk')
         self.assertIs(self.write._write_invocation_started, post)
-        self.assertIs(self.write._requires_reconciliation(), post)
-        self.assertIs(self.coordinator._reconciliation_required, post)
-        self.assertIs(self.broker.reconciliation_required, post)
-        if post: self.assertIs(self.broker.paper_execution_status, AuthStatus.INVALIDATED)
+        self.assertTrue(self.write._requires_reconciliation())
+        self.assertTrue(self.coordinator._reconciliation_required)
+        self.assertTrue(self.broker.reconciliation_required)
+        self.assertIs(self.broker.paper_execution_status, AuthStatus.INVALIDATED)
         self.assertFalse(self.write_calls())
         with ThreadPoolExecutor(max_workers=1) as pool:
             pool.submit(self.write.disconnect).result(timeout=5)
@@ -513,13 +519,15 @@ for model in ('_PendingOrder', '_BridgeResult'):
 
 
 class BoundaryTests(ReservationFixture):
-    def test_no_journal_storage_or_recovery_import(self):
+    def test_no_recovery_import_or_transport_storage_dependency(self):
         root = Path(__file__).resolve().parents[1] / 'tradingbot_broker'
         for name in ('paper_dispatch.py', 'ibkr_paper_transport.py'):
             tree = ast.parse((root / name).read_text())
             imports = [n.module or '' for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)]
             imports += [a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names]
-            self.assertFalse(any('journal' in n or 'sqlite' in n or 'recovery' in n for n in imports))
+            self.assertFalse(any('recovery' in n for n in imports))
+            if name == 'ibkr_paper_transport.py':
+                self.assertFalse(any('journal' in n or 'sqlite' in n for n in imports))
 
     def test_account_mode_unknown_public_snapshot_none(self):
         self.build()
@@ -544,12 +552,22 @@ class BoundaryTests(ReservationFixture):
             self.assertFalse(any('reservation' in n or 'commitment' in n
                                  for n in dir(owner) if not n.startswith('_')))
 
-    def test_no_sqlite_or_journal_side_effect(self):
+    def test_bound_dispatch_uses_existing_store_without_opening_connection(self):
         self.build()
-        from tradingbot_broker.paper_execution_journal_sqlite import _SQLiteJournalStore
-        with patch('sqlite3.connect', side_effect=AssertionError('SQLite forbidden')), \
-                patch.object(_SQLiteJournalStore, '_append', side_effect=AssertionError('Journal forbidden')):
+        from tradingbot_broker.paper_dispatch_journal import _PaperDispatchJournalOwner
+        from tradingbot_broker.paper_execution_journal import (
+            _AttemptConsumed, _NumericOrderIdReserved, _InvocationMayOccur, _SdkReturnedNormally)
+        original = _PaperDispatchJournalOwner._append_event
+        events = []
+        def append(owner, event, **kwargs):
+            self.assertFalse(self.write._arrival_lock._is_owned())
+            events.append(type(event))
+            return original(owner, event, **kwargs)
+        with patch('sqlite3.connect', side_effect=AssertionError('New connection forbidden')), \
+                patch.object(_PaperDispatchJournalOwner, '_append_event', append):
             self.assertIs(self.invoke().state, State.DISPATCHED_PENDING_CONFIRMATION)
+        self.assertEqual(events, [_AttemptConsumed, _NumericOrderIdReserved,
+                                  _InvocationMayOccur, _SdkReturnedNormally])
         self.assertEqual(len(self.write_calls()), 1)
 
     def test_privacy_no_sdk_or_control_objects_in_reservation(self):

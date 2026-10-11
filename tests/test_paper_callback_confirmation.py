@@ -63,7 +63,10 @@ class CallbackFixture(BridgeFixture):
         before = len(self.write_calls())
         other = request('next-entry')
         result = self.invoke(other, permission(other))
-        self.assertIs(result.state, BS.OUTCOME_UNKNOWN if reconcile else BS.DENIED)
+        self.assertIs(result.state, BS.OUTCOME_UNKNOWN if reconcile or self.journal._inhibited else BS.DENIED)
+        if self.journal._inhibited:
+            self.assertTrue(self.broker.reconciliation_required)
+            self.assertTrue(self.coordinator._reconciliation_required)
         self.assertEqual(len(self.write_calls()), before)
         self.assertFalse(hasattr(result, 'accepted'))
 
@@ -646,7 +649,11 @@ class ConcurrencyPrivacyTests(CallbackFixture):
             a=pool.submit(sync); b=pool.submit(duplicate); gate.wait(5)
             a.result(5); b.result(5)
         self.assertEqual(len(self.write_calls()),1)
-        self.assertTrue(self.coordinator._broker_state_reconciliation_required)
+        # The non-owner submission now permanently inhibits the runtime; that
+        # stronger barrier outranks callback confirmation regardless of race order.
+        self.assertTrue(self.coordinator._reconciliation_required)
+        self.assertTrue(self.broker.reconciliation_required)
+        self.assertTrue(self.write._requires_reconciliation())
 
     def test_disconnect_races_with_sync_without_deadlock(self):
         self.pending(); self.open(); gate=Barrier(3)

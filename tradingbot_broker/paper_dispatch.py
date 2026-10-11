@@ -23,6 +23,9 @@ from .paper_execution import (PaperExecutionScope, PaperExecutionAuthorizationSt
     _timestamp_value)
 from .readonly_models import AccountMode, ReadOnlyError
 from .safety import Controls, submission_gates
+from .paper_dispatch_journal_context import _adapt_dispatch_journal_context
+from .paper_dispatch_journal import _PaperDispatchJournalOwner, _values as _journal_values
+from .paper_execution_journal import _ReconciliationReason
 
 
 class _BridgeState(StrEnum):
@@ -68,6 +71,9 @@ class _Attempt:
     capability: object
     snapshots: tuple
     binding: tuple
+    context: object
+    approval: object
+    position: object
 
     def __repr__(self):
         return '<PrivatePaperDispatchAttempt>'
@@ -274,6 +280,9 @@ class _PaperOrderDispatchCoordinator:
         self._active_attempt = None
         self._prepared_attempt = None
         self._prepared_reservation = None
+        self._prepared_journal_proof = None
+        self.__journal_owner = None
+        self.__journal_setup_started = False
         self._broker_reconciliation_sequence = 0
         self._broker_reconciliation_attempt = None
         self._pair_values = self._pairing()
@@ -283,6 +292,43 @@ class _PaperOrderDispatchCoordinator:
 
     def __repr__(self):
         return '<OfflinePaperOrderDispatchCoordinator>'
+
+    def __setattr__(self, name, value):
+        if name in ('_PaperOrderDispatchCoordinator__journal_owner',
+                    '_PaperOrderDispatchCoordinator__journal_setup_started') and hasattr(self, name):
+            raise ReadOnlyError('PAPER_JOURNAL_ASSOCIATION_IMMUTABLE')
+        super().__setattr__(name, value)
+
+    def __delattr__(self, name):
+        if name in ('_PaperOrderDispatchCoordinator__journal_owner',
+                    '_PaperOrderDispatchCoordinator__journal_setup_started'):
+            raise ReadOnlyError('PAPER_JOURNAL_ASSOCIATION_IMMUTABLE')
+        super().__delattr__(name)
+
+    @property
+    def _journal_owner(self): return self.__journal_owner
+
+    @property
+    def _journal_setup_started(self): return self.__journal_setup_started
+
+    def _start_journal_setup(self):
+        if not self._lock._is_owned() or self.__journal_setup_started:
+            raise ReadOnlyError('PAPER_JOURNAL_ASSOCIATION_IMMUTABLE')
+        object.__setattr__(self, '_PaperOrderDispatchCoordinator__journal_setup_started', True)
+
+    def _claim_journal_owner(self, owner):
+        self._require_outer_locks()
+        if type(owner) is not _PaperDispatchJournalOwner or self.__journal_owner is not None:
+            raise ReadOnlyError('PAPER_JOURNAL_ASSOCIATION_IMMUTABLE')
+        owner._local_check(self, setup=True)
+        object.__setattr__(self, '_PaperOrderDispatchCoordinator__journal_owner', owner)
+
+    def _require_journal_owner(self):
+        owner = self.__journal_owner
+        if type(owner) is not _PaperDispatchJournalOwner:
+            raise ReadOnlyError('PAPER_DISPATCH_JOURNAL_UNAVAILABLE')
+        owner._local_check(self)
+        return owner
 
     def _pairing(self, *, validate=True):
         read, write = self._control._transport.config, self._write._config
@@ -424,11 +470,32 @@ class _PaperOrderDispatchCoordinator:
             self._check_reservation(attempt, reservation)
         self._check(attempt.order, attempt.permission, attempt.capability,
                     attempt.snapshots, attempt.binding)
+        owner = self._require_journal_owner()
+        try:
+            proof = owner._prepare(self, attempt, reservation)
+        except BaseException:
+            owner._inhibit()
+            self._mark_reconciliation(audit=False)
+            raise
+        # SQLite/enrollment latency cannot leave a stale preparation proof.
+        owner._authenticate(self)
+        fresh = _adapt_dispatch_journal_context(attempt.order, attempt.permission,
+            attempt.approval, attempt.position,
+            next(c for c in self._contracts if c.security_id == attempt.order.security_id),
+            at=self._control._processing_time())
+        if _journal_values((fresh.order, fresh.contract, fresh.strategy, fresh.risk)) != \
+                _journal_values((attempt.context.order, attempt.context.contract,
+                                 attempt.context.strategy, attempt.context.risk)):
+            raise ReadOnlyError('PAPER_BRIDGE_INPUT_CHANGED')
+        self._check(attempt.order, attempt.permission, attempt.capability,
+                    attempt.snapshots, attempt.binding)
         with self._write._arrival_lock:
             self._check_reservation(attempt, reservation)
+            owner._require_marker(self, attempt, reservation, proof)
             if attempt is not self._active_attempt or self._prepared_attempt is not None:
                 raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
             self._prepared_attempt, self._prepared_reservation = attempt, reservation
+            self._prepared_journal_proof = proof
 
     def _validate_commit(self, reservation, challenge):
         self._require_outer_locks()
@@ -442,15 +509,40 @@ class _PaperOrderDispatchCoordinator:
                 or attempt.order.client_order_id not in self._attempts):
             raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
         self._check_reservation(attempt, reservation)
+        owner = self._require_journal_owner()
+        owner._require_marker(self, attempt, reservation, self._prepared_journal_proof)
         # Enrollment was freshly authenticated under the same held read locks.
         # Recheck that binding and current evidence; no file read in commitment.
         self._check(attempt.order, attempt.permission, attempt.capability,
                     attempt.snapshots, attempt.binding, collect=False)
         self._check_reservation(attempt, reservation)
+        owner._require_marker(self, attempt, reservation, self._prepared_journal_proof)
         if (attempt is not self._active_attempt or attempt is not self._prepared_attempt
                 or reservation is not self._prepared_reservation):
             raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
         return challenge
+
+    def _sdk_returned(self, reservation):
+        self._require_outer_locks()
+        attempt = self._active_attempt
+        try:
+            owner = self._require_journal_owner()
+            if reservation is not self._prepared_reservation:
+                raise ReadOnlyError('PAPER_COMMIT_RESERVATION_MISMATCH')
+            owner._returned(self, attempt, reservation, self._prepared_journal_proof)
+        except BaseException:
+            self._mark_reconciliation(audit=False)
+            if type(self.__journal_owner) is _PaperDispatchJournalOwner:
+                self.__journal_owner._uncertain(self, _ReconciliationReason.TRANSPORT_POISON, attempt)
+            raise
+
+    def _sdk_uncertain(self, reservation, interrupted):
+        self._require_outer_locks()
+        self._mark_reconciliation(audit=False)
+        if type(self.__journal_owner) is _PaperDispatchJournalOwner:
+            self.__journal_owner._uncertain(self,
+                _ReconciliationReason.DISPATCH_INTERRUPTED if interrupted else _ReconciliationReason.SDK_EXCEPTION,
+                self._active_attempt)
 
     def _mark_reconciliation(self, *, audit=True):
         # Safety first, before optional audit/report construction can fail.
@@ -462,6 +554,8 @@ class _PaperOrderDispatchCoordinator:
         control = self._control
         control._reconciliation_required = True
         control._paper_authority._revoke(PaperExecutionAuthorizationStatus.INVALIDATED)
+        if type(self.__journal_owner) is _PaperDispatchJournalOwner:
+            self.__journal_owner._inhibit()
         if changed and audit:
             try:
                 control._authorization_audit('PAPER_EXECUTION_INVALIDATED', 'PAPER_WRITE_RECONCILIATION_REQUIRED')
@@ -708,30 +802,62 @@ class _PaperOrderDispatchCoordinator:
             self._broker_reconciliation_attempt = None
             return bundle
 
-    def _dispatch_entry(self, order, permission, capability):
+    def _dispatch_entry(self, order, permission, capability, *, approval=None, position=None):
         # A typed bounded request ID is consumed even if later gates deny it.
         if type(order) is not OrderRequest:
             raise ReadOnlyError('INVALID_PAPER_BRIDGE_INPUT')
         identifier(order.client_order_id)
         client_id = order.client_order_id
         with self._lock:
+            newly_consumed = False
             def result(state, reason, order_id=None):
+                owner = self.__journal_owner
+                if (state is _BridgeState.DENIED and newly_consumed
+                        and type(owner) is _PaperDispatchJournalOwner and not owner._inhibited):
+                    with self._control._lock:
+                        try:
+                            owner._denied(self, client_id)
+                        except BaseException as error:
+                            owner._inhibit()
+                            self._mark_reconciliation(audit=False)
+                            if not isinstance(error, Exception):
+                                raise
                 if self._reconciliation_required:
                     state, reason = _BridgeState.OUTCOME_UNKNOWN, _BridgeReason.RECONCILIATION_REQUIRED
                 try:
                     return _BridgeResult(client_id, state, reason, self._control._processing_time(),
                         order_id, self._reconciliation_required, self._pending_confirmation)
                 except BaseException as error:
+                    if self._write._write_invocation_started:
+                        with self._control._lock:
+                            self._mark_reconciliation(audit=False)
                     if not isinstance(error, Exception):
-                        if self._write._write_invocation_started:
-                            with self._control._lock:
-                                self._mark_reconciliation(audit=False)
                         raise
                     raise ReadOnlyError('PAPER_BRIDGE_RESULT_UNAVAILABLE') from None
             control, read, write = self._control, self._control._transport, self._write
             if self._active_attempt is not None:
                 self._attempts.add(client_id)
+                # No nested SQLite work during an SDK call. Undurable reentrant
+                # consumption instead permanently inhibits this runtime owner.
+                with control._lock:
+                    if type(self.__journal_owner) is _PaperDispatchJournalOwner:
+                        self.__journal_owner._inhibit()
+                    self._mark_reconciliation(audit=False)
+                return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.RECONCILIATION_REQUIRED)
+            if type(self.__journal_owner) is not _PaperDispatchJournalOwner:
+                self._attempts.add(client_id)
                 return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED)
+            try:
+                with control._lock, read._lifecycle, read._condition, write._lock:
+                    owner = self._require_journal_owner()
+            except BaseException as error:
+                self._attempts.add(client_id)
+                with control._lock:
+                    self.__journal_owner._inhibit()
+                    self._mark_reconciliation(audit=False)
+                if not isinstance(error, Exception):
+                    raise
+                return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.RECONCILIATION_REQUIRED)
             # Fatal transport state outranks EVERY duplicate/pending fast return.
             with control._lock:
                 self._sync_callbacks_locked()
@@ -744,57 +870,81 @@ class _PaperOrderDispatchCoordinator:
                     return result(_BridgeState.DENIED, _BridgeReason.DUPLICATE_ORDER)
                 if self._broker_state_reconciliation_required:
                     self._attempts.add(client_id)
+                    newly_consumed = True
                     return result(_BridgeState.DENIED, _BridgeReason.BROKER_STATE_RECONCILIATION_REQUIRED)
                 if self._pending_confirmation:
                     self._attempts.add(client_id)
+                    newly_consumed = True
                     return result(_BridgeState.DENIED, _BridgeReason.PENDING_CONFIRMATION)
             self._attempts.add(client_id)
+            newly_consumed = True
             try:
                 snapshots = (_order_snapshot(order), _permission_snapshot(permission))
                 # Poll outside lifecycle/callback/write locks; disconnect may join a reader.
                 control.poll()
                 with control._lock, read._lifecycle, read._condition, write._lock:
-                    binding, _ = self._check(order, permission, capability, snapshots)
+                    binding, at = self._check(order, permission, capability, snapshots)
+                    selected = next(c for c in self._contracts if c.security_id == order.security_id)
+                    context = _adapt_dispatch_journal_context(order, permission, approval, position,
+                                                             selected, at=at)
                 spec = self._translate(order)
-            except Exception:
+            except BaseException as error:
+                if not isinstance(error, Exception):
+                    with control._lock:
+                        owner._uncertain(self, _ReconciliationReason.DISPATCH_INTERRUPTED)
+                    raise
                 return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED)
             with control._lock, read._lifecycle, read._condition, write._lock:
                 try:
                     self._check(order, permission, capability, snapshots, binding)
-                except Exception:
+                except BaseException as error:
+                    if not isinstance(error, Exception):
+                        owner._uncertain(self, _ReconciliationReason.DISPATCH_INTERRUPTED)
+                        raise
                     return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED)
-                self._active_attempt = _Attempt(order, permission, capability, snapshots, binding)
-                selected = next(c for c in self._contracts if c.security_id == order.security_id)
-                # Copy expected identity BEFORE SDK invocation. Caller-held models
-                # are never reread to establish callback identity after dispatch.
-                expected = (order.client_order_id, write._generation, write._config.client_id,
-                    selected.con_id, order.security_id, order.symbol, order.currency, 'BUY',
-                    order.quantity, 'MKT', 'DAY', control._processing_time())
+                attempt = None
+                allocator_before = (write._lifetime_order_floor, write._lifetime_order_ids_exhausted)
                 try:
+                    self._active_attempt = attempt = _Attempt(order, permission, capability, snapshots,
+                                                              binding, context, approval, position)
+                    selected = next(c for c in self._contracts if c.security_id == order.security_id)
+                    # Copy identity before invocation; never infer ownership from
+                    # caller-held values after dispatch.
+                    expected = (order.client_order_id, write._generation, write._config.client_id,
+                        selected.con_id, order.security_id, order.symbol, order.currency, 'BUY',
+                        order.quantity, 'MKT', 'DAY', control._processing_time())
                     outcome = write._dispatch_new(spec)
                 except BaseException as error:
                     if not isinstance(error, Exception):
-                        # C1 only latches post-invocation uncertainty. A preflight
-                        # interruption still consumes reservations, without making
-                        # a false claim that SDK dispatch began.
-                        if write._requires_reconciliation():
-                            self._mark_reconciliation(audit=False)
+                        # Consumed memory may have diverged from durable history.
+                        # Inhibition never claims that an SDK call actually began.
+                        owner._uncertain(self, _ReconciliationReason.DISPATCH_INTERRUPTED, attempt)
                         raise
-                    self._mark_reconciliation()
+                    owner._uncertain(self, _ReconciliationReason.DISPATCH_INTERRUPTED, attempt)
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN)
                 finally:
                     self._active_attempt = self._prepared_attempt = None
                     self._prepared_reservation = None
+                    self._prepared_journal_proof = None
                 if (type(outcome) is not _DispatchResult or outcome.operation is not _Operation.PLACE_ORDER):
                     self._mark_reconciliation()
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN)
+                allocator_changed = allocator_before != (
+                    write._lifetime_order_floor, write._lifetime_order_ids_exhausted)
+                if outcome.state is _DispatchState.NOT_DISPATCHED and (
+                        owner._marker_may_exist(attempt) or allocator_changed):
+                    # A consumed numeric ID that never reached a durable record
+                    # also prohibits continuing with incomplete runtime history.
+                    owner._uncertain(self, _ReconciliationReason.UNRESOLVED_LIFECYCLE, attempt)
+                    return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN,
+                                  outcome.order_id)
                 if outcome.state is _DispatchState.NOT_DISPATCHED:
                     if outcome.reconciliation_required or write._requires_reconciliation():
                         self._mark_reconciliation()
                     return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED, outcome.order_id)
                 if (outcome.state is _DispatchState.OUTCOME_UNKNOWN or outcome.reconciliation_required
                         or write._requires_reconciliation()):
-                    self._mark_reconciliation()
+                    owner._uncertain(self, _ReconciliationReason.TRANSPORT_POISON, attempt)
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN, outcome.order_id)
                 if outcome.state is not _DispatchState.DISPATCHED:
                     self._mark_reconciliation()

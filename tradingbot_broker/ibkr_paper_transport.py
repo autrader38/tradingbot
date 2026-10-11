@@ -530,7 +530,9 @@ Private session/dispatch methods support offline qualification only in this phas
             # Capture reviewed methods, not mutable per-instance hook attributes.
             binding = (owner,
                 _PaperOrderDispatchCoordinator._prepare_commit.__get__(owner),
-                _PaperOrderDispatchCoordinator._validate_commit.__get__(owner))
+                _PaperOrderDispatchCoordinator._validate_commit.__get__(owner),
+                _PaperOrderDispatchCoordinator._sdk_returned.__get__(owner),
+                _PaperOrderDispatchCoordinator._sdk_uncertain.__get__(owner))
             object.__setattr__(self, '_PaperTWSTransport__dispatch_binding', binding)
 
     def __repr__(self): return '<PaperTWSTransport offline-foundation>'
@@ -958,7 +960,19 @@ Private session/dispatch methods support offline qualification only in this phas
                 self._consume_commitment(commitment)
             # No new eligibility decision, clock, hook or lock acquisition here.
             errors_before = self._error_sequence
-            self._client.placeOrder(order_id, contract, order)
+            try:
+                self._client.placeOrder(order_id, contract, order)
+            except BaseException as error:
+                self._latch_reconciliation()
+                try:
+                    binding[4](reservation, not isinstance(error, Exception))
+                except BaseException:
+                    # The exact original SDK interruption must survive diagnostics.
+                    pass
+                raise
+            # Captured private owner hook; no callback thread accesses storage.
+            # This records normal return BEFORE result construction can fail.
+            binding[3](reservation)
             codes = tuple(self._errors) if self._error_sequence != errors_before else ()
             if codes:
                 self._latch_reconciliation()

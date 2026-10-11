@@ -6,8 +6,10 @@ unsupported; callbacks cannot attest PAPER account mode or grant authorization.
 """
 
 from dataclasses import dataclass, fields, replace
+from datetime import datetime, timezone
 from decimal import Decimal, Context, localcontext
 from enum import Enum, StrEnum
+from hashlib import sha256
 import importlib
 import inspect
 import logging
@@ -17,7 +19,7 @@ from .ibkr_readonly import _load_official_api, _read_opcodes, _PROTOBUF_READ_BAS
 from .ibkr_readonly_wire import sdk_call
 from .ibkr_paper_wire import (_guarded_connection, _LEGACY_POLICY, _PROTOBUF_POLICY,
                               _LEGACY_WRITES, _PROTOBUF_WRITES)
-from .models import Side, identifier
+from .models import Side, identifier, validate_timestamp
 from .readonly_models import AccountMode, ReadOnlyError
 
 
@@ -237,6 +239,32 @@ class _ExecutionEvidence(_PrivateEvidence):
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class _CommissionEvidence(_PrivateEvidence):
+    """Unattributed received fact, never a fee-completeness or recovery claim."""
+    generation: int
+    sequence: int
+    exec_id: str
+    report_id: str
+    amount: Decimal
+    currency: str
+    received_at: datetime
+
+    def __post_init__(self):
+        if any(type(v) is not int or v <= 0 for v in (self.generation, self.sequence)):
+            raise ValueError()
+        _callback_text(self.exec_id, reference=True)
+        if type(self.amount) is not Decimal or type(self.report_id) is not str:
+            raise ValueError()
+        _commission_amount(self.amount)
+        _commission_currency(self.currency)
+        if self.report_id != _commission_report_id(self.exec_id, self.amount, self.currency):
+            raise ValueError()
+        if type(self.received_at) is not datetime or self.received_at.tzinfo is not timezone.utc:
+            raise ValueError()
+        validate_timestamp(self.received_at)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _EvidenceBatch(_PrivateEvidence):
     through_sequence: int
     events: tuple
@@ -284,6 +312,70 @@ def _callback_status(value):
     return value if type(value) is str and value in _STATUSES else 'UNKNOWN'
 
 
+def _commission_amount(value):
+    if type(value) in (float, int):
+        value = Decimal(str(value))
+    if type(value) is not Decimal or not value.is_finite():
+        raise ValueError()
+    parts = value.as_tuple()
+    if len(parts.digits) > 64 or not -64 <= parts.exponent <= 64:
+        raise ValueError()
+    return Decimal(parts)  # Independent exact copy; no arithmetic/rounding.
+
+
+def _commission_currency(value):
+    # Qualified currency codes, never account IDs or arbitrary broker messages.
+    if type(value) is not str or len(value) != 3 or any(not 'A' <= c <= 'Z' for c in value):
+        raise ValueError()
+    return value
+
+
+def _commission_report_id(exec_id, amount, currency):
+    # Canonical numeric equality without normalize(), which obeys ambient precision.
+    sign, digits, exponent = amount.as_tuple()
+    if not any(digits):
+        number = '0'
+    else:
+        digits = list(digits)
+        while digits[-1] == 0:
+            digits.pop()
+            exponent += 1
+        number = f'{sign}:{"".join(map(str, digits))}:{exponent}'
+    encoded = b'paper-commission-report-v1\0'
+    for tag, value in ((b'exec_id:str', exec_id), (b'amount:decimal', number),
+                       (b'currency:str', currency)):
+        data = value.encode('ascii')
+        encoded += tag + b'\0' + len(data).to_bytes(4, 'big') + data
+    return 'commission-' + sha256(encoded).hexdigest()
+
+
+def _commission_receipt_time():
+    return datetime.now(timezone.utc)
+
+
+def _copy_commission(generation, sequence, value, clock):
+    variant, report = value
+    stamp = clock()  # Local receipt/sanitization, not broker or execution time.
+    if type(stamp) is not datetime:
+        raise ValueError()
+    validate_timestamp(stamp)
+    exec_id = _callback_text(report.execId, reference=True)
+    if variant == 'legacy':
+        amount = _commission_amount(report.commission)
+    elif variant == 'fees':
+        amount = _commission_amount(report.commissionAndFees)
+    else:
+        raise ValueError()
+    currency = _commission_currency(report.currency)
+    return _CommissionEvidence(generation, sequence, exec_id,
+        _commission_report_id(exec_id, amount, currency), amount, currency,
+        stamp.astimezone(timezone.utc))
+
+
+def _commission_economic_identity(event):
+    return (event.exec_id, event.report_id, event.amount, event.currency)
+
+
 def _copy_callback(generation, sequence, kind, value):
     """Copy only qualified primitive fields; never inspect account/whyHeld text."""
     if kind == 'open':
@@ -316,6 +408,11 @@ def _copy_callback(generation, sequence, kind, value):
 
 
 def _evidence_identity(event):
+    if type(event) is _CommissionEvidence:
+        # Source occurrences only compress when their actual receipt instants also
+        # agree. Differing instants remain separate; economic identity ignores time.
+        return (type(event), (event.generation, event.received_at,
+                             *_commission_economic_identity(event)))
     return (type(event), tuple(getattr(event, f.name) for f in fields(event)
                               if f.name != 'sequence'))
 
@@ -414,8 +511,8 @@ def _make_paper_client(api, owner, generation):
         def execDetails(self, reqId, contract, execution):
             owner._callback(generation, 'execution', (contract, execution))
         def execDetailsEnd(self, reqId): owner._callback(generation, 'executions_end')
-        def commissionReport(self, report): owner._callback(generation, 'commission')
-        def commissionAndFeesReport(self, report): owner._callback(generation, 'commission')
+        def commissionReport(self, report): owner._callback(generation, 'commission', ('legacy', report))
+        def commissionAndFeesReport(self, report): owner._callback(generation, 'commission', ('fees', report))
         def connectionClosed(self): owner._callback(generation, 'closed')
 
     connection = None
@@ -492,6 +589,7 @@ Private session/dispatch methods support offline qualification only in this phas
         self._callback_evidence = []
         self._callback_run_ends = []  # Exact duplicate sequence spans, bounded with the ledger.
         self._last_callback_identity = None
+        self._commission_clock = _commission_receipt_time  # Private captured local clock.
         self._commit_callback_sequence = 0
         self._lifetime_order_floor = MIN_ORDER_ID
         self._lifetime_order_ids_exhausted = False
@@ -572,7 +670,7 @@ Private session/dispatch methods support offline qualification only in this phas
             # Never cancel/global-cancel in cleanup; no reader thread is joined.
 
     def _callback(self, generation, kind, value=None):
-        if kind in ('error', 'closed', 'open', 'status', 'execution', 'next'):
+        if kind in ('error', 'closed', 'open', 'status', 'execution', 'commission', 'next'):
             # Announce before waiting on the dispatch lock. No fairness assumption
             # about RLock acquisition can let a later writer absorb this error.
             with self._arrival_lock:
@@ -590,12 +688,15 @@ Private session/dispatch methods support offline qualification only in this phas
                         self._lifetime_order_floor = max(self._lifetime_order_floor, value)
                     else:
                         self._arrival_unusable = True
-                elif self.__dispatch_binding is not None:
+                elif self.__dispatch_binding is not None or kind == 'commission':
                     try:
-                        event = _copy_callback(generation, self._callback_sequence + 1, kind, value)
+                        event = (_copy_commission(generation, self._callback_sequence + 1,
+                                     value, self._commission_clock) if kind == 'commission'
+                                 else _copy_callback(generation, self._callback_sequence + 1, kind, value))
                         # Accepted observed IDs enter lifetime history NOW, before
                         # deferred dispatch bookkeeping or generation reset.
-                        self._raise_observed_floor(event.order_id)
+                        if type(event) is not _CommissionEvidence:
+                            self._raise_observed_floor(event.order_id)
                         self._callback_sequence += 1
                         identity = _evidence_identity(event)
                         # Consecutive exact duplicates have new sequence numbers
@@ -620,6 +721,8 @@ Private session/dispatch methods support offline qualification only in this phas
                         if self._write_invocation_started:
                             self._reconciliation_required = True
             # Release arrival BEFORE dispatch bookkeeping; never reverse nesting.
+        if kind == 'commission':
+            value = None  # Deferred bookkeeping retains only its non-economic kind flag.
         if kind in ('open', 'status'):
             kind, value = 'observed', value[0]
         with self._lock:
@@ -893,7 +996,8 @@ Private session/dispatch methods support offline qualification only in this phas
                 or self._arrival_unusable or self._reconciliation_required
                 or self._closed or self._invalid_callback or not self._initialized
                 or self._sync != 'COMPLETED' or reservation.order_id in self._known
-                or any(e.generation == reservation.generation and
+                or any(type(e) is not _CommissionEvidence and
+                       e.generation == reservation.generation and
                        e.order_id == reservation.order_id
                        for e in self._callback_evidence)):
             raise ReadOnlyError('PAPER_RESERVATION_STALE')

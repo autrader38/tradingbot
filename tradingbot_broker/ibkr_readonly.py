@@ -8,6 +8,7 @@ import importlib
 import logging
 import math
 import os
+import secrets
 import socket
 from threading import Condition, Thread, RLock, get_ident
 from time import monotonic
@@ -20,6 +21,40 @@ from .models import (AccountSnapshot, BrokerEvent, Commission, EventKind, Fill,
 from .readonly_models import (AccountIdentity, ObservedOrder, ReadOnlyError,
                               ReadOnlySnapshot, broker_decimal)
 from .ibkr_readonly_wire import guarded_connection, client_view, sdk_call
+from .paper_execution_journal import _JournalAccountBinding
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _JournalAccountBindingReceipt:
+    """Private association evidence only; never execution/recovery authority."""
+    version: int
+    binding: _JournalAccountBinding
+    read_generation: int
+
+    def __post_init__(self):
+        if (type(self.version) is not int or self.version != 1
+                or type(self.binding) is not _JournalAccountBinding
+                or type(self.read_generation) is not int or self.read_generation <= 0):
+            raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+        _JournalAccountBinding.__post_init__(self.binding)
+
+    def __repr__(self):
+        return '<PrivateJournalAccountBindingReceipt>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _JournalAccountAssociation:
+    # Authentication revision stays inside the issuer, as in the existing
+    # execution binding. No account number, fingerprint, key or SDK object.
+    receipt: _JournalAccountBindingReceipt
+    opaque_id: str
+    generation: int
+    configuration: tuple
+    revision: str
+    valid_until: datetime
+
+    def __repr__(self):
+        return '<PrivateJournalAccountAssociation>'
 
 
 def utc_now():
@@ -623,9 +658,12 @@ class ReadOnlyTWSTransport:
         self._reconciliation_read_request = None
         self._reconciliation_read_binding = None
         self._reconciliation_read_receipt = None
+        self._journal_account_association = None
+        self._journal_account_binding_issued = False  # Instance lifetime, no rebind.
         self._reset()
 
     def _reset(self):
+        self._journal_account_association = None
         self._disconnect_emitted = False
         self._ready = False
         self._accounts = ()
@@ -967,6 +1005,84 @@ class ReadOnlyTWSTransport:
                 raise ReadOnlyError('PAPER_EXECUTION_ENROLLMENT_MISMATCH')
             return self._generation, record['authentication'], self._snapshot.account.valid_until
 
+    def _journal_binding_context(self):
+        # Caller holds lifecycle -> condition. Enrollment authentication may
+        # read its qualified local store; no SDK request or authorization change.
+        if (type(self) is not ReadOnlyTWSTransport or type(self.config) is not TWSReadOnlyConfig
+                or type(self._snapshot) is not ReadOnlySnapshot
+                or type(self._snapshot.account) is not AccountSnapshot
+                or self._snapshot.account.verified is not True
+                or self._snapshot.account.mode is not None):
+            raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+        ReadOnlySnapshot.__post_init__(self._snapshot)
+        AccountSnapshot.__post_init__(self._snapshot.account)
+        self.config.__post_init__()
+        configuration = tuple(getattr(self.config, f.name) for f in fields(TWSReadOnlyConfig))
+        generation, snapshot = self._generation, self._snapshot
+        if type(generation) is not int or generation <= 0:
+            raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+        bound_generation, revision, valid_until = self._paper_execution_binding()
+        connected = self._current_sdk_connection_evidence(generation)
+        at = self._clock()  # Recheck AFTER enrollment/connection inspection latency.
+        validate_timestamp(at)
+        self._validate_paper_execution_observation(generation, at)
+        if (connected is not True or generation != bound_generation
+                or snapshot is not self._snapshot
+                or configuration != tuple(getattr(self.config, f.name) for f in fields(TWSReadOnlyConfig))
+                or at >= valid_until):
+            raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+        return generation, configuration, revision, valid_until
+
+    def _issue_journal_account_binding(self):
+        """One authenticated namespace per transport lifetime; no store adoption."""
+        with self._lifecycle, self._condition:
+            try:
+                if self._journal_account_binding_issued:
+                    raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+                context = self._journal_binding_context()
+                binding = _JournalAccountBinding('binding-' + secrets.token_hex(16))
+                receipt = _JournalAccountBindingReceipt(1, binding, context[0])
+                # Random/constructor work may be interrupted or delayed. Secure
+                # a second authenticated context before publishing anything.
+                final = self._journal_binding_context()
+                if context != final:
+                    raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+                association = _JournalAccountAssociation(receipt, binding.opaque_id, *final)
+                self._journal_account_binding_issued = True
+                self._journal_account_association = association
+                return receipt
+            except BaseException as error:
+                self._journal_account_association = None
+                if not isinstance(error, Exception):
+                    raise
+                raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING') from None
+
+    def _validate_journal_account_binding(self, receipt):
+        """Authenticate exact issuer provenance afresh, without arming or writing."""
+        with self._lifecycle, self._condition:
+            try:
+                association = self._journal_account_association
+                if (type(association) is not _JournalAccountAssociation
+                        or type(receipt) is not _JournalAccountBindingReceipt
+                        or receipt is not association.receipt):
+                    raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+                _JournalAccountBindingReceipt.__post_init__(receipt)
+                if (receipt.binding.opaque_id != association.opaque_id
+                        or receipt.read_generation != association.generation):
+                    raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+                context = self._journal_binding_context()
+                if (context[:3] != (association.generation, association.configuration, association.revision)
+                        or context[3] != association.valid_until):
+                    raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING')
+                return _JournalAccountBinding(association.opaque_id)
+            except BaseException as error:
+                # Failure/interruption permanently invalidates this association.
+                # Equal headers/receipts can never recreate lost issuer provenance.
+                self._journal_account_association = None
+                if not isinstance(error, Exception):
+                    raise
+                raise ReadOnlyError('INVALID_JOURNAL_ACCOUNT_BINDING') from None
+
     def _current_sdk_connection_evidence(self, generation):
         # EClient.isConnected is a local state inspection, not a broker request.
         # Exact bool only; None means unavailable. Never return an SDK object/error.
@@ -1263,6 +1379,7 @@ class ReadOnlyTWSTransport:
 
     def _disconnect(self):
         with self._condition:
+            self._journal_account_association = None
             self._reconciliation_fail('GENERATION_LOST')
             self._generation += 1
             client, self._client = self._client, None

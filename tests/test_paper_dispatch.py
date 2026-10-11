@@ -755,10 +755,10 @@ class ProofCorrections(BridgeFixture):
     def test_legitimate_proof_exact_identity_inside_commitment(self):
         original=Coordinator._validate_commit
         observations=[]
-        def checked(owner,challenge):
+        def checked(owner,reservation,challenge):
             self.assertTrue(owner._write._arrival_lock._is_owned())
             self.assertFalse(owner._write._write_invocation_started)
-            value=original(owner,challenge)
+            value=original(owner,reservation,challenge)
             self.assertIs(value,challenge)
             observations.append(True)
             return value
@@ -791,7 +791,7 @@ class ProofCorrections(BridgeFixture):
 
     def test_stale_proof_cannot_be_replayed(self):
         challenges=[]
-        def replay(owner,challenge):
+        def replay(owner,reservation,challenge):
             challenges.append(challenge)
             return False if len(challenges)==1 else challenges[0]
         with patch.object(Coordinator,'_validate_commit',replay):self.build()
@@ -803,7 +803,7 @@ class ProofCorrections(BridgeFixture):
         self.assertEqual(self.write._lifetime_order_floor,12)
 
     def test_validator_ordinary_exception_denies_without_uncertainty(self):
-        def failed(owner,challenge):raise RuntimeError('anonymous-validator-secret')
+        def failed(owner,reservation,challenge):raise RuntimeError('anonymous-validator-secret')
         with patch.object(Coordinator,'_validate_commit',failed):self.build()
         outcome=self.invoke()
         self.assert_denied(outcome)
@@ -856,7 +856,7 @@ def wrong_proof(kind):
             def __eq__(self,other):raise AssertionError('Identity must not invoke equality')
             def __bool__(self):return True
         values={'false':False,'true':True,'none':None,'int':1,'object':object(),'equal':Equal()}
-        def validator(owner,challenge):return values[kind]
+        def validator(owner,reservation,challenge):return values[kind]
         with patch.object(Coordinator,'_validate_commit',validator):self.build()
         outcome=self.invoke()
         self.assert_denied(outcome)
@@ -874,7 +874,7 @@ for kind in ('false','true','none','int','object','equal'):
 def validator_interruption(exception_type):
     def test(self):
         interruption=exception_type(37)
-        def validator(owner,challenge):raise interruption
+        def validator(owner,reservation,challenge):raise interruption
         with patch.object(Coordinator,'_validate_commit',validator):self.build()
         with self.assertRaises(exception_type) as caught:self.invoke()
         self.assertIs(caught.exception,interruption)
@@ -898,8 +898,8 @@ class CommitmentCorrections(BridgeFixture):
     def test_prior_arrival_lock_expiry_exploit_is_closed(self):
         gate={'at_commitment':False}
         prepare=Coordinator._prepare_commit
-        def prepared(owner):
-            prepare(owner)
+        def prepared(owner,reservation):
+            prepare(owner,reservation)
             gate['at_commitment']=True
         with patch.object(Coordinator,'_prepare_commit',prepared):self.build()
         real=self.write._arrival_lock
@@ -940,25 +940,25 @@ class CommitmentCorrections(BridgeFixture):
 
     def test_final_validator_checks_read_sdk_local_state_again(self):
         original=Coordinator._validate_commit
-        def changed(owner,challenge):
+        def changed(owner,reservation,challenge):
             self.api.clients[-1].isConnected=lambda:False
-            return original(owner,challenge)
+            return original(owner,reservation,challenge)
         with patch.object(Coordinator,'_validate_commit',changed):self.build()
         self.assert_denied(self.invoke())
 
     def test_final_validator_checks_write_sdk_local_state_again(self):
         original=Coordinator._validate_commit
-        def changed(owner,challenge):
+        def changed(owner,reservation,challenge):
             self.client.connected=False
-            return original(owner,challenge)
+            return original(owner,reservation,challenge)
         with patch.object(Coordinator,'_validate_commit',changed):self.build()
         self.assert_denied(self.invoke())
 
     def test_bound_generation_and_attempt_still_required(self):
         original=Coordinator._validate_commit
-        def changed(owner,challenge):
+        def changed(owner,reservation,challenge):
             owner._prepared_attempt=None
-            return original(owner,challenge)
+            return original(owner,reservation,challenge)
         with patch.object(Coordinator,'_validate_commit',changed):self.build()
         self.assert_denied(self.invoke())
 
@@ -966,14 +966,14 @@ class CommitmentCorrections(BridgeFixture):
 def commitment_expiration(name):
     def test(self):
         original=Coordinator._validate_commit
-        def expired(owner,challenge):
+        def expired(owner,reservation,challenge):
             if name=='monotonic':self.monotonic.value=self.broker._paper_authority._deadline
             elif name=='authorization':self.clock.now=self.capability.expires_at
             elif name=='account':self.clock.now=self.broker._account.valid_until
             elif name=='risk':self.clock.now=self.permission.valid_until
             elif name=='order':self.clock.now=self.order.expires_at
             else:self.clock.now=self.contracts[0].valid_until
-            return original(owner,challenge)
+            return original(owner,reservation,challenge)
         with patch.object(Coordinator,'_validate_commit',expired):
             self.build(mappings=(lambda mappings:(replace(mappings[0],
                 valid_until=request().created_at+timedelta(seconds=2)),)) if name=='contract' else None)

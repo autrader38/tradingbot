@@ -126,6 +126,70 @@ class _PrivateEvidence:
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class _DispatchReservation:
+    """Copied intent only. Issuer provenance stays in the transport registry."""
+    generation: int
+    order_id: int
+    client_id: int
+    con_id: int
+    side: str
+    quantity: Decimal
+    order_type: str
+    tif: str
+    order_ref: str
+    arrival_marker: int
+    callback_watermark: int
+    order_id_floor: int
+    allocator_exhausted: bool
+
+    def __post_init__(self):
+        if (type(self.generation) is not int or self.generation <= 0
+                or not _valid_order_id(self.order_id)
+                or type(self.client_id) is not int or not 0 < self.client_id <= MAX_ORDER_ID
+                or type(self.con_id) is not int or self.con_id <= 0
+                or type(self.side) is not str or self.side != 'BUY'
+                or type(self.quantity) is not Decimal or not self.quantity.is_finite()
+                or self.quantity <= 0 or type(self.order_type) is not str or self.order_type != 'MKT'
+                or type(self.tif) is not str or self.tif != 'DAY'
+                or any(type(v) is not int or v < 0 for v in
+                       (self.arrival_marker, self.callback_watermark))
+                or not _valid_order_id(self.order_id_floor)
+                or type(self.allocator_exhausted) is not bool):
+            raise ReadOnlyError('INVALID_PAPER_RESERVATION')
+        try:
+            identifier(self.order_ref)
+        except Exception:
+            raise ReadOnlyError('INVALID_PAPER_RESERVATION') from None
+
+    def __repr__(self):
+        return '<PrivatePaperDispatchReservation>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _InvocationCommitment:
+    reservation: _DispatchReservation
+    arrival_marker: int
+    callback_watermark: int
+
+    def __post_init__(self):
+        if (type(self.reservation) is not _DispatchReservation
+                or any(type(v) is not int or v < 0 for v in
+                       (self.arrival_marker, self.callback_watermark))):
+            raise ReadOnlyError('INVALID_PAPER_COMMITMENT')
+        _DispatchReservation.__post_init__(self.reservation)
+
+    def __repr__(self):
+        return '<PrivatePaperInvocationCommitment>'
+
+
+def _reservation_values(reservation):
+    if type(reservation) is not _DispatchReservation:
+        raise ReadOnlyError('INVALID_PAPER_RESERVATION')
+    _DispatchReservation.__post_init__(reservation)
+    return tuple(getattr(reservation, f.name) for f in fields(_DispatchReservation))
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _OpenOrderEvidence(_PrivateEvidence):
     generation: int
     sequence: int
@@ -414,6 +478,13 @@ Private session/dispatch methods support offline qualification only in this phas
         # Never held while waiting for _lock or calling SDK methods. An error can
         # revoke write eligibility even when its bookkeeping waits on dispatch.
         self._arrival_lock = RLock()
+        self._arrival_sequence = 0  # Transport lifetime, separate from callback evidence.
+        self._arrival_unusable = False  # Current generation: error/closed/malformed arrival.
+        self._active_reservation = self._reservation_snapshot = None
+        self._active_commitment = self._commitment_snapshot = None
+        self._commitment_consumed = False
+        self._bound_invocation_may_occur = False
+        self._sdk_object_types = (api.Contract, api.Order)
         self._reconciliation_required = False  # Instance lifetime; no clear API.
         self._write_invocation_started = False  # Never reset by reconnect.
         self._callback_generation = 0
@@ -483,6 +554,7 @@ Private session/dispatch methods support offline qualification only in this phas
             with self._arrival_lock:
                 self._generation += 1
                 self._callback_generation = self._generation
+                self._arrival_unusable = False
             self._reset()
             self._client = self._create_client(self._generation)
 
@@ -498,16 +570,25 @@ Private session/dispatch methods support offline qualification only in this phas
             # Never cancel/global-cancel in cleanup; no reader thread is joined.
 
     def _callback(self, generation, kind, value=None):
-        if kind in ('error', 'open', 'status', 'execution'):
+        if kind in ('error', 'closed', 'open', 'status', 'execution', 'next'):
             # Announce before waiting on the dispatch lock. No fairness assumption
             # about RLock acquisition can let a later writer absorb this error.
             with self._arrival_lock:
                 if (type(generation) is not int or generation != self._callback_generation
                         or kind != 'error' and self._closed):
                     return
-                if kind == 'error' and self._write_invocation_started:
-                    self._reconciliation_required = True
-                elif kind != 'error' and self.__dispatch_binding is not None:
+                self._arrival_sequence += 1
+                if kind in ('error', 'closed'):
+                    self._arrival_unusable = True
+                    if self._write_invocation_started:
+                        self._reconciliation_required = True
+                elif kind == 'next':
+                    # An allocator update must be visible before bookkeeping waits.
+                    if _valid_order_id(value):
+                        self._lifetime_order_floor = max(self._lifetime_order_floor, value)
+                    else:
+                        self._arrival_unusable = True
+                elif self.__dispatch_binding is not None:
                     try:
                         event = _copy_callback(generation, self._callback_sequence + 1, kind, value)
                         # Accepted observed IDs enter lifetime history NOW, before
@@ -528,6 +609,7 @@ Private session/dispatch methods support offline qualification only in this phas
                         else:
                             self._callback_run_ends[-1] = event.sequence
                     except BaseException as error:
+                        self._arrival_unusable = True
                         if not isinstance(error, Exception):
                             # Interrupted current-generation truth collection is
                             # uncertain. Secure local safety BEFORE propagation.
@@ -674,6 +756,9 @@ Private session/dispatch methods support offline qualification only in this phas
         with self._lock:
             if type(operation) is not _Operation:
                 raise ReadOnlyError('INVALID_PAPER_OPERATION')
+            binding = self.__dispatch_binding
+            if binding is not None and operation is _Operation.PLACE_ORDER:
+                return self._dispatch_bound_new(argument, binding)
             generation = self._generation
             order_id = None
             try:
@@ -695,10 +780,6 @@ Private session/dispatch methods support offline qualification only in this phas
                     raise ReadOnlyError('INVALID_PAPER_OPERATION')
                 if generation != self._generation or not self._connected():
                     raise ReadOnlyError('PAPER_SESSION_NOT_READY')
-                # Refresh authenticated local evidence outside the arrival lock.
-                # The permanently bound owner already holds all outer locks.
-                if binding is not None:
-                    binding[1]()
             except Exception:
                 return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
                     _Reason.PREFLIGHT_FAILED, generation, order_id,
@@ -712,20 +793,6 @@ Private session/dispatch methods support offline qualification only in this phas
                     return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
                         _Reason.PREFLIGHT_FAILED, generation, order_id,
                         reconciliation_required=True)
-                if binding is not None:
-                    challenge = object()  # Local, fresh; no retained/replayable proof.
-                    try:
-                        proof = binding[2](challenge)
-                        if proof is not challenge:
-                            raise ReadOnlyError('PAPER_COMMIT_PROOF_INVALID')
-                    except Exception:
-                        return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
-                            _Reason.PREFLIGHT_FAILED, generation, order_id,
-                            reconciliation_required=self._reconciliation_required)
-                    if self._reconciliation_required:
-                        return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
-                            _Reason.PREFLIGHT_FAILED, generation, order_id,
-                            reconciliation_required=True)
                 if operation is _Operation.PLACE_ORDER:
                     self._known.add(order_id)
                 self._commit_callback_sequence = self._callback_sequence
@@ -753,3 +820,162 @@ Private session/dispatch methods support offline qualification only in this phas
                 self._latch_reconciliation()
             return _DispatchResult(_DispatchState.DISPATCHED, operation,
                 _Reason.SDK_RETURNED, generation, order_id, codes, self._requires_reconciliation())
+
+    @staticmethod
+    def _spec_identity(spec):
+        if type(spec) is not _StockMarketSpec:
+            raise ReadOnlyError('INVALID_PAPER_RESERVATION')
+        _StockMarketSpec.__post_init__(spec)
+        if spec.side is not Side.BUY or spec.order_ref is None:
+            raise ReadOnlyError('INVALID_PAPER_RESERVATION')
+        return (spec.con_id, spec.side.value, Decimal(spec.quantity.as_tuple()),
+                'MKT', 'DAY', spec.order_ref)
+
+    def _check_sdk_identity(self, contract, order, identity):
+        if (type(contract) is not self._sdk_object_types[0]
+                or type(order) is not self._sdk_object_types[1]):
+            raise ReadOnlyError('PAPER_RESERVED_INTENT_CHANGED')
+        # These are fields explicitly written by our builder on the qualified
+        # SDK classes. Inspect stored primitives, without property/SDK hooks at
+        # the final commitment boundary.
+        c = object.__getattribute__(contract, '__dict__')
+        o = object.__getattribute__(order, '__dict__')
+        if type(c) is not dict or type(o) is not dict:
+            raise ReadOnlyError('PAPER_RESERVED_INTENT_CHANGED')
+        values = (c.get('conId'), o.get('action'), o.get('totalQuantity'),
+                  o.get('orderType'), o.get('tif'), o.get('orderRef'))
+        if (tuple(type(v) for v in values) != (int, str, Decimal, str, str, str)
+                or values != identity or type(c.get('secType')) is not str
+                or c['secType'] != 'STK' or type(c.get('exchange')) is not str
+                or c['exchange'] != 'SMART'):
+            raise ReadOnlyError('PAPER_RESERVED_INTENT_CHANGED')
+
+    def _issue_reservation(self, generation, identity):
+        if not self._lock._is_owned() or not self._arrival_lock._is_owned():
+            raise ReadOnlyError('PAPER_RESERVATION_LOCKS_REQUIRED')
+        if (self.__dispatch_binding is None or self._active_reservation is not None
+                or self._arrival_unusable):
+            raise ReadOnlyError('PAPER_RESERVATION_UNAVAILABLE')
+        marker, watermark = self._arrival_sequence, self._callback_sequence
+        order_id = self._allocate_order_id(generation)
+        if (marker != self._arrival_sequence or watermark != self._callback_sequence
+                or self._lifetime_order_floor != min(order_id + 1, MAX_ORDER_ID)
+                or self._lifetime_order_ids_exhausted != (order_id == MAX_ORDER_ID)):
+            raise ReadOnlyError('PAPER_RESERVATION_STALE')
+        reservation = _DispatchReservation(generation, order_id, self._config.client_id,
+            *identity, self._arrival_sequence, self._callback_sequence,
+            self._lifetime_order_floor, self._lifetime_order_ids_exhausted)
+        snapshot = _reservation_values(reservation)
+        self._active_reservation, self._reservation_snapshot = reservation, snapshot
+        return reservation
+
+    def _validate_reservation(self, owner, reservation):
+        if not self._lock._is_owned() or not self._arrival_lock._is_owned():
+            raise ReadOnlyError('PAPER_RESERVATION_LOCKS_REQUIRED')
+        if (self.__dispatch_binding is None or owner is not self.__dispatch_binding[0]
+                or reservation is not self._active_reservation
+                or self._reservation_snapshot is None or self._commitment_consumed):
+            raise ReadOnlyError('PAPER_RESERVATION_NOT_ISSUED')
+        if (_reservation_values(reservation) != self._reservation_snapshot
+                or reservation.generation != self._generation
+                or reservation.client_id != self._config.client_id
+                or reservation.arrival_marker != self._arrival_sequence
+                or reservation.callback_watermark != self._callback_sequence
+                or reservation.order_id_floor != self._lifetime_order_floor
+                or reservation.order_id_floor != min(reservation.order_id + 1, MAX_ORDER_ID)
+                or reservation.allocator_exhausted != self._lifetime_order_ids_exhausted
+                or reservation.allocator_exhausted != (reservation.order_id == MAX_ORDER_ID)
+                or self._boundary != (None if reservation.allocator_exhausted
+                                      else reservation.order_id_floor)
+                or self._exhausted != reservation.allocator_exhausted
+                or self._arrival_unusable or self._reconciliation_required
+                or self._closed or self._invalid_callback or not self._initialized
+                or self._sync != 'COMPLETED' or reservation.order_id in self._known
+                or any(e.generation == reservation.generation and
+                       e.order_id == reservation.order_id
+                       for e in self._callback_evidence)):
+            raise ReadOnlyError('PAPER_RESERVATION_STALE')
+
+    def _stage_commitment(self, reservation):
+        self._validate_reservation(self._dispatch_coordinator_owner, reservation)
+        if self._active_commitment is not None:
+            raise ReadOnlyError('PAPER_COMMITMENT_ALREADY_ISSUED')
+        commitment = _InvocationCommitment(reservation, self._arrival_sequence, self._callback_sequence)
+        self._validate_reservation(self._dispatch_coordinator_owner, reservation)
+        self._commitment_snapshot = (reservation, commitment.arrival_marker, commitment.callback_watermark)
+        self._active_commitment = commitment
+        return commitment
+
+    def _consume_commitment(self, commitment):
+        if (type(commitment) is not _InvocationCommitment
+                or commitment is not self._active_commitment or self._commitment_consumed):
+            raise ReadOnlyError('PAPER_COMMITMENT_NOT_ISSUED')
+        self._validate_reservation(self._dispatch_coordinator_owner, commitment.reservation)
+        snapshot = self._commitment_snapshot
+        if (snapshot is None or commitment.reservation is not snapshot[0]
+                or type(commitment.arrival_marker) is not int
+                or type(commitment.callback_watermark) is not int
+                or commitment.arrival_marker != snapshot[1]
+                or commitment.callback_watermark != snapshot[2]):
+            raise ReadOnlyError('PAPER_COMMITMENT_CHANGED')
+        # First irreversible boundary: interruptions from here require inhibition.
+        self._bound_invocation_may_occur = True
+        self._commitment_consumed = True
+        self._write_invocation_started = True
+        self._known.add(commitment.reservation.order_id)
+        self._commit_callback_sequence = commitment.callback_watermark
+
+    def _dispatch_bound_new(self, spec, binding):
+        generation, order_id = self._generation, None
+        # A reentrant callback cannot replace an in-flight reservation/commitment.
+        if self._active_reservation is not None:
+            return _DispatchResult(_DispatchState.NOT_DISPATCHED, _Operation.PLACE_ORDER,
+                _Reason.PREFLIGHT_FAILED, generation, reconciliation_required=self._requires_reconciliation())
+        try:
+            if self._requires_reconciliation() or not self._connected():
+                raise ReadOnlyError('PAPER_SESSION_NOT_READY')
+            identity = self._spec_identity(spec)
+            contract, order = self._build_order(spec)
+            self._check_sdk_identity(contract, order, identity)
+            with self._arrival_lock:
+                reservation = self._issue_reservation(generation, identity)
+                order_id = reservation.order_id
+            # Authenticated file inspection stays outside arrival synchronization.
+            binding[1](reservation)
+            with self._arrival_lock:
+                self._validate_reservation(binding[0], reservation)
+                commitment = self._stage_commitment(reservation)
+                if self._spec_identity(spec) != identity:
+                    raise ReadOnlyError('PAPER_RESERVED_INTENT_CHANGED')
+                self._check_sdk_identity(contract, order, identity)
+                challenge = object()
+                proof = binding[2](reservation, challenge)
+                if proof is not challenge:
+                    raise ReadOnlyError('PAPER_COMMIT_PROOF_INVALID')
+                if self._spec_identity(spec) != identity:
+                    raise ReadOnlyError('PAPER_RESERVED_INTENT_CHANGED')
+                self._check_sdk_identity(contract, order, identity)
+                self._consume_commitment(commitment)
+            # No new eligibility decision, clock, hook or lock acquisition here.
+            errors_before = self._error_sequence
+            self._client.placeOrder(order_id, contract, order)
+            codes = tuple(self._errors) if self._error_sequence != errors_before else ()
+            if codes:
+                self._latch_reconciliation()
+            return _DispatchResult(_DispatchState.DISPATCHED, _Operation.PLACE_ORDER,
+                _Reason.SDK_RETURNED, generation, order_id, codes, self._requires_reconciliation())
+        except BaseException as error:
+            may_occur = self._bound_invocation_may_occur
+            if may_occur:
+                self._latch_reconciliation()
+            if not isinstance(error, Exception):
+                raise
+            return _DispatchResult(_DispatchState.OUTCOME_UNKNOWN if may_occur else _DispatchState.NOT_DISPATCHED,
+                _Operation.PLACE_ORDER,
+                _Reason.SDK_INVOCATION_UNCERTAIN if may_occur else _Reason.PREFLIGHT_FAILED,
+                generation, order_id, reconciliation_required=self._requires_reconciliation())
+        finally:
+            # Retained values never become a replayable authority or SDK owner.
+            self._active_reservation = self._reservation_snapshot = None
+            self._active_commitment = self._commitment_snapshot = None
+            self._commitment_consumed = self._bound_invocation_may_occur = False

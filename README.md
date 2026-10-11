@@ -64,6 +64,8 @@ Phase 10C3C4B adds [private transactional SQLite/WAL journal storage](docs/phase
 
 Phase 10C3C4C-PRE1 adds [private dispatch-journal context and authenticated account binding](docs/phase-10c3c4c-pre1-dispatch-journal-context-binding.md): pure reference projection with canonical configuration identity and an exact in-process account-association receipt. No dispatch/storage integration, broker write, PAPER attestation or recovery authority is added. C3C4C remains blocked until PRE1 is independently reviewed; Gateway Read-Only remains required.
 
+Phase 10C3C4C-PRE2 adds [private reservation-bound dispatch commitment](docs/phase-10c3c4c-pre2-reservation-dispatch-commitment.md), binding the actual allocated ID and exact intended order to arrival-aware one-shot final proof. Deferred callback bookkeeping cannot hide reserved-ID evidence, errors or connection-closed arrivals. No journal/storage integration or real execution is enabled. PRE2 requires independent review before C3C4C is re-qualified; Gateway Read-Only remains required and the first real PAPER order remains blocked.
+
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 
 After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.

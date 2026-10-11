@@ -16,7 +16,7 @@ from .ibkr_readonly_broker import ReadOnlyIBKRBroker
 from .ibkr_paper_transport import (PaperTWSTransport, PaperTWSConfig,
     _StockMarketSpec, _DispatchResult, _DispatchState, _Operation, _valid_order_id,
     _OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence, _evidence_identity,
-    _sum_callback_amounts)
+    _sum_callback_amounts, _DispatchReservation)
 from .models import (OrderRequest, RiskPermission, TradingMode, Side, OrderType,
     OrderIntent, TimeInForce, BrokerReason, AccountSnapshot, identifier)
 from .paper_execution import (PaperExecutionScope, PaperExecutionAuthorizationStatus,
@@ -273,6 +273,7 @@ class _PaperOrderDispatchCoordinator:
         self._reconciliation_required = False
         self._active_attempt = None
         self._prepared_attempt = None
+        self._prepared_reservation = None
         self._broker_reconciliation_sequence = 0
         self._broker_reconciliation_attempt = None
         self._pair_values = self._pairing()
@@ -401,30 +402,54 @@ class _PaperOrderDispatchCoordinator:
             if not lock._is_owned():
                 raise ReadOnlyError('PAPER_COMMIT_LOCKS_REQUIRED')
 
-    def _prepare_commit(self):
+    def _check_reservation(self, attempt, reservation):
+        self._write._validate_reservation(self, reservation)
+        contract = next((c for c in self._contracts
+                         if c.security_id == attempt.order.security_id), None)
+        if (type(reservation) is not _DispatchReservation or contract is None
+                or (reservation.con_id, reservation.side, reservation.quantity,
+                    reservation.order_type, reservation.tif, reservation.order_ref) !=
+                   (contract.con_id, attempt.order.side.value, attempt.order.quantity,
+                    'MKT', 'DAY', attempt.order.client_order_id)
+                or reservation.generation != attempt.binding[2]):
+            raise ReadOnlyError('PAPER_COMMIT_RESERVATION_MISMATCH')
+
+    def _prepare_commit(self, reservation):
         self._require_outer_locks()
         attempt = self._active_attempt
         if (type(attempt) is not _Attempt or self._write._dispatch_coordinator_owner is not self
                 or attempt.order.client_order_id not in self._attempts):
             raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
+        with self._write._arrival_lock:
+            self._check_reservation(attempt, reservation)
         self._check(attempt.order, attempt.permission, attempt.capability,
                     attempt.snapshots, attempt.binding)
-        self._prepared_attempt = attempt
+        with self._write._arrival_lock:
+            self._check_reservation(attempt, reservation)
+            if attempt is not self._active_attempt or self._prepared_attempt is not None:
+                raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
+            self._prepared_attempt, self._prepared_reservation = attempt, reservation
 
-    def _validate_commit(self, challenge):
+    def _validate_commit(self, reservation, challenge):
         self._require_outer_locks()
         if not self._write._arrival_lock._is_owned():
             raise ReadOnlyError('PAPER_COMMIT_LOCKS_REQUIRED')
         attempt = self._active_attempt
         if (type(challenge) is not object or type(attempt) is not _Attempt
                 or attempt is not self._prepared_attempt
+                or reservation is not self._prepared_reservation
                 or self._write._dispatch_coordinator_owner is not self
                 or attempt.order.client_order_id not in self._attempts):
             raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
+        self._check_reservation(attempt, reservation)
         # Enrollment was freshly authenticated under the same held read locks.
         # Recheck that binding and current evidence; no file read in commitment.
         self._check(attempt.order, attempt.permission, attempt.capability,
                     attempt.snapshots, attempt.binding, collect=False)
+        self._check_reservation(attempt, reservation)
+        if (attempt is not self._active_attempt or attempt is not self._prepared_attempt
+                or reservation is not self._prepared_reservation):
+            raise ReadOnlyError('PAPER_COMMIT_ATTEMPT_REQUIRED')
         return challenge
 
     def _mark_reconciliation(self, *, audit=True):
@@ -696,9 +721,17 @@ class _PaperOrderDispatchCoordinator:
                 try:
                     return _BridgeResult(client_id, state, reason, self._control._processing_time(),
                         order_id, self._reconciliation_required, self._pending_confirmation)
-                except Exception:
+                except BaseException as error:
+                    if not isinstance(error, Exception):
+                        if self._write._write_invocation_started:
+                            with self._control._lock:
+                                self._mark_reconciliation(audit=False)
+                        raise
                     raise ReadOnlyError('PAPER_BRIDGE_RESULT_UNAVAILABLE') from None
             control, read, write = self._control, self._control._transport, self._write
+            if self._active_attempt is not None:
+                self._attempts.add(client_id)
+                return result(_BridgeState.DENIED, _BridgeReason.LOCAL_GATE_FAILED)
             # Fatal transport state outranks EVERY duplicate/pending fast return.
             with control._lock:
                 self._sync_callbacks_locked()
@@ -751,6 +784,7 @@ class _PaperOrderDispatchCoordinator:
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN)
                 finally:
                     self._active_attempt = self._prepared_attempt = None
+                    self._prepared_reservation = None
                 if (type(outcome) is not _DispatchResult or outcome.operation is not _Operation.PLACE_ORDER):
                     self._mark_reconciliation()
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN)
@@ -769,8 +803,10 @@ class _PaperOrderDispatchCoordinator:
                 try:
                     self._pending_order = _PendingOrder(expected[0], outcome.order_id,
                         *expected[1:], write._commit_callback_sequence)
-                except Exception:
-                    self._mark_reconciliation()
+                except BaseException as error:
+                    self._mark_reconciliation(audit=isinstance(error, Exception))
+                    if not isinstance(error, Exception):
+                        raise
                     return result(_BridgeState.OUTCOME_UNKNOWN, _BridgeReason.DISPATCH_UNCERTAIN,
                                   outcome.order_id)
                 return result(_BridgeState.DISPATCHED_PENDING_CONFIRMATION, _BridgeReason.SDK_RETURNED,

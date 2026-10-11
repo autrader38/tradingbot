@@ -256,7 +256,9 @@ def _snapshot_matches_evidence(candidate, evidence):
 
 
 class _PaperExecutionAccountingOwner:
-    __slots__ = ('__association', '__snapshot', '__failed', '__refreshing', '__candidate')
+    __slots__ = ('__association', '__snapshot', '__failed', '__refreshing', '__candidate',
+                 '__publication', '__lifecycle_owner', '__lifecycle_setup_started',
+                 '__lifecycle_handoff')
 
     def __init__(self, *args, **kwargs):
         raise ReadOnlyError(_ERROR)
@@ -265,7 +267,7 @@ class _PaperExecutionAccountingOwner:
         return '<PrivatePaperExecutionAccountingOwner>'
 
     def __setattr__(self, name, value):
-        if name.endswith('__association') and hasattr(self, name):
+        if name.endswith(('__association', '__lifecycle_owner')) and hasattr(self, name):
             raise ReadOnlyError(_ERROR)
         object.__setattr__(self, name, value)
 
@@ -276,6 +278,8 @@ class _PaperExecutionAccountingOwner:
         _require(not hasattr(self, '_PaperExecutionAccountingOwner__association'))
         self.__association = association
         self.__snapshot, self.__failed, self.__refreshing, self.__candidate = None, False, False, None
+        self.__publication, self.__lifecycle_owner, self.__lifecycle_handoff = None, None, None
+        self.__lifecycle_setup_started = False
 
     def _matches_association(self, association):
         return (len(association) == len(self.__association)
@@ -331,7 +335,131 @@ class _PaperExecutionAccountingOwner:
         evidence = self.__candidate[1]
         self._require_candidate(candidate, evidence)
         self.__association[0]._consume_accounting_publication(self, evidence, candidate)
+        # Retain exact successful publication provenance for the historical
+        # lifecycle consumer. The accounting pointer remains the linearization.
+        self.__publication = (candidate, self.__candidate[2])
         self.__snapshot = candidate
+
+    def _create_lifecycle_owner(self):
+        from .paper_working_order import _PaperWorkingOrderEvidenceOwner
+        journal, c, control = self.__association[:3]
+        journal._thread_check()
+        with c._lock, control._lock:
+            journal._accounting_check(self)
+            _require(not self.__failed and not self.__refreshing
+                     and not self.__lifecycle_setup_started)
+            self.__lifecycle_setup_started = True
+            try:
+                owner = object.__new__(_PaperWorkingOrderEvidenceOwner)
+                owner._initialize((self,) + self.__association)
+                object.__setattr__(self, '_PaperExecutionAccountingOwner__lifecycle_owner', owner)
+                return owner
+            except BaseException:
+                try:
+                    journal._accounting_failure(self)
+                except BaseException:
+                    pass  # Secure failure must preserve the original interruption.
+                raise
+
+    def _lifecycle_check(self, owner):
+        from .paper_working_order import _PaperWorkingOrderEvidenceOwner
+        journal, c, control = self.__association[:3]
+        _require(type(owner) is _PaperWorkingOrderEvidenceOwner
+                 and owner is self.__lifecycle_owner
+                 and owner._matches_association((self,) + self.__association)
+                 and c._lock._is_owned() and control._lock._is_owned()
+                 and not self.__failed and not self.__refreshing)
+        journal._accounting_check(self)
+        publication = self.__publication
+        _require(publication is not None and self.__snapshot is publication[0]
+                 and _model_values(self.__snapshot) == publication[1])
+
+    def _lifecycle_state(self, owner):
+        self._lifecycle_check(owner)
+        return self.__association[0]._accounting_state(self)
+
+    def _lifecycle_verified_source(self, owner):
+        """Existing owner-thread storage verification; no capture locks during I/O."""
+        journal, c, _, read, write, receipt, header, _, session = self.__association[:9]
+        self._lifecycle_check(owner)
+        binding = read._validate_journal_account_binding(receipt)
+        from .paper_dispatch_journal import _values
+        _require(_values(binding) == _values(header.account_binding))
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            state = self._lifecycle_state(owner)
+        journal._callback_io_boundary(c)
+        loaded = journal._load()
+        _require(_values(loaded.header) == _values(header)
+                 and tuple(_values(r) for r in loaded.records) == state[0]
+                 and tuple(_values(s) for s in loaded.replay.sessions) == (_values(session),))
+        progress = loaded.replay.callback_progress
+        _require(not progress and state[1] == 0 or len(progress) == 1
+                 and progress[0].session_id == session.session_id
+                 and progress[0].processed_sequence == state[1]
+                 and progress[0].through_sequence <= state[2])
+        evidence = _AccountingEvidence(loaded.header, loaded.records, session.session_id,
+            state[1], state[2], len(state[3]), len(state[4]), state[5])
+        verified = _derive_accounting(evidence)
+        _require(_model_values(verified) == self.__publication[1])
+        return verified, state
+
+    def _capture_lifecycle_evidence(self, owner):
+        from .paper_working_order import _LifecycleEvidence, _lifecycle_values
+        _require(self.__lifecycle_handoff is None)
+        verified, state = self._lifecycle_verified_source(owner)
+        session = self.__association[8]
+        evidence = _LifecycleEvidence(verified, session.client_id, session.write_generation)
+        self.__lifecycle_handoff = (owner, evidence, self.__snapshot, state,
+                                    self.__publication[1], _lifecycle_values(evidence))
+        return evidence
+
+    def _publish_lifecycle_snapshot(self, owner, evidence, candidate):
+        from .paper_working_order import _lifecycle_values
+        journal, c, control, read, write = self.__association[:5]
+        verified, state = self._lifecycle_verified_source(owner)
+        handoff = self.__lifecycle_handoff
+        _require(handoff is not None and handoff[0] is owner and handoff[1] is evidence
+                 and handoff[2] is self.__snapshot and handoff[3] == state
+                 and handoff[4] == _model_values(verified)
+                 and handoff[5] == _lifecycle_values(evidence))
+        # Storage verification can outlive account/enrollment freshness. Repeat
+        # authentication after that latency, before final capture synchronization.
+        from .paper_dispatch_journal import _values
+        binding = read._validate_journal_account_binding(self.__association[5])
+        _require(_values(binding) == _values(self.__association[6].account_binding))
+        with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            _require(self._lifecycle_state(owner) == state
+                     and c._pending_order is state[6][0])
+            owner._require_candidate(candidate, evidence)
+            self.__lifecycle_handoff = handoff + (candidate,)
+            owner._publish(candidate)
+
+    def _consume_lifecycle_publication(self, owner, evidence, candidate):
+        _, c, control, read, write = self.__association[:5]
+        handoff = self.__lifecycle_handoff
+        _require(c._lock._is_owned() and control._lock._is_owned()
+                 and read._lifecycle._is_owned() and read._condition._is_owned()
+                 and write._lock._is_owned() and write._arrival_lock._is_owned()
+                 and handoff is not None and len(handoff) == 7
+                 and handoff[0] is owner and handoff[1] is evidence
+                 and handoff[2] is self.__snapshot and handoff[6] is candidate
+                 and self._lifecycle_state(owner) == handoff[3])
+        self.__lifecycle_handoff = None
+
+    def _lifecycle_currentness(self, owner, snapshot):
+        journal, c, control, read, write = self.__association[:5]
+        journal._thread_check()
+        with c._lock, control._lock, read._lifecycle, read._condition, write._lock, write._arrival_lock:
+            state = self._lifecycle_state(owner)
+            return (len(state[0]) == snapshot.journal_tail
+                    and state[1] == state[2] == snapshot.persistence_cursor
+                    and not state[3] and not state[4]
+                    and _model_values(self.__snapshot) == owner._accounting_values())
+
+    def _lifecycle_failure(self, owner):
+        _require(owner is self.__lifecycle_owner)
+        self.__lifecycle_handoff = None
+        self.__association[0]._accounting_failure(self)
 
     def _refresh(self):
         journal, c, control = self.__association[:3]

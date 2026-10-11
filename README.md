@@ -58,6 +58,8 @@ Phase 10C3C2C3A adds a [pure offline advisory recovery planner](docs/phase-10c3c
 
 Phase 10C3C4A adds a [private execution journal contract and pure replay model](docs/phase-10c3c4a-paper-execution-journal.md), preserving immutable ownership, consumed IDs, invocation uncertainty and sanitized observations. **THIS IS NOT DURABLE STORAGE.** No file/database, dispatch hook, restart recovery, barrier clearing or PAPER write is added. Transactional storage and write-ahead integration require separate phases.
 
+Phase 10C3C4B adds [private transactional SQLite/WAL journal storage](docs/phase-10c3c4b-sqlite-journal-storage.md) with verified FULL synchronization, canonical codecs, hash-chain validation, durable semantic quarantine and conservative commit uncertainty. It adds no dispatch hook, broker write, recovery authority or startup ownership adoption. Write-ahead integration remains a separately reviewed phase.
+
 ## Safety and next phases
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.

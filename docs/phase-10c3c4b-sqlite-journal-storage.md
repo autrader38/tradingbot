@@ -17,6 +17,62 @@ semantics fail closed. No dependencies were installed. Windows execution was not
 tested here; the implementation uses standard-library APIs and portable subprocess
 tests, with platform-specific path/permission limits below.
 
+The user subsequently tested Windows 11, CPython **3.12.10 64-bit**, SQLite
+**3.49.1**. WAL, FULL (2) and foreign keys (1) passed the host runtime check. SQLite
+3.49.1 satisfies the documented 3.37 minimum and supports the required STRICT,
+WAL, FULL, foreign-key and trusted_schema behavior; Linux's 3.53.1 is not required.
+The initial 227-test Windows run nevertheless reported 53 errors: one missing
+America/New_York IANA dataset and 52 database-file locking errors during cleanup.
+That run did not qualify Windows storage. **WINDOWS_RUNTIME_RETEST_REQUIRED: YES.**
+
+## Windows portability and host prerequisites
+
+The [foundation](phase-1-foundation.md) already requires host-provided IANA timezone
+data. Windows Python may lack that dataset. The actual host must provide a compatible
+IANA database, including **America/New_York**, before qualification can pass. A
+separately provisioned `tzdata` installation is one host solution; it is not added as
+a repository dependency or installed by this patch. Named keys, verified offsets and
+DST/fold behavior remain mandatory. The New York round-trip test is unchanged and
+is neither skipped nor replaced by UTC, fixed EST or a guessed Windows offset.
+Unavailable IANA data still fails closed.
+
+SQLite's connection context manager controls transactions; it does not close the
+connection. Raw test helpers, arbitrary-database setup, inspection and busy-writer
+connections therefore use explicit `contextlib.closing` ownership. The child lock
+holder closes its connection on every ordinary exit, and parent cleanup terminates
+and waits for an outstanding child before removing temporary files. Deliberate crash
+tests still use abrupt process exit to exercise SQLite recovery.
+
+The production audit also reproduced retained native handles when record validation
+failed mid-scan and an exception retained the scan cursor. Closing the connection
+alone could leave that active statement alive. The record-scan cursor now closes
+before connection failure cleanup, on both normal and interrupted paths. Secondary
+cleanup errors cannot replace the original interruption. No schema, journal,
+transaction, quarantine, hash, replay or authority semantics change.
+
+Portability regressions retain real connection/cursor objects, assert explicit closure
+and closed-connection behavior, then remove the temporary directory with those objects
+still retained. This detects missing closure on Linux as well as exercising actual
+Windows deletion locks on retest. There is no GC, sleep, deletion retry, ignored
+PermissionError or disabled cleanup workaround.
+
+After applying this patch and providing IANA data, the actual Windows host must rerun
+all storage tests and the full offline suite, with the real integration opt-in unset:
+
+```powershell
+Remove-Item Env:IBKR_RUN_READ_ONLY_TESTS -ErrorAction SilentlyContinue
+py -3.12 -c "from zoneinfo import ZoneInfo; print(ZoneInfo('America/New_York').key)"
+py -3.12 -m unittest -q tests.test_paper_execution_journal_sqlite
+py -3.12 -m unittest discover -s tests -q
+```
+
+Linux results do not qualify the Windows runtime. C3C4C deployment qualification,
+actual Windows bot integration, disabling Gateway Read-Only and any real PAPER write
+remain blocked pending a successful Windows retest. This patch performs no C3C4C
+integration, dependency installation, broker connection or write.
+
+## Storage durability guarantees
+
 Confirmed appends are transactionally committed to the configured SQLite/WAL store
 under verified synchronous=FULL semantics. These guarantees depend on SQLite, the
 filesystem, OS and storage device honoring their contracts. They are not protection

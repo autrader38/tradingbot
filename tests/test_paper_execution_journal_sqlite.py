@@ -1,7 +1,7 @@
 """Temporary-only SQLite/WAL storage, corruption and process-crash tests."""
 
 import ast
-from contextlib import ExitStack
+from contextlib import ExitStack, closing
 from dataclasses import FrozenInstanceError, fields, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, Inexact, Rounded, localcontext
@@ -18,7 +18,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tests import test_paper_execution_journal as f
 from tradingbot_broker import paper_execution_journal as j
@@ -62,13 +62,13 @@ class Fixture(unittest.TestCase):
         return caught.exception
 
     def sql(self, statement, parameters=()):
-        with sqlite3.connect(self.path, isolation_level=None, timeout=0) as connection:
+        with closing(sqlite3.connect(self.path, isolation_level=None, timeout=0)) as connection:
             return connection.execute(statement, parameters).fetchall()
 
     def tamper(self, statement, parameters=()):
         # Deliberately bypass defense-in-depth triggers in a temporary database;
         # restore their exact definitions so hash/codec validation is exercised.
-        with sqlite3.connect(self.path, isolation_level=None, timeout=0) as connection:
+        with closing(sqlite3.connect(self.path, isolation_level=None, timeout=0)) as connection:
             triggers = connection.execute("SELECT name,sql FROM sqlite_schema WHERE type='trigger'").fetchall()
             for name, _ in triggers:
                 connection.execute('DROP TRIGGER ' + name)
@@ -106,10 +106,11 @@ class CreationTests(Fixture):
 
     def test_create_rejects_arbitrary_sqlite_content(self):
         path = Path(self.directory.name) / 'unrelated.db'
-        with sqlite3.connect(path) as connection:
-            connection.execute('CREATE TABLE unrelated(value TEXT)')
+        with closing(sqlite3.connect(path)) as connection:
+            with connection:
+                connection.execute('CREATE TABLE unrelated(value TEXT)')
         self.error(C.ALREADY_EXISTS, s._SQLiteJournalStore._create, path, f.header())
-        with sqlite3.connect(path) as connection:
+        with closing(sqlite3.connect(path)) as connection:
             self.assertEqual(connection.execute('SELECT name FROM sqlite_schema').fetchall(), [('unrelated',)])
 
     def test_open_does_not_create_missing_file(self):
@@ -671,13 +672,13 @@ class DefenseTests(Fixture):
                    '_SessionRegistered', b'{}', b'x' * 32)
 
     def test_busy_never_retries_or_poisons_unchanged_transaction(self):
-        writer = sqlite3.connect(self.path, isolation_level=None, timeout=0)
-        self.addCleanup(writer.close); writer.execute('BEGIN IMMEDIATE')
-        with patch.object(s, '_commit', side_effect=AssertionError('must not commit')):
-            self.error(C.BUSY, self.store._append, f.session())
-        self.assertFalse(self.store._poisoned)
-        self.assertFalse(self.store._connection.in_transaction)
-        writer.rollback()
+        with closing(sqlite3.connect(self.path, isolation_level=None, timeout=0)) as writer:
+            writer.execute('BEGIN IMMEDIATE')
+            with patch.object(s, '_commit', side_effect=AssertionError('must not commit')):
+                self.error(C.BUSY, self.store._append, f.session())
+            self.assertFalse(self.store._poisoned)
+            self.assertFalse(self.store._connection.in_transaction)
+            writer.rollback()
         self.assertEqual(self.store._append(f.session()).record.sequence, 1)
 
     def test_two_independent_connections_contiguous(self):
@@ -774,6 +775,14 @@ class CodecTests(unittest.TestCase):
         self.assertEqual(rebuilt.created_at.fold, 1)
         self.assertEqual(rebuilt.created_at.tzinfo.key, 'America/New_York')
         self.assertEqual(s._encode(rebuilt), s._encode(value))
+
+    def test_missing_iana_data_rejects_named_timezone_without_fallback(self):
+        node = json.loads(s._encode(f.order()))
+        node['fields']['created_at']['zone'] = {
+            'kind': 'zoneinfo', 'key': 'America/New_York', 'offset_us': -18_000_000_000}
+        with patch.object(s, 'ZoneInfo', side_effect=ZoneInfoNotFoundError('host data missing')) as zone:
+            self.malformed(node, j._JournalOrderIntent)
+        zone.assert_called_once_with('America/New_York')
 
     def test_zoneinfo_offset_conflict_rejected(self):
         node = json.loads(s._encode(f.order()))
@@ -940,20 +949,273 @@ class ProcessTests(Fixture):
     def test_process_writer_exclusion_and_explicit_later_append(self):
         child_code = """
 import sqlite3, sys
-c=sqlite3.connect(sys.argv[1], isolation_level=None, timeout=0)
-c.execute('BEGIN IMMEDIATE')
-print('LOCKED', flush=True)
-sys.stdin.readline()
-c.rollback(); c.close()
+from contextlib import closing
+with closing(sqlite3.connect(sys.argv[1], isolation_level=None, timeout=0)) as c:
+    c.execute('BEGIN IMMEDIATE')
+    print('LOCKED', flush=True)
+    sys.stdin.readline()
+    c.rollback()
 """
         child = subprocess.Popen([sys.executable, '-B', '-c', child_code, str(self.path)],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        self.addCleanup(lambda: child.kill() if child.poll() is None else None)
+        def close_child():
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=10)
+        self.addCleanup(close_child)
         self.assertEqual(child.stdout.readline().strip(), 'LOCKED')
         self.error(C.BUSY, self.store._append, f.session())
         output, error = child.communicate('\n', timeout=10)
         self.assertEqual(child.returncode, 0, error)
         self.assertEqual(self.store._append(f.session()).record.sequence, 1)
+
+
+class _TrackedScanCursor(sqlite3.Cursor):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.explicitly_closed = False
+
+    def close(self):
+        super().close()
+        self.explicitly_closed = True
+
+
+class _TrackedConnection(sqlite3.Connection):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.scan_cursors = []
+        self.close_calls = 0
+        self.closed_with_open_scan = False
+
+    def execute(self, sql, *args, **kwargs):
+        if sql == 'SELECT sequence,typeof(encoded),length(encoded) FROM records ORDER BY sequence':
+            cursor = self.cursor(factory=_TrackedScanCursor)
+            self.scan_cursors.append(cursor)
+            return cursor.execute(sql, *args, **kwargs)
+        return super().execute(sql, *args, **kwargs)
+
+    def close(self):
+        self.closed_with_open_scan |= any(not cursor.explicitly_closed for cursor in self.scan_cursors)
+        super().close()
+        self.close_calls += 1
+
+
+class HandleLifetimeTests(Fixture):
+    def tracking(self):
+        # Keep real connections/cursors alive so GC cannot make these tests pass.
+        connections = []
+        original = sqlite3.connect
+        def connected(*args, **kwargs):
+            connection = original(*args, factory=_TrackedConnection, **kwargs)
+            connections.append(connection)
+            self.addCleanup(connection.close)
+            return connection
+        return connections, patch.object(sqlite3, 'connect', connected)
+
+    def owned_store(self):
+        self.store._close()
+        self.path = self.path.with_name('owned.db')
+        self.store = self.new()
+        return self.store
+
+    def assert_released_and_removable(self, connections):
+        self.assertTrue(connections)
+        for connection in connections:
+            self.assertGreater(connection.close_calls, 0)
+            self.assertFalse(connection.closed_with_open_scan)
+            self.assertTrue(all(cursor.explicitly_closed for cursor in connection.scan_cursors))
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute('SELECT 1')
+        self.store._close()
+        # Windows exercises delete locking; closed-handle assertions above also
+        # make this meaningful on POSIX, which permits deleting an open file.
+        self.directory.cleanup()
+        self.assertFalse(Path(self.directory.name).exists())
+
+    def test_raw_sql_success_closes_retained_connection(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.assertEqual(self.sql('SELECT count(*) FROM records'), [(0,)])
+        self.assert_released_and_removable(connections)
+
+    def test_raw_sql_error_closes_retained_connection(self):
+        connections, tracking = self.tracking()
+        with tracking, self.assertRaises(sqlite3.IntegrityError):
+            self.sql('DELETE FROM metadata')
+        self.assert_released_and_removable(connections)
+
+    def test_raw_tamper_success_closes_retained_connection(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.tamper('UPDATE store_state SET tail_digest=?', (b'x' * 32,))
+        self.assert_released_and_removable(connections)
+
+    def test_raw_tamper_error_closes_retained_connection(self):
+        connections, tracking = self.tracking()
+        with tracking, self.assertRaises(sqlite3.OperationalError):
+            self.tamper('SELECT * FROM nonexistent_table')
+        self.assert_released_and_removable(connections)
+
+    def test_arbitrary_database_setup_and_inspection_close_both_connections(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            CreationTests.test_create_rejects_arbitrary_sqlite_content(self)
+        self.assertEqual(len(connections), 2)
+        self.assert_released_and_removable(connections)
+
+    def test_busy_writer_is_explicitly_closed_before_cleanup(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            DefenseTests.test_busy_never_retries_or_poisons_unchanged_transaction(self)
+        self.assert_released_and_removable(connections)
+
+    def test_successful_create_and_open_release_after_explicit_close(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            store = self.owned_store()
+            store._append(f.session()); store._load(); store._close()
+            with self.reopen() as reopened:
+                self.assertEqual(reopened._load().replay.last_sequence, 1)
+        self.assert_released_and_removable(connections)
+
+    def test_failed_connection_configuration_closes_handle(self):
+        connections, tracking = self.tracking()
+        with tracking, patch.object(s, '_configure', side_effect=sqlite3.OperationalError('configuration failed')):
+            self.error(C.STORAGE_FAILURE, s._SQLiteJournalStore._create,
+                       self.path.with_name('failed-create.db'), f.header())
+        self.assert_released_and_removable(connections)
+
+    def test_failed_connection_limit_setup_closes_handle(self):
+        connections, tracking = self.tracking()
+        with tracking, patch.object(_TrackedConnection, 'setlimit', side_effect=RuntimeError('limit failed')):
+            self.error(C.STORAGE_FAILURE, s._SQLiteJournalStore._create,
+                       self.path.with_name('failed-connect.db'), f.header())
+        self.assert_released_and_removable(connections)
+
+    def test_failed_initialization_closes_handle(self):
+        connections, tracking = self.tracking()
+        with tracking, patch.object(s, '_initialize', side_effect=sqlite3.OperationalError('initialization failed')):
+            self.error(C.STORAGE_FAILURE, s._SQLiteJournalStore._create,
+                       self.path.with_name('failed-initialize.db'), f.header())
+        self.assert_released_and_removable(connections)
+
+    def test_failed_open_header_validation_closes_handle(self):
+        connections, tracking = self.tracking()
+        header = replace(f.header(), journal_id='journal-' + 'c' * 32)
+        with tracking:
+            self.error(C.HEADER_MISMATCH, s._SQLiteJournalStore._open, self.path, header)
+        self.assert_released_and_removable(connections)
+
+    def corrupt_first_record(self):
+        self.append(*f.prefix()[:3])
+        self.tamper('UPDATE records SET digest=? WHERE sequence=1', (b'x' * 32,))
+
+    def test_corrupt_open_closes_active_scan_before_connection(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.corrupt_first_record(); self.store._close()
+            self.error(C.CORRUPT, s._SQLiteJournalStore._open, self.path, f.header())
+        self.assert_released_and_removable(connections)
+
+    def test_corrupt_load_closes_active_scan_before_connection(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.owned_store(); self.corrupt_first_record()
+            self.error(C.CORRUPT, self.store._load)
+        self.assert_released_and_removable(connections)
+
+    def test_corrupt_append_closes_active_scan_before_connection(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.owned_store(); self.corrupt_first_record()
+            self.error(C.CORRUPT, self.store._append, j._InvocationMayOccur('entry-1'))
+        self.assert_released_and_removable(connections)
+
+    def test_quarantine_close_and_rejected_reopen_release_handles(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.owned_store(); self.append(f.session(), f.consumed())
+            self.error(C.QUARANTINED, self.store._append, f.consumed())
+            self.store._close()
+            self.error(C.QUARANTINED, s._SQLiteJournalStore._open, self.path, f.header())
+        self.assert_released_and_removable(connections)
+
+    def test_precommit_uncertainty_closes_handle(self):
+        connections, tracking = self.tracking()
+        with tracking:
+            self.owned_store()
+            with patch.object(s, '_commit', side_effect=sqlite3.OperationalError('before commit')):
+                self.error(C.COMMIT_OUTCOME_UNKNOWN, self.store._append, f.session())
+        self.assert_released_and_removable(connections)
+
+    def test_postcommit_uncertainty_closes_handle(self):
+        connections, tracking = self.tracking()
+        def committed(connection):
+            connection.commit(); raise sqlite3.OperationalError('after commit')
+        with tracking:
+            self.owned_store()
+            with patch.object(s, '_commit', committed):
+                self.error(C.COMMIT_OUTCOME_UNKNOWN, self.store._append, f.session())
+        self.assert_released_and_removable(connections)
+
+    def test_context_manager_interruption_closes_handle(self):
+        connections, tracking = self.tracking()
+        error = KeyboardInterrupt()
+        with tracking, self.assertRaises(KeyboardInterrupt) as caught:
+            with self.owned_store():
+                raise error
+        self.assertIs(caught.exception, error)
+        self.assert_released_and_removable(connections)
+
+    def test_secondary_cursor_cleanup_error_preserves_original_interruption(self):
+        connections, tracking = self.tracking()
+        error = KeyboardInterrupt()
+        original_close = _TrackedScanCursor.close
+        def closed(cursor):
+            original_close(cursor); raise SystemExit(99)
+        with tracking:
+            self.owned_store(); self.append(*f.prefix()[:3])
+            with patch.object(s, '_record_digest', side_effect=error), patch.object(_TrackedScanCursor, 'close', closed):
+                with self.assertRaises(KeyboardInterrupt) as caught:
+                    self.store._load()
+            self.assertIs(caught.exception, error)
+        self.assert_released_and_removable(connections)
+
+    def test_version_gate_accepts_windows_sqlite_3_49_1(self):
+        # Exercises the version gate on this engine; it is not a Windows run.
+        with patch.object(s.sqlite3, 'sqlite_version_info', (3, 49, 1)):
+            self.assertEqual(self.store._load().records, ())
+            self.assertEqual(self.store._connection.execute('PRAGMA trusted_schema').fetchall(), [(0,)])
+
+
+def handle_interruption_case(error_type, operation):
+    def test(self):
+        connections, tracking = self.tracking()
+        error = error_type(37) if error_type is SystemExit else error_type()
+        with tracking:
+            self.owned_store(); self.append(*f.prefix()[:3])
+            original_verify = self.store._verify_commit
+            def verification(*args):
+                with patch.object(s, '_record_digest', side_effect=error):
+                    original_verify(*args)
+            if operation == 'verify':
+                target, name, replacement = self.store, '_verify_commit', verification
+            else:
+                target, name, replacement = s, '_record_digest', lambda *args: (_ for _ in ()).throw(error)
+            with patch.object(target, name, replacement), self.assertRaises(error_type) as caught:
+                if operation == 'load': self.store._load()
+                else: self.store._append(j._InvocationMayOccur('entry-1'))
+            self.assertIs(caught.exception, error)
+            if error_type is SystemExit: self.assertEqual(error.code, 37)
+            self.assertTrue(self.store._poisoned)
+        self.assert_released_and_removable(connections)
+    return test
+
+
+for label, error_type in (('keyboard', KeyboardInterrupt), ('system_exit', SystemExit), ('generator', GeneratorExit)):
+    for operation in ('load', 'append', 'verify'):
+        setattr(HandleLifetimeTests, 'test_active_cursor_' + label + '_' + operation,
+                handle_interruption_case(error_type, operation))
 
 
 # Independent model/event schemas and malformed primitive boundaries.

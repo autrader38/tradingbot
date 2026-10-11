@@ -429,21 +429,30 @@ def _inspect(connection, expected_header):
     previous = genesis
     # Inspect size/type before selecting bytes; do not trust a corrupt row's length.
     sizes = connection.execute('SELECT sequence,typeof(encoded),length(encoded) FROM records ORDER BY sequence')
-    for expected, (sequence, kind, length) in enumerate(sizes, 1):
-        _check(type(sequence) is int and sequence == expected and sequence <= _MAX_SQL_INTEGER
-               and kind == 'blob' and type(length) is int and 0 < length <= _MAX_PAYLOAD_BYTES)
-        tag, data, prior, digest = connection.execute(
-            'SELECT event_type,encoded,previous_digest,digest FROM records WHERE sequence=?',
-            (sequence,)).fetchone()
-        _check(type(tag) is str and tag in _EVENT_TAGS and type(prior) is bytes
-               and type(digest) is bytes and len(digest) == 32 and prior == previous)
-        _check(digest == _record_digest(header_bytes, sequence, tag, data, prior))
-        record = _decode(data, journal._JournalRecord)
-        _check(record.sequence == sequence and type(record.payload).__name__ == tag
-               and record.schema_version == header.schema_version
-               and record.journal_id == header.journal_id
-               and record.account_binding == header.account_binding)
-        records.append(record); digests.append(digest); previous = digest
+    try:
+        for expected, (sequence, kind, length) in enumerate(sizes, 1):
+            _check(type(sequence) is int and sequence == expected and sequence <= _MAX_SQL_INTEGER
+                   and kind == 'blob' and type(length) is int and 0 < length <= _MAX_PAYLOAD_BYTES)
+            tag, data, prior, digest = connection.execute(
+                'SELECT event_type,encoded,previous_digest,digest FROM records WHERE sequence=?',
+                (sequence,)).fetchone()
+            _check(type(tag) is str and tag in _EVENT_TAGS and type(prior) is bytes
+                   and type(digest) is bytes and len(digest) == 32 and prior == previous)
+            _check(digest == _record_digest(header_bytes, sequence, tag, data, prior))
+            record = _decode(data, journal._JournalRecord)
+            _check(record.sequence == sequence and type(record.payload).__name__ == tag
+                   and record.schema_version == header.schema_version
+                   and record.journal_id == header.journal_id
+                   and record.account_binding == header.account_binding)
+            records.append(record); digests.append(digest); previous = digest
+    except BaseException:
+        try:
+            sizes.close()
+        except BaseException:
+            pass  # Secondary cleanup cannot replace the original interruption.
+        raise
+    else:
+        sizes.close()
     _check(tail == len(records) and tail_digest == previous)
     return header, tuple(records), tuple(digests), bool(quarantined)
 

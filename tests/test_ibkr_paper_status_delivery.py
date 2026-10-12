@@ -156,8 +156,9 @@ class Case(unittest.TestCase):
             return f.decoder.interpret((37, *values))
         key = f.incoming.ORDER_STATUS
         key = key if type(key) is int else key.value
-        tokens = [str(key).encode(), *(str(x).encode() for x in values), b'', b'0']
-        return f.decoder.interpret(tokens)
+        # SDK 10.50.2 receives the message ID separately; fields start at orderId.
+        tokens = [*(str(x).encode() for x in values), b'', b'0']
+        return f.decoder.interpret(tokens, key)
 
     def closed(self, f):
         self.assertEqual(f.transport._status_fences, [])
@@ -984,7 +985,27 @@ class InstalledSDKTests(Case):
         self.assertEqual(len(f.handoffs), 1)
 
     def test_real_decoder_legacy_handoff_no_client_connect(self):
-        f = self.build(installed=True); self.legacy(f); self.closed(f)
+        f = self.build(installed=True)
+        calls = []
+        def observed(frame, event, arg):
+            if (event == 'call' and frame.f_code is f.decoder_type.interpret.__code__
+                    and frame.f_locals.get('self') is f.decoder):
+                forwarded = frame.f_back.f_locals['args']
+                calls.append((len(forwarded), frame.f_locals['fields'] is forwarded[0],
+                              frame.f_locals['msgId'] is forwarded[1],
+                              tuple(frame.f_locals['fields']), frame.f_locals['msgId']))
+        previous = sys.getprofile()
+        try:
+            # Observe the original SDK method without replacing its identity/witness.
+            sys.setprofile(observed)
+            self.legacy(f)
+        finally:
+            sys.setprofile(previous)
+        key = f.incoming.ORDER_STATUS
+        key = key if type(key) is int else key.value
+        expected_fields = tuple(str(x).encode() for x in LEGACY) + (b'', b'0')
+        self.assertEqual(calls, [(2, True, True, expected_fields, key)])
+        self.closed(f)
         self.assertEqual(len(f.handoffs), 1)
 
     def test_real_decoder_unconsumed_handoff_fails_closed(self):

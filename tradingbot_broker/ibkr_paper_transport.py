@@ -13,12 +13,15 @@ from hashlib import sha256
 import importlib
 import inspect
 import logging
-from threading import RLock
+from threading import RLock, current_thread as _current_thread
 
 from .ibkr_readonly import _load_official_api, _read_opcodes, _PROTOBUF_READ_BASES
 from .ibkr_readonly_wire import sdk_call
 from .ibkr_paper_wire import (_guarded_connection, _LEGACY_POLICY, _PROTOBUF_POLICY,
                               _LEGACY_WRITES, _PROTOBUF_WRITES)
+from .ibkr_paper_status_delivery import (_new_status_delivery, _PaperStatusDelivery,
+                                       _DecoderRegistration, _StatusDeliveryReceipt,
+                                       _StatusArrivalFence)
 from .models import Side, identifier, validate_timestamp
 from .readonly_models import AccountMode, ReadOnlyError
 
@@ -480,6 +483,10 @@ def _load_paper_api():
 def _make_paper_client(api, owner, generation):
     sdk_call('UNSUPPORTED_PAPER_IBAPI_CONTRACT', _qualify, api)
     legacy, protobuf = _LEGACY_POLICY, _PROTOBUF_POLICY
+    # Existing C1 doubles have no connect/run/decoder lifecycle at all. Their
+    # original callback tests remain isolated; an SDK lifecycle never falls back.
+    delivery = _new_status_delivery(owner, generation, offline_fixture=(
+        not hasattr(api.Client, 'connect') and not hasattr(api.Client, 'run')))
     # Suppress SDK logging of raw request/response payloads, as on the read path.
     for name in ('ibapi', *tuple(logging.Logger.manager.loggerDict)):
         if name == 'ibapi' or name.startswith('ibapi.'):
@@ -494,10 +501,15 @@ def _make_paper_client(api, owner, generation):
         def openOrder(self, orderId, contract, order, orderState):
             owner._callback(generation, 'open', (orderId, contract, order, orderState))
         def openOrderEnd(self): owner._callback(generation, 'open_end')
+        def orderStatusProtoBuf(self, raw): delivery._raw(raw)
         def orderStatus(self, orderId, status, filled, remaining, avgFillPrice,
                         permId, parentId, lastFillPrice, clientId, whyHeld, mktCapPrice):
-            owner._callback(generation, 'status', (orderId, status, filled, remaining,
-                avgFillPrice, parentId, lastFillPrice, clientId))
+            if delivery._fixture_status():
+                owner._callback(generation, 'status', (orderId, status, filled, remaining,
+                    avgFillPrice, parentId, lastFillPrice, clientId))
+            else:
+                return delivery._normalized((orderId, status, filled, remaining,
+                    avgFillPrice, permId, parentId, lastFillPrice, clientId))
         def error(self, *args):
             # Legacy fixture: reqId,code,text. Modern: reqId,time,code,text[,advanced].
             # Never reinterpret a malformed modern code as its timestamp.
@@ -518,6 +530,43 @@ def _make_paper_client(api, owner, generation):
     connection = None
 
     class GuardedClient(api.Client):
+        @property
+        def decoder(self): return delivery._decoder_get()
+        @decoder.setter
+        def decoder(self, value): delivery._decoder_set(value)
+        def connect(self, *args, **kwargs):
+            delivery._connect_begin()
+            try:
+                result = super().connect(*args, **kwargs)
+                delivery._connect_finished()
+                return result
+            except BaseException as error:
+                delivery._fail()
+                if isinstance(error, Exception):
+                    raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY') from None
+                raise
+        def run(self):
+            delivery._run_begin()
+            try:
+                result = super().run()
+            except BaseException as error:
+                try:
+                    delivery._fail()
+                    delivery._run_finished()
+                except BaseException:
+                    pass  # Preserve the original SDK interruption/failure.
+                if isinstance(error, Exception):
+                    raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY') from None
+                raise
+            delivery._run_finished()
+            return result
+        def disconnect(self):
+            delivery._retire()
+            try:
+                return super().disconnect()
+            except BaseException:
+                delivery._fail()
+                raise
         @property
         def conn(self): return connection
         @conn.setter
@@ -541,7 +590,10 @@ def _make_paper_client(api, owner, generation):
                 raise ReadOnlyError('PAPER_WIRE_MESSAGE_FORBIDDEN')
             return super().sendMsgProtoBuf(msgId, msg)
 
-    client = GuardedClient(Wrapper())
+    wrapper = Wrapper()
+    client = GuardedClient(wrapper)
+    delivery._bind_client(client, wrapper)
+    owner._claim_status_delivery(delivery, generation, delivery._fixture_status())
     # No raw SDK object, generic sender, connect, run, socket or descriptor on view.
     class PaperClientView:
         __slots__ = ()
@@ -577,6 +629,9 @@ Private session/dispatch methods support offline qualification only in this phas
         self._arrival_lock = RLock()
         self._arrival_sequence = 0  # Transport lifetime, separate from callback evidence.
         self._arrival_unusable = False  # Current generation: error/closed/malformed arrival.
+        self._status_delivery_owner = self._status_registration = None
+        self._status_registration_eligible = False
+        self._status_fences = []  # At most 32 active private delivery receipts; no evidence queue.
         self._active_reservation = self._reservation_snapshot = None
         self._active_commitment = self._commitment_snapshot = None
         self._commitment_consumed = False
@@ -635,6 +690,90 @@ Private session/dispatch methods support offline qualification only in this phas
 
     def __repr__(self): return '<PaperTWSTransport offline-foundation>'
 
+    def _claim_status_delivery(self, delivery, generation, offline_fixture):
+        with self._arrival_lock:
+            if (type(delivery) is not _PaperStatusDelivery or type(generation) is not int
+                    or generation != self._generation or self._status_delivery_owner is not None
+                    or type(offline_fixture) is not bool):
+                raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+            self._status_delivery_owner = delivery
+            self._status_registration_eligible = offline_fixture
+
+    def _status_delivery_failed(self, delivery):
+        with self._arrival_lock:
+            if delivery is self._status_delivery_owner:
+                self._arrival_unusable = self._reconciliation_required = True
+                self._status_registration_eligible = False
+
+    def _status_registration_not_ready(self, delivery):
+        with self._arrival_lock:
+            if delivery is not self._status_delivery_owner or self._closed:
+                raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+            self._status_registration_eligible = False
+
+    def _status_registration_ready(self, delivery, registration):
+        with self._arrival_lock:
+            if (delivery is not self._status_delivery_owner or self._closed
+                    or type(registration) is not _DecoderRegistration
+                    or registration is not object.__getattribute__(delivery, '_PaperStatusDelivery__registration')
+                    or registration.generation != self._callback_generation
+                    or self._status_registration is not None):
+                raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+            self._status_registration = registration
+            self._status_registration_eligible = True
+
+    def _check_status_registration(self, delivery, registration):
+        with self._arrival_lock:
+            if (delivery is not self._status_delivery_owner
+                    or registration is not self._status_registration
+                    or not self._status_registration_eligible or self._closed
+                    or registration.generation != self._callback_generation):
+                raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+
+    def _status_registration_retired(self, delivery):
+        with self._arrival_lock:
+            if delivery is self._status_delivery_owner:
+                self._status_registration_eligible = False
+                if self._status_fences:
+                    self._arrival_unusable = self._reconciliation_required = True
+                    self._status_fences.clear()
+
+    def _status_arrival_started(self, delivery, receipt):
+        with self._arrival_lock:
+            if (type(delivery) is not _PaperStatusDelivery or delivery is not self._status_delivery_owner
+                    or type(receipt) is not _StatusDeliveryReceipt
+                    or not any(e.receipt is receipt and e.thread is _current_thread()
+                               for e in object.__getattribute__(delivery, '_PaperStatusDelivery__entries'))):
+                raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+            self._check_status_registration(delivery, receipt.registration)
+            if (type(receipt) is not _StatusDeliveryReceipt or len(self._status_fences) >= 32
+                    or any(f.delivery is receipt for f in self._status_fences)):
+                self._arrival_unusable = self._reconciliation_required = True
+                raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+            fence = _StatusArrivalFence(receipt, self._arrival_sequence + 1)
+            self._status_fences.append(fence)
+            self._arrival_sequence = fence.arrival_marker
+
+    def _status_arrival_aborted(self, delivery, receipt):
+        # An exact handler entry that failed BEFORE its fence was returned still
+        # counts once. Also complete a marker assignment interrupted after append.
+        with self._arrival_lock:
+            if (delivery is self._status_delivery_owner and self._status_registration is not None
+                    and self._status_registration.generation == self._callback_generation and not self._closed):
+                existing = next((f for f in self._status_fences if f.delivery is receipt), None)
+                self._arrival_sequence = (self._arrival_sequence + 1 if existing is None
+                                          else max(self._arrival_sequence, existing.arrival_marker))
+                self._arrival_unusable = self._reconciliation_required = True
+                self._status_registration_eligible = False
+
+    def _status_arrival_finished(self, delivery, receipt):
+        with self._arrival_lock:
+            if delivery is self._status_delivery_owner:
+                closing = object.__getattribute__(delivery, '_PaperStatusDelivery__closing')
+                if type(closing) is not tuple or not any(r is receipt for r in closing):
+                    raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+                self._status_fences[:] = [f for f in self._status_fences if f.delivery is not receipt]
+
     def _reset(self):
         self._boundary = None
         self._exhausted = self._lifetime_order_ids_exhausted
@@ -655,6 +794,8 @@ Private session/dispatch methods support offline qualification only in this phas
                 self._generation += 1
                 self._callback_generation = self._generation
                 self._arrival_unusable = False
+                self._status_delivery_owner = self._status_registration = None
+                self._status_registration_eligible = False
             self._reset()
             self._client = self._create_client(self._generation)
 
@@ -894,10 +1035,11 @@ Private session/dispatch methods support offline qualification only in this phas
             # latches before commitment prevents this invocation; after commitment
             # it revokes all later writes without waiting for SDK return.
             with self._arrival_lock:
-                if self._reconciliation_required:
+                if (self._reconciliation_required or self._status_fences
+                        or not self._status_registration_eligible):
                     return _DispatchResult(_DispatchState.NOT_DISPATCHED, operation,
                         _Reason.PREFLIGHT_FAILED, generation, order_id,
-                        reconciliation_required=True)
+                        reconciliation_required=self._reconciliation_required)
                 if operation is _Operation.PLACE_ORDER:
                     self._known.add(order_id)
                 self._commit_callback_sequence = self._callback_sequence
@@ -994,6 +1136,7 @@ Private session/dispatch methods support offline qualification only in this phas
                                       else reservation.order_id_floor)
                 or self._exhausted != reservation.allocator_exhausted
                 or self._arrival_unusable or self._reconciliation_required
+                or self._status_fences or not self._status_registration_eligible
                 or self._closed or self._invalid_callback or not self._initialized
                 or self._sync != 'COMPLETED' or reservation.order_id in self._known
                 or any(type(e) is not _CommissionEvidence and

@@ -1,4 +1,4 @@
-"""Private per-decoder pairing only; never installed by a production transport.
+"""Private per-decoder pairing, with an optional private PAPER delivery seam.
 
 No callback ledger, generation, clock, storage or management authority lives here.
 The intercepted SDK dispatcher remains responsible for parsing and BadMessage.
@@ -164,7 +164,8 @@ class _Frame:
 class _OrderStatusPairingBoundary:
     __slots__ = ('__decoder', '__decoder_type', '__original', '__dispatcher', '__table',
                  '__handle', '__handler', '__message', '__number', '__namespace',
-                 '__interceptor', '__guard', '__stack', '__counter', '__entry_key', '__unpaired_depth')
+                 '__interceptor', '__guard', '__stack', '__counter', '__entry_key', '__unpaired_depth',
+                 '__observer', '__notifications')
 
     def __init__(self, *args, **kwargs):
         raise ReadOnlyError(_ERROR)  # Only the qualified installer publishes one.
@@ -289,6 +290,9 @@ class _OrderStatusPairingBoundary:
             return successful
 
     def _intercept(self, decoder, protoBuf, msgId):
+        notifications = self.__notifications
+        if notifications is not None:
+            notifications[0](decoder)  # No pairing guard held across transport checks.
         self._check_binding()
         _require(decoder is self.__decoder)
         order_status = (type(msgId) is int and msgId == self.__number
@@ -311,19 +315,31 @@ class _OrderStatusPairingBoundary:
                     with self.__guard:
                         object.__setattr__(self, '_OrderStatusPairingBoundary__unpaired_depth',
                                            prior_depth)
-        _require(type(protoBuf) is bytes)
-        with self.__guard:
-            _require(not self.__stack or self.__stack[-1].thread is current_thread())
-            entry_depth = len(self.__stack)
+        entry_depth = len(self.__stack)
         frame = None
+        delivery = None
         aborted = True
         try:
+            if notifications is not None:
+                # The arrival fence precedes bytes validation, parsing and raw getters.
+                delivery = notifications[1](decoder)
+            _require(type(protoBuf) is bytes)
+            with self.__guard:
+                _require(not self.__stack or self.__stack[-1].thread is current_thread())
             # Enter INSIDE try: an interruption after stack insertion but before
             # this assignment must also be cleaned by the invocation finally.
             frame = self._begin(self.__entry_key)
+            if notifications is not None:
+                notifications[2](delivery, frame.receipt)
             result = self.__original(protoBuf, msgId)
             aborted = False
             return result
+        except Exception:
+            if notifications is not None:
+                # Registered production delivery must not surface SDK payload text.
+                # Standalone PRE4 keeps its original SDK exception contract.
+                raise ReadOnlyError(_ERROR) from None
+            raise
         finally:
             # Close using the captured frame, even if the SDK raised after pairing.
             # Original exceptions must never be replaced by orphan reporting.
@@ -343,6 +359,19 @@ class _OrderStatusPairingBoundary:
                     for active in self.__stack[index:]:
                         active.invalidate()
                     del self.__stack[index:]
+            if notifications is not None:
+                try:
+                    if delivery is not None:
+                        success = notifications[3](delivery, success) and success
+                    elif aborted:
+                        notifications[5]()  # Interrupted notification return/assignment.
+                except BaseException:
+                    try:
+                        notifications[4]()
+                    except BaseException:
+                        pass  # The original SDK/notification interruption wins.
+                    if not aborted:
+                        raise
             if not aborted and not success:
                 raise ReadOnlyError(_ERROR) from None
             if not aborted:
@@ -352,6 +381,23 @@ class _OrderStatusPairingBoundary:
 def _load_pairing_sdk():
     return (importlib.import_module('ibapi.decoder').Decoder,
             importlib.import_module('ibapi.message').IN)
+
+
+def _install_status_delivery_observer(boundary, observer):
+    """One exact private owner; never caller-selected notification functions."""
+    from .ibkr_paper_status_delivery import _PaperStatusDelivery
+    _require(type(boundary) is _OrderStatusPairingBoundary
+             and type(observer) is _PaperStatusDelivery and observer._owns_pairing(boundary))
+    with boundary._OrderStatusPairingBoundary__guard:
+        boundary._check_binding()
+        _require(boundary._OrderStatusPairingBoundary__observer is None
+                 and not boundary._OrderStatusPairingBoundary__stack)
+        notifications = tuple(method.__get__(observer) for method in (
+            _PaperStatusDelivery._proto_check, _PaperStatusDelivery._proto_enter,
+            _PaperStatusDelivery._proto_bound, _PaperStatusDelivery._proto_exit,
+            _PaperStatusDelivery._fail, _PaperStatusDelivery._proto_cancel))
+        object.__setattr__(boundary, '_OrderStatusPairingBoundary__observer', observer)
+        object.__setattr__(boundary, '_OrderStatusPairingBoundary__notifications', notifications)
 
 
 def _install_order_status_pairing(decoder):
@@ -391,7 +437,7 @@ def _install(decoder):
             ('original', original), ('dispatcher', dispatcher), ('table', table),
             ('handle', handle), ('handler', handler), ('message', message), ('number', number),
             ('namespace', object()), ('guard', RLock()), ('stack', []), ('counter', 0),
-            ('entry_key', object()), ('unpaired_depth', 0)):
+            ('entry_key', object()), ('unpaired_depth', 0), ('observer', None), ('notifications', None)):
             object.__setattr__(boundary, '_OrderStatusPairingBoundary__' + name, value)
         def intercept(instance, protoBuf, msgId):
             return boundary._intercept(instance, protoBuf, msgId)

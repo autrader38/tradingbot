@@ -644,6 +644,7 @@ Private session/dispatch methods support offline qualification only in this phas
         self._callback_evidence = []
         self._callback_run_ends = []  # Exact duplicate sequence spans, bounded with the ledger.
         self._last_callback_identity = None
+        self.__callback_evidence_lost_at = None  # First loss, immutable for transport lifetime.
         self._commission_clock = _commission_receipt_time  # Private captured local clock.
         self._commit_callback_sequence = 0
         self._lifetime_order_floor = MIN_ORDER_ID
@@ -660,14 +661,23 @@ Private session/dispatch methods support offline qualification only in this phas
     def account_mode(self): return AccountMode.UNKNOWN
 
     def __setattr__(self, name, value):
+        if (name == '_callback_evidence_lost_at' or
+                name == '_PaperTWSTransport__callback_evidence_lost_at' and hasattr(self, name)):
+            raise ReadOnlyError('PAPER_CALLBACK_LOSS_IMMUTABLE')
         if name == '_PaperTWSTransport__dispatch_binding' and hasattr(self, name):
             raise ReadOnlyError('PAPER_COORDINATOR_BINDING_IMMUTABLE')
         super().__setattr__(name, value)
 
     def __delattr__(self, name):
+        if name in ('_callback_evidence_lost_at', '_PaperTWSTransport__callback_evidence_lost_at'):
+            raise ReadOnlyError('PAPER_CALLBACK_LOSS_IMMUTABLE')
         if name == '_PaperTWSTransport__dispatch_binding':
             raise ReadOnlyError('PAPER_COORDINATOR_BINDING_IMMUTABLE')
         super().__delattr__(name)
+
+    @property
+    def _callback_evidence_lost_at(self):
+        return self.__callback_evidence_lost_at
 
     @property
     def _dispatch_coordinator_owner(self):
@@ -831,27 +841,7 @@ Private session/dispatch methods support offline qualification only in this phas
                         self._arrival_unusable = True
                 elif self.__dispatch_binding is not None or kind == 'commission':
                     try:
-                        event = (_copy_commission(generation, self._callback_sequence + 1,
-                                     value, self._commission_clock) if kind == 'commission'
-                                 else _copy_callback(generation, self._callback_sequence + 1, kind, value))
-                        # Accepted observed IDs enter lifetime history NOW, before
-                        # deferred dispatch bookkeeping or generation reset.
-                        if type(event) is not _CommissionEvidence:
-                            self._raise_observed_floor(event.order_id)
-                        self._callback_sequence += 1
-                        identity = _evidence_identity(event)
-                        # Consecutive exact duplicates have new sequence numbers
-                        # but need no storage. Interleaved repeats are retained:
-                        # Submitted -> Cancelled -> Submitted is a conflict.
-                        if identity != self._last_callback_identity:
-                            if len(self._callback_evidence) >= _EVIDENCE_CAPACITY:
-                                self._reconciliation_required = True
-                            else:
-                                self._callback_evidence.append(event)
-                                self._callback_run_ends.append(event.sequence)
-                                self._last_callback_identity = identity
-                        else:
-                            self._callback_run_ends[-1] = event.sequence
+                        self._capture_callback_evidence(generation, kind, value)
                     except BaseException as error:
                         self._arrival_unusable = True
                         if not isinstance(error, Exception):
@@ -861,6 +851,10 @@ Private session/dispatch methods support offline qualification only in this phas
                             raise
                         if self._write_invocation_started:
                             self._reconciliation_required = True
+                        if self.__callback_evidence_lost_at is not None:
+                            # Failed capture already secured lifetime ID safety.
+                            # Do not repeat a failed transition in bookkeeping.
+                            return
             # Release arrival BEFORE dispatch bookkeeping; never reverse nesting.
         if kind == 'commission':
             value = None  # Deferred bookkeeping retains only its non-economic kind flag.
@@ -902,6 +896,117 @@ Private session/dispatch methods support offline qualification only in this phas
             elif kind in ('execution', 'executions_end', 'commission'):
                 self._callback_kinds.add(kind)
 
+    def _check_callback_evidence(self):
+        """Arrival-owned structural proof of the truthful, contiguous prefix."""
+        def invalid():
+            raise ReadOnlyError('PAPER_CALLBACK_COVERAGE_INVALID')
+        if (type(self._callback_sequence) is not int or self._callback_sequence < 0
+                or type(self._callback_evidence) is not list
+                or type(self._callback_run_ends) is not list
+                or len(self._callback_evidence) != len(self._callback_run_ends)
+                or len(self._callback_evidence) > _EVIDENCE_CAPACITY):
+            invalid()
+        expected = 1
+        for event, end in zip(self._callback_evidence, self._callback_run_ends):
+            if (type(event) not in (_OpenOrderEvidence, _OrderStatusEvidence,
+                                   _ExecutionEvidence, _CommissionEvidence)
+                    or type(event.generation) is not int or event.generation < 1
+                    or type(event.sequence) is not int or event.sequence != expected
+                    or type(end) is not int or not event.sequence <= end <= self._callback_sequence):
+                invalid()
+            expected = end + 1
+        lost = self.__callback_evidence_lost_at
+        if lost is None:
+            if expected != self._callback_sequence + 1:
+                invalid()
+        elif (type(lost) is not int or not 1 <= lost <= self._callback_sequence
+                or expected != lost or self._last_callback_identity is not None):
+            invalid()
+
+    def _record_callback_evidence_loss(self, sequence):
+        # No clear/reset API. Called only under arrival synchronization.
+        if type(sequence) is not int or sequence < 1:
+            raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_INVALID')
+        if self.__callback_evidence_lost_at is None:
+            object.__setattr__(self, '_PaperTWSTransport__callback_evidence_lost_at', sequence)
+        self._last_callback_identity = None
+        self._reconciliation_required = True
+
+    def _publish_callback_evidence(self, events, ends, identity):
+        # Prepared bounded copies: an interrupted transition cannot mutate the
+        # old prefix that the capture failure path restores.
+        self._callback_evidence = events
+        self._callback_run_ends = ends
+        self._last_callback_identity = identity
+
+    def _advance_callback_sequence(self, sequence):
+        if type(sequence) is not int or sequence != self._callback_sequence + 1:
+            raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_INVALID')
+        self._callback_sequence = sequence
+
+    def _capture_callback_evidence(self, generation, kind, value):
+        """One arrival-owned update; no SDK, journal, acknowledgement or authority."""
+        try:
+            self._check_callback_evidence()
+        except BaseException:
+            self._arrival_unusable = self._reconciliation_required = True
+            raise
+        sequence = self._callback_sequence + 1
+        original_events, original_ends = self._callback_evidence, self._callback_run_ends
+        event = None
+        try:
+            event = (_copy_commission(generation, sequence, value, self._commission_clock)
+                     if kind == 'commission' else _copy_callback(generation, sequence, kind, value))
+            if (type(event) not in (_OpenOrderEvidence, _OrderStatusEvidence,
+                                   _ExecutionEvidence, _CommissionEvidence)
+                    or type(event.generation) is not int or event.generation != generation
+                    or type(event.sequence) is not int or event.sequence != sequence):
+                event = None
+                raise ReadOnlyError('PAPER_CALLBACK_EVIDENCE_INVALID')
+            identity = _evidence_identity(event)
+            if self.__callback_evidence_lost_at is not None:
+                # Watermark still records valid occurrences; retained prefix is frozen.
+                self._last_callback_identity = None
+            elif (original_events and original_ends
+                    and original_ends[-1] == sequence - 1
+                    and identity == self._last_callback_identity
+                    and identity == _evidence_identity(original_events[-1])):
+                ends = original_ends.copy()
+                ends[-1] = sequence
+                self._publish_callback_evidence(original_events.copy(), ends, identity)
+            elif len(original_events) == _EVIDENCE_CAPACITY:
+                self._record_callback_evidence_loss(sequence)
+            else:
+                self._publish_callback_evidence(original_events + [event],
+                                                original_ends + [sequence], identity)
+            self._advance_callback_sequence(sequence)
+            if type(event) is not _CommissionEvidence:
+                self._raise_observed_floor(event.order_id)
+            self._check_callback_evidence()
+        except BaseException:
+            if event is not None:
+                # A valid copied occurrence exists but its transition failed.
+                # Restore only the untouched prefix, NEVER roll back the watermark
+                # or lifetime allocator safety. Cleanup bypasses fallible helpers.
+                object.__setattr__(self, '_callback_evidence', original_events)
+                object.__setattr__(self, '_callback_run_ends', original_ends)
+                object.__setattr__(self, '_last_callback_identity', None)
+                current = self._callback_sequence
+                object.__setattr__(self, '_callback_sequence',
+                                   current if type(current) is int and current > sequence else sequence)
+                if self.__callback_evidence_lost_at is None:
+                    object.__setattr__(self, '_PaperTWSTransport__callback_evidence_lost_at', sequence)
+                object.__setattr__(self, '_arrival_unusable', True)
+                object.__setattr__(self, '_reconciliation_required', True)
+                if type(event) is not _CommissionEvidence:
+                    if event.order_id == MAX_ORDER_ID:
+                        object.__setattr__(self, '_lifetime_order_ids_exhausted', True)
+                        object.__setattr__(self, '_lifetime_order_floor', MAX_ORDER_ID)
+                    else:
+                        object.__setattr__(self, '_lifetime_order_floor',
+                                           max(self._lifetime_order_floor, event.order_id + 1))
+            raise
+
     def _raise_observed_floor(self, order_id):
         # Caller owns arrival. Only lifetime safety state changes here; current
         # generation readiness/known IDs remain under dispatch bookkeeping.
@@ -917,6 +1022,21 @@ Private session/dispatch methods support offline qualification only in this phas
             if (self.__dispatch_binding is None or owner is not self.__dispatch_binding[0]
                     or type(cursor) is not int or not 0 <= cursor <= self._callback_sequence):
                 raise ReadOnlyError('PAPER_CALLBACK_CURSOR_INVALID')
+            if self.__callback_evidence_lost_at is not None and cursor >= self.__callback_evidence_lost_at:
+                raise ReadOnlyError('PAPER_CALLBACK_EVIDENCE_LOST')
+            try:
+                self._check_callback_evidence()
+            except Exception:
+                self._arrival_unusable = self._reconciliation_required = True
+                if type(self._callback_sequence) is int and cursor < self._callback_sequence:
+                    # Existing coordinator callers secure their barriers from the
+                    # latch. Publish no unvalidated fact, only a visible missing
+                    # suffix. Never return a superficially complete empty page.
+                    return _EvidenceBatch(self._callback_sequence, ())
+                raise
+            except BaseException:
+                self._arrival_unusable = self._reconciliation_required = True
+                raise
             # Expand exact duplicate spans into bounded immutable event pages.
             # Every sequence is explicitly processed; a fetch upper bound is
             # never an acknowledgement of unseen/coalesced events.

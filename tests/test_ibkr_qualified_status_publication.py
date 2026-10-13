@@ -537,16 +537,22 @@ for _case in ('projectable', *_UNPROJECTABLE):
 
 
 class DurabilityTests(RuntimeCase):
-    def test_projectable_qualified_blocks_durable_progress(self):
+    def test_projectable_qualified_has_exact_source_durability(self):
         self.registered(True); self.qualified()
-        self.failed(self.drain())
-        self.assertEqual(self.journal._persistence_cursor, 0)
+        self.assertEqual(self.drain().state.value, 'CURRENT')
+        self.assertEqual(self.journal._persistence_cursor, 1)
         self.assertEqual(self.of_type(journal._OrderStatusObserved), ())
-        self.assertEqual(self.of_type(journal._CallbackProgress), ())
+        self.assertEqual(self.of_type(journal._QualifiedOrderStatusObserved)[0].source.sequence, 1)
 
     def test_later_old_record_cannot_bypass_qualified(self):
         self.registered(True); self.qualified(); self.open()
-        self.failed(self.drain())
+        original = owner_module._PaperDispatchJournalOwner._append_callback
+        def append(owner, coordinator, event, staged):
+            if type(event) is journal._QualifiedOrderStatusObserved:
+                raise storage._StorageError(storage._Code.BUSY)
+            return original(owner, coordinator, event, staged)
+        with patch.object(owner_module._PaperDispatchJournalOwner, '_append_callback', append):
+            self.failed(self.drain())
         self.assertEqual(self.journal._persistence_cursor, 0)
         self.assertEqual(self.of_type(journal._OpenOrderObserved), ())
 
@@ -554,7 +560,9 @@ class DurabilityTests(RuntimeCase):
         self.registered(True); self.open(); self.drain()
         self.assertEqual(self.journal._persistence_cursor, 1)
         self.qualified(); self.open(order_id=1000)
-        self.failed(self.drain())
+        with patch.object(owner_module._PaperDispatchJournalOwner, '_append_callback',
+                          side_effect=storage._StorageError(storage._Code.BUSY)):
+            self.failed(self.drain())
         self.assertEqual(self.journal._persistence_cursor, 1)
         self.assertTrue(all(p.processed_sequence < 2 for p in self.of_type(journal._CallbackProgress)))
 
@@ -563,14 +571,17 @@ class DurabilityTests(RuntimeCase):
         with self.coordinator._lock, self.broker._lock: self.coordinator._sync_callbacks_locked()
         self.assertEqual(self.coordinator._callback_cursor, 1)
         self.assertEqual(self.journal._persistence_cursor, 0)
-        self.assert_denied(self.invoke())
+        with patch.object(owner_module._PaperDispatchJournalOwner, '_append_callback',
+                          side_effect=storage._StorageError(storage._Code.BUSY)):
+            self.assert_denied(self.invoke())
         self.assertEqual(self.write_calls(), [])
 
-    def test_source_qualified_never_enters_journal_codec(self):
+    def test_transport_qualified_never_replaces_storage_owned_source(self):
         self.registered(True); before = self.history(); self.qualified()
         self.assertEqual(self.history(), before)
-        self.failed(self.drain())
+        self.assertEqual(self.drain().state.value, 'CURRENT')
         self.assertFalse(any(type(e) is Q for e in self.history()))
+        self.assertEqual(len(self.of_type(journal._QualifiedOrderStatusObserved)), 1)
 
     def test_restart_quarantine_after_memory_capture(self):
         self.registered(True); self.qualified()

@@ -74,11 +74,14 @@ _MODELS = (journal._JournalAccountBinding, journal._JournalHeader,
     journal._OpenOrderCallbackSnapshot, journal._OrderStatusCallbackSnapshot,
     journal._ExecutionCallbackSnapshot, journal._CommissionCallbackSnapshot,
     journal._DuplicateCallbackCovered, journal._UntrackedCallbackObserved,
-    journal._CommissionCallbackCovered, journal._UntrackedCommissionCallbackCovered)
+    journal._CommissionCallbackCovered, journal._UntrackedCommissionCallbackCovered,
+    journal._QualifiedStatusPresence, journal._QualifiedStatusObservation,
+    journal._QualifiedOrderStatusObserved)
 _MODEL_TAGS = {model.__name__: model for model in _MODELS}
 _ENUMS = (journal._LifecycleStatus, journal._ReconciliationReason,
           journal._ClosureReason, journal._WitnessKind, AccountMode,
-          journal._UntrackedCallbackReason)
+          journal._UntrackedCallbackReason, journal._QualifiedStatusProtocol,
+          journal._QualifiedStatusSourceQuality)
 _ENUM_TAGS = {model.__name__: model for model in _ENUMS}
 _EVENT_TAGS = {model.__name__ for model in journal._EVENT_TYPES}
 

@@ -1,7 +1,7 @@
 """Private journal contract and pure replay; no storage or execution authority.
 
 Only a complete, explicitly supplied journal is replayed. V1 retains its original
-producer-certified progress. Inactive V2 adds historical occurrence coverage,
+producer-certified progress. V2 adds historical occurrence coverage,
 not correction, migration, retirement or reconciliation-clear APIs.
 """
 
@@ -745,6 +745,107 @@ class _UntrackedCommissionCallbackCovered(_PrivateJournalValue):
         _integer(self.execution_record_sequence, 1)
 
 
+class _QualifiedStatusProtocol(StrEnum):
+    LEGACY = 'LEGACY'
+    PROTOBUF = 'PROTOBUF'
+
+
+class _QualifiedStatusSourceQuality(StrEnum):
+    SUPPLIED = 'SUPPLIED'
+    LEGACY_DECODED = 'LEGACY_DECODED'
+    LEGACY_AMBIGUOUS = 'LEGACY_AMBIGUOUS'
+    UNAVAILABLE = 'UNAVAILABLE'
+
+
+_QUALIFIED_STATUS_FIELDS = ('order_id', 'status', 'filled', 'remaining',
+    'average_fill_price', 'perm_id', 'parent_id', 'last_fill_price', 'client_id')
+_QUALIFIED_STATUS_IDS = frozenset(('order_id', 'perm_id', 'parent_id', 'client_id'))
+_QUALIFIED_STATUS_QUANTITIES = frozenset(('filled', 'remaining'))
+_QUALIFIED_STATUS_PRICES = frozenset(('average_fill_price', 'last_fill_price'))
+_QUALIFIED_UNSET_QUANTITY = Decimal('170141183460469231731687303715884105727')
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _QualifiedStatusPresence(_PrivateJournalValue):
+    order_id: _QualifiedStatusSourceQuality
+    status: _QualifiedStatusSourceQuality
+    filled: _QualifiedStatusSourceQuality
+    remaining: _QualifiedStatusSourceQuality
+    average_fill_price: _QualifiedStatusSourceQuality
+    perm_id: _QualifiedStatusSourceQuality
+    parent_id: _QualifiedStatusSourceQuality
+    last_fill_price: _QualifiedStatusSourceQuality
+    client_id: _QualifiedStatusSourceQuality
+    wire_supplied: tuple[str, ...] | None
+
+    def __post_init__(self):
+        for name in _QUALIFIED_STATUS_FIELDS:
+            _require(type(getattr(self, name)) is _QualifiedStatusSourceQuality)
+        if self.wire_supplied is not None:
+            _require(type(self.wire_supplied) is tuple
+                     and all(type(name) is str and name in _QUALIFIED_STATUS_FIELDS
+                             for name in self.wire_supplied)
+                     and self.wire_supplied == tuple(name for name in _QUALIFIED_STATUS_FIELDS
+                                                    if name in self.wire_supplied))
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _QualifiedStatusObservation(_PrivateJournalValue):
+    protocol: _QualifiedStatusProtocol
+    order_id: int | None
+    status: str | None
+    filled: Decimal | None
+    remaining: Decimal | None
+    average_fill_price: Decimal | None
+    perm_id: int | None
+    parent_id: int | None
+    last_fill_price: Decimal | None
+    client_id: int | None
+    presence: _QualifiedStatusPresence
+
+    def __post_init__(self):
+        _require(type(self.protocol) is _QualifiedStatusProtocol)
+        _exact(self.presence, _QualifiedStatusPresence)
+        legacy = self.protocol is _QualifiedStatusProtocol.LEGACY
+        _require((self.presence.wire_supplied is None) is legacy)
+        quality_type = _QualifiedStatusSourceQuality
+        for name in _QUALIFIED_STATUS_FIELDS:
+            value, quality = getattr(self, name), getattr(self.presence, name)
+            if value is None:
+                _require(quality is quality_type.UNAVAILABLE)
+                if legacy:
+                    _require(name in _QUALIFIED_STATUS_QUANTITIES | _QUALIFIED_STATUS_PRICES)
+                elif name in _QUALIFIED_STATUS_IDS or name == 'status':
+                    _require(name not in self.presence.wire_supplied)
+                continue
+            if name in _QUALIFIED_STATUS_IDS:
+                _integer(value, 0, (1 << 63) - 1 if name == 'perm_id' else _MAX_ORDER_ID)
+            elif name == 'status':
+                _require(type(value) is str and value in tuple(s.value for s in _LifecycleStatus))
+            else:
+                _amount(value)
+                if name in _QUALIFIED_STATUS_QUANTITIES:
+                    _require(value != _QUALIFIED_UNSET_QUANTITY)
+            if legacy:
+                expected = (quality_type.LEGACY_AMBIGUOUS
+                    if name in _QUALIFIED_STATUS_IDS | _QUALIFIED_STATUS_PRICES and value == 0
+                    else quality_type.LEGACY_DECODED)
+                _require(quality is expected)
+            else:
+                _require(quality is quality_type.SUPPLIED
+                         and name in self.presence.wire_supplied)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _QualifiedOrderStatusObserved(_PrivateJournalValue):
+    source: _CallbackSource
+    observation: _QualifiedStatusObservation
+
+    def __post_init__(self):
+        _exact(self.source, _CallbackSource)
+        _exact(self.observation, _QualifiedStatusObservation)
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _CallbackProgress(_PrivateJournalValue):
     session_id: str
@@ -765,7 +866,7 @@ _EVENT_TYPES_V1 = (_SessionRegistered, _AttemptConsumed, _NumericOrderIdReserved
     _ExecutionObserved, _CommissionReceived, _CallbackProgress)
 _COVERAGE_EVENT_TYPES = (_DuplicateCallbackCovered, _UntrackedCallbackObserved,
                        _CommissionCallbackCovered, _UntrackedCommissionCallbackCovered)
-_EVENT_TYPES_V2 = _EVENT_TYPES_V1 + _COVERAGE_EVENT_TYPES
+_EVENT_TYPES_V2 = _EVENT_TYPES_V1 + _COVERAGE_EVENT_TYPES + (_QualifiedOrderStatusObserved,)
 _EVENT_TYPES = _EVENT_TYPES_V2  # Storage's closed union; record enforces version.
 
 
@@ -1131,6 +1232,11 @@ def _replay(header, records):
         elif kind in _COVERAGE_EVENT_TYPES:
             _require(coverage is not None)
             coverage.exceptional(record)
+        elif kind is _QualifiedOrderStatusObserved:
+            # Historical source only: no attempt, allocator, economic or
+            # lifecycle interpretation. Every logical occurrence is direct.
+            _require(coverage is not None)
+            coverage.direct(record)
         else:
             state = attempt(event.client_order_id)
             consumed = state['consumed']

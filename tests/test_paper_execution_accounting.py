@@ -478,8 +478,10 @@ class CurrentnessTests(AccountingFixture):
 
     def test_progress_number_cannot_adopt_unseen_prefix(self):
         self.begin(); prior = self.refresh()
-        with self.coordinator._lock, self.broker._lock:
+        with self.coordinator._lock, self.broker._lock, self.assertRaises(storage._StorageError) as caught:
             self.journal._append_event(j._CallbackProgress(self.journal._session.session_id, 100, 100), diagnostic=True)
+        self.assertEqual(caught.exception.code, 'QUARANTINED')
+        self.assertTrue(self.journal._store._quarantined)
         self.failed_refresh(prior=prior)
 
     def test_retained_history_corruption_rejected(self):

@@ -20,6 +20,9 @@ from .readonly_models import ReadOnlyError
 from .ibkr_readonly import _JournalAccountBindingReceipt, _JournalAccountAssociation
 from .ibkr_paper_transport import (PaperTWSTransport, _OpenOrderEvidence,
     _OrderStatusEvidence, _ExecutionEvidence, _CommissionEvidence, _EVIDENCE_CAPACITY)
+from .ibkr_qualified_status_ledger import _QualifiedOrderStatusEvidence
+from .paper_qualified_status_journal import (_adapt_qualified_status,
+                                            _qualified_callback_values)
 
 
 _ERROR = 'PAPER_DISPATCH_JOURNAL_UNAVAILABLE'
@@ -43,7 +46,8 @@ def _values(value):
     if kind is date:
         return kind, value.isoformat()
     if kind in (j._WitnessKind, j._LifecycleStatus, j._ReconciliationReason,
-                j._ClosureReason, j.AccountMode):
+                j._ClosureReason, j.AccountMode, j._UntrackedCallbackReason,
+                j._QualifiedStatusProtocol, j._QualifiedStatusSourceQuality):
         return kind, value.value
     if kind is tuple:
         return kind, tuple(_values(item) for item in value)
@@ -104,7 +108,12 @@ class _CallbackCoverage:
         return '<PrivateCallbackCoverage>'
 
 
-_CALLBACK_TYPES = (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence, _CommissionEvidence)
+_CALLBACK_TYPES = (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence,
+                   _CommissionEvidence, _QualifiedOrderStatusEvidence)
+_OCCURRENCE_TYPES = (j._OpenOrderObserved, j._OrderStatusObserved, j._ExecutionObserved,
+    j._DuplicateCallbackCovered, j._UntrackedCallbackObserved,
+    j._CommissionCallbackCovered, j._UntrackedCommissionCallbackCovered,
+    j._QualifiedOrderStatusObserved)
 _STATUS = {'PendingSubmit': j._LifecycleStatus.PENDING_SUBMIT, 'PreSubmitted': j._LifecycleStatus.PRE_SUBMITTED,
     'Submitted': j._LifecycleStatus.SUBMITTED,
     'Filled': j._LifecycleStatus.FILLED, 'Cancelled': j._LifecycleStatus.CANCELLED,
@@ -114,6 +123,8 @@ _STATUS = {'PendingSubmit': j._LifecycleStatus.PENDING_SUBMIT, 'PreSubmitted': j
 
 def _callback_values(event):
     _require(type(event) in _CALLBACK_TYPES)
+    if type(event) is _QualifiedOrderStatusEvidence:
+        return _qualified_callback_values(event)
     return tuple((field.name, _values(getattr(event, field.name))) for field in fields(type(event)))
 
 
@@ -139,6 +150,40 @@ def _callback_projection(event, key, session):
     _require(type(event) is _ExecutionEvidence)
     return j._ExecutionObserved(key, source, event.order_id, event.client_id, event.order_ref,
         event.execution_id, event.con_id, event.side, event.shares, event.price)
+
+
+def _callback_source(event, session):
+    _require(type(event.generation) is int and event.generation == session.write_generation)
+    return j._CallbackSource(session.session_id, event.generation, event.sequence)
+
+
+def _ordinary_callback_snapshot(event, session):
+    _require(type(event) in (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence))
+    return j._ordinary_source_snapshot(_callback_projection(event, 'validation-only', session))
+
+
+def _commission_callback_snapshot(event):
+    _require(type(event) is _CommissionEvidence)
+    _CommissionEvidence.__post_init__(event)
+    return j._CommissionCallbackSnapshot(event.exec_id, event.report_id,
+        Decimal(event.amount.as_tuple()), event.currency, event.received_at.replace())
+
+
+def _callback_event_agreement(evidence, event, session):
+    """Exact reviewed correspondence, including backing vs occurrence distinction."""
+    kind = type(event)
+    if kind is j._QualifiedOrderStatusObserved:
+        _require(_values(event) == _values(_adapt_qualified_status(evidence, session)))
+    elif kind in (j._OpenOrderObserved, j._OrderStatusObserved,
+                  j._ExecutionObserved, j._CommissionReceived):
+        _require(_values(event) == _values(_callback_projection(evidence, event.client_order_id, session)))
+    else:
+        _require(kind in j._COVERAGE_EVENT_TYPES
+                 and _values(event.source) == _values(_callback_source(evidence, session)))
+        snapshot = (_commission_callback_snapshot(evidence)
+                    if kind in (j._CommissionCallbackCovered, j._UntrackedCommissionCallbackCovered)
+                    else _ordinary_callback_snapshot(evidence, session))
+        _require(_values(event.snapshot) == _values(snapshot))
 
 
 class _PaperDispatchJournalOwner:
@@ -211,6 +256,7 @@ class _PaperDispatchJournalOwner:
                  and control._transport is read and write._dispatch_coordinator_owner is c
                  and type(store) is _SQLiteJournalStore and store._header is header
                  and type(header) is j._JournalHeader and type(session) is j._SessionRegistered
+                 and header.schema_version == 2 and header.format_id == j._FORMAT_ID_V2
                  and not self.__closed
                  and (_values(header), _values(session), _values(receipt)) == self.__identity)
         _require(not store._closed and not store._poisoned and not store._quarantined)
@@ -406,12 +452,8 @@ class _PaperDispatchJournalOwner:
         covered = []
         for sequence, value in sorted(self.__covered.items()):
             _require(value.staged is self.__staged[sequence])
-            if value.committed is not None:
-                _CommittedRecord.__post_init__(value.committed)
-                _require(value.committed.record.payload is value.event
-                         and 0 < value.committed.record.sequence <= len(self.__history)
-                         and _values(value.committed.record) == self.__history[value.committed.record.sequence - 1])
-            covered.append((sequence, None if value.event is None else _values(value.event)))
+            self._require_callback_coverage(value)
+            covered.append((sequence, _values(value.event)))
         return (self.__history, cursor, batch.through_sequence, tuple(staged), tuple(covered),
                 self.__inhibited, state, write._arrival_sequence)
 
@@ -514,9 +556,12 @@ class _PaperDispatchJournalOwner:
                 _require(type(retained) in _CALLBACK_TYPES and type(retained.sequence) is int
                          and retained.sequence == expected_start and type(end) is int
                          and end >= retained.sequence)
+                if type(retained) is _QualifiedOrderStatusEvidence:
+                    _adapt_qualified_status(retained, self._session)
                 expected_start = end + 1
             _require(type(write._callback_sequence) is int
-                     and expected_start == write._callback_sequence + 1)
+                     and expected_start == write._callback_sequence + 1
+                     and write._callback_evidence_lost_at is None)
             batch = PaperTWSTransport._evidence_since(write, coordinator, self.__persistence_cursor)
             _require(type(batch.through_sequence) is int
                      and batch.through_sequence >= self.__persistence_cursor
@@ -525,7 +570,10 @@ class _PaperDispatchJournalOwner:
             for event in batch.events:
                 _require(type(event) in _CALLBACK_TYPES and type(event.sequence) is int
                          and event.sequence == expected and event.sequence <= batch.through_sequence)
-                _callback_projection(event, 'validation-only', self._session)
+                if type(event) is _QualifiedOrderStatusEvidence:
+                    _adapt_qualified_status(event, self._session)
+                else:
+                    _callback_projection(event, 'validation-only', self._session)
                 expected += 1
             _require(batch.events or batch.through_sequence == self.__persistence_cursor)
             # Arrival failure is never concealed by an unchanged evidence sequence.
@@ -547,7 +595,8 @@ class _PaperDispatchJournalOwner:
             _require(pending is state[0] and values == state[1]
                      and write._generation == state[2] == self._session.write_generation
                      and (write._closed, write._reconciliation_required, write._arrival_unusable) == state[3:]
-                     and not write._invalid_callback and write._callback_sequence >= through)
+                     and not write._invalid_callback and write._callback_sequence >= through
+                     and write._callback_evidence_lost_at is None)
             page = PaperTWSTransport._evidence_since(write, coordinator, self.__persistence_cursor)
             for event in page.events:
                 staged = self.__staged.get(event.sequence)
@@ -562,12 +611,34 @@ class _PaperDispatchJournalOwner:
     def _append_callback(self, coordinator, event, staged):
         # Restricted evidence-only path; inhibition remains monotonic. No general
         # invocation/attempt/authorization event may enter through this method.
-        _require(type(event) in (j._OpenOrderObserved, j._OrderStatusObserved,
-                    j._ExecutionObserved, j._CommissionReceived)
+        _require(type(event) in _OCCURRENCE_TYPES + (j._CommissionReceived,)
                  and self.__staged.get(staged.evidence.sequence) is staged
                  and _callback_values(staged.evidence) == staged.values)
+        _callback_event_agreement(staged.evidence, event, self._session)
         self._callback_io_boundary(coordinator)
         return self._append_event(event, diagnostic=True)
+
+    def _require_committed_callback(self, event, committed):
+        _require(type(committed) is _CommittedRecord
+                 and committed.record.payload is event
+                 and 0 < committed.record.sequence <= len(self.__history)
+                 and committed.record.schema_version == self._header.schema_version
+                 and committed.record.journal_id == self._header.journal_id
+                 and _values(committed.record.account_binding) == _values(self._header.account_binding)
+                 and _values(committed.record) == self.__history[committed.record.sequence - 1])
+        _CommittedRecord.__post_init__(committed)
+        return committed.record.sequence
+
+    def _require_callback_coverage(self, coverage):
+        _require(type(coverage) is _CallbackCoverage
+                 and type(coverage.staged) is _StagedCallback
+                 and self.__staged.get(coverage.staged.evidence.sequence) is coverage.staged
+                 and coverage.staged.values == _callback_values(coverage.staged.evidence)
+                 and type(coverage.event) in _OCCURRENCE_TYPES)
+        self._require_committed_callback(coverage.event, coverage.committed)
+        _require(_values(coverage.event.source) ==
+                 _values(_callback_source(coverage.staged.evidence, self._session)))
+        _callback_event_agreement(coverage.staged.evidence, coverage.event, self._session)
 
     def _callback_io_boundary(self, coordinator):
         self._local_check(coordinator, current=False, healthy=False)
@@ -580,15 +651,24 @@ class _PaperDispatchJournalOwner:
         event = staged.evidence
         _require(self.__staged.get(event.sequence) is staged
                  and _callback_values(event) == staged.values)
+        if type(event) is _QualifiedOrderStatusEvidence:
+            mapped = _adapt_qualified_status(event, self._session)
+            committed = self._append_callback(coordinator, mapped, staged)
+            return _CallbackCoverage(staged, mapped, committed)
         if type(event) is _CommissionEvidence:
             owned = self.__executions.get(event.exec_id)
             foreign = self.__foreign_executions.get(event.exec_id)
             _require(owned is None or foreign is None)
             if foreign is not None:
-                return _CallbackCoverage(staged, None, None)  # Proven unrelated execution.
+                _, original, committed = foreign
+                reference = self._require_committed_callback(original, committed)
+                mapped = j._UntrackedCommissionCallbackCovered(_callback_source(event, self._session),
+                    _commission_callback_snapshot(event), reference)
+                return _CallbackCoverage(staged, mapped, self._append_callback(coordinator, mapped, staged))
             if owned is None:
                 return None  # Bounded staging, never a fabricated target label.
-            execution, _ = owned
+            execution, execution_receipt = owned
+            self._require_committed_callback(execution, execution_receipt)
             _require(event.sequence > self.__invocation_boundaries[execution.client_order_id])
             mapped = _callback_projection(event, execution.client_order_id, self._session)
             prior = self.__commissions.get(event.exec_id)
@@ -596,10 +676,14 @@ class _PaperDispatchJournalOwner:
                 original, committed = prior
                 _require((mapped.client_order_id, mapped.exec_id, mapped.report_id, mapped.amount, mapped.currency) ==
                          (original.client_order_id, original.exec_id, original.report_id, original.amount, original.currency))
-                return _CallbackCoverage(staged, original, committed)
-            committed = self._append_callback(coordinator, mapped, staged)
-            self.__commissions[event.exec_id] = (mapped, committed)
-            return _CallbackCoverage(staged, mapped, committed)
+            else:
+                committed = self._append_callback(coordinator, mapped, staged)
+                original = mapped
+                self.__commissions[event.exec_id] = (original, committed)
+            reference = self._require_committed_callback(original, committed)
+            covered = j._CommissionCallbackCovered(_callback_source(event, self._session),
+                _commission_callback_snapshot(event), reference)
+            return _CallbackCoverage(staged, covered, self._append_callback(coordinator, covered, staged))
         related_exec = self.__executions.get(event.execution_id) if type(event) is _ExecutionEvidence else None
         target = next((a for a in attempts if a.order_id == event.order_id), None)
         if related_exec is not None:
@@ -612,9 +696,14 @@ class _PaperDispatchJournalOwner:
                 prior = self.__foreign_executions.get(event.execution_id)
                 identity = tuple((f.name, _values(getattr(event, f.name))) for f in fields(type(event))
                                  if f.name not in ('sequence', 'generation'))
-                _require(prior is None or prior == identity)
-                self.__foreign_executions[event.execution_id] = identity
-            return _CallbackCoverage(staged, None, None)
+                _require(prior is None or prior[0] == identity)
+            mapped = j._UntrackedCallbackObserved(_callback_source(event, self._session),
+                _ordinary_callback_snapshot(event, self._session),
+                j._UntrackedCallbackReason.NO_TRACKED_NUMERIC_ORDER_IN_SESSION)
+            committed = self._append_callback(coordinator, mapped, staged)
+            if type(event) is _ExecutionEvidence:
+                self.__foreign_executions.setdefault(event.execution_id, (identity, mapped, committed))
+            return _CallbackCoverage(staged, mapped, committed)
         key = target.consumed.client_order_id
         _require(target.invocation_may_have_occurred and key in self.__invocation_boundaries
                  and event.sequence > self.__invocation_boundaries[key])
@@ -629,8 +718,12 @@ class _PaperDispatchJournalOwner:
         previous = self.__adjacent_observation
         if previous is not None and previous[0] + 1 == event.sequence and previous[1] == identity:
             original, committed = previous[2:]
+            reference = self._require_committed_callback(original, committed)
+            covered = j._DuplicateCallbackCovered(_callback_source(event, self._session),
+                _ordinary_callback_snapshot(event, self._session), reference)
+            occurrence = self._append_callback(coordinator, covered, staged)
             self.__adjacent_observation = (event.sequence, identity, original, committed)
-            return _CallbackCoverage(staged, original, committed)
+            return _CallbackCoverage(staged, covered, occurrence)
         committed = self._append_callback(coordinator, mapped, staged)
         self.__adjacent_observation = (event.sequence, identity, mapped, committed)
         if type(mapped) is j._OpenOrderObserved and mapped.order_ref == key and mapped.status is not j._LifecycleStatus.UNKNOWN:
@@ -689,12 +782,14 @@ class _PaperDispatchJournalOwner:
                     if sequence not in self.__covered:
                         coverage = self._cover_callback(coordinator, self.__staged[sequence], attempts)
                         if coverage is not None:
+                            self._require_callback_coverage(coverage)
                             self.__covered[sequence] = coverage
                 # A later durable execution can now qualify earlier commissions.
                 for sequence in sorted(self.__staged):
                     if sequence not in self.__covered:
                         coverage = self._cover_callback(coordinator, self.__staged[sequence], attempts)
                         if coverage is not None:
+                            self._require_callback_coverage(coverage)
                             self.__covered[sequence] = coverage
                 cursor = self.__persistence_cursor
                 while cursor + 1 in self.__covered:
@@ -702,13 +797,7 @@ class _PaperDispatchJournalOwner:
                     coverage = self.__covered[cursor]
                     _require(coverage.staged is self.__staged[cursor]
                              and _callback_values(coverage.staged.evidence) == coverage.staged.values)
-                    if coverage.committed is not None:
-                        committed = coverage.committed
-                        _require(type(committed) is _CommittedRecord
-                                 and committed.record.payload is coverage.event
-                                 and 0 < committed.record.sequence <= len(self.__history)
-                                 and _values(committed.record) == self.__history[committed.record.sequence - 1])
-                        _CommittedRecord.__post_init__(committed)
+                    self._require_callback_coverage(coverage)
                 self._callback_revalidate(coordinator, state, through)
                 if cursor == self.__persistence_cursor:
                     _require(len(self.__staged) < _EVIDENCE_CAPACITY
@@ -766,7 +855,8 @@ def _create_paper_dispatch_journal_owner(coordinator, path):
             generation, client_id = write._generation, write._config.client_id
             receipt = read._issue_journal_account_binding()
             binding = read._validate_journal_account_binding(receipt)
-            header = j._JournalHeader(1, 'journal-' + secrets.token_hex(16), binding)
+            header = j._JournalHeader(2, 'journal-' + secrets.token_hex(16), binding,
+                                      format_id=j._FORMAT_ID_V2)
             store = _SQLiteJournalStore._create(path, header)
             loaded = store._load()
             _require(not loaded.records and _values(loaded.header) == _values(header)

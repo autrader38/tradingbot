@@ -101,7 +101,7 @@ class VersionTests(PureCase):
             '_InvocationMayOccur', '_SdkReturnedNormally', '_AttemptClosedWithoutInvocation',
             '_ReconciliationRequired', '_OpenOrderObserved', '_OrderStatusObserved',
             '_ExecutionObserved', '_CommissionReceived', '_CallbackProgress'))
-        self.assertEqual(j._EVENT_TYPES_V2, j._EVENT_TYPES_V1 + EVENTS)
+        self.assertEqual(j._EVENT_TYPES_V2, j._EVENT_TYPES_V1 + EVENTS + (j._QualifiedOrderStatusObserved,))
 
     def test_baseline_v1_canonical_bytes_and_chain_golden(self):
         # Independently compared with the exact 445ef299 baseline modules before
@@ -610,13 +610,14 @@ for exception in (KeyboardInterrupt,SystemExit,GeneratorExit):
 
 
 class BoundaryTests(PureCase):
-    def test_owner_stays_v1_and_producer_remains_unsupported(self):
+    def test_fresh_owner_v2_and_qualified_occurrence_is_durable(self):
         from tests.test_ibkr_qualified_status_publication import RuntimeCase
         case=RuntimeCase('runTest'); case.setUp()
         try:
-            case.registered(); self.assertEqual(case.journal._header.schema_version,1)
-            case.qualified(); case.failed(case.drain())
-            self.assertEqual(case.journal._persistence_cursor,0)
+            case.registered(); self.assertEqual(case.journal._header.schema_version,2)
+            case.qualified(); self.assertEqual(case.drain().state.value,'CURRENT')
+            self.assertEqual(case.journal._persistence_cursor,1)
+            self.assertEqual(len(case.of_type(j._QualifiedOrderStatusObserved)),1)
         finally: case.tearDown(); case.doCleanups()
 
     def test_no_transport_storage_or_authority_import_in_journal(self):
@@ -639,10 +640,11 @@ class BoundaryTests(PureCase):
         self.assertEqual(result.entries[0].recorded_execution_quantity,D(3))
         self.assertEqual(result.entries[0].known_commission_total,D('0.25'))
 
-    def test_no_qualified_source_model_or_public_exports(self):
+    def test_qualified_source_model_remains_private(self):
         import tradingbot_broker
-        self.assertFalse(hasattr(j,'_QualifiedOrderStatusObserved'))
-        self.assertFalse(any(hasattr(tradingbot_broker,t.__name__) for t in EVENTS+SNAPSHOTS))
+        self.assertTrue(hasattr(j,'_QualifiedOrderStatusObserved'))
+        self.assertFalse(any(hasattr(tradingbot_broker,t.__name__) for t in
+                             EVENTS+SNAPSHOTS+(j._QualifiedOrderStatusObserved,)))
 
 
 if __name__ == '__main__': unittest.main()

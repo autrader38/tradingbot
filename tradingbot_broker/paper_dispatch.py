@@ -17,6 +17,8 @@ from .ibkr_paper_transport import (PaperTWSTransport, PaperTWSConfig,
     _StockMarketSpec, _DispatchResult, _DispatchState, _Operation, _valid_order_id,
     _OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence, _evidence_identity,
     _sum_callback_amounts, _DispatchReservation)
+from .ibkr_qualified_status_ledger import (_QualifiedOrderStatusEvidence,
+    _consumer_support, _legacy_projection, _LedgerConsumer, _ConsumerSupport)
 from .models import (OrderRequest, RiskPermission, TradingMode, Side, OrderType,
     OrderIntent, TimeInForce, BrokerReason, AccountSnapshot, identifier)
 from .paper_execution import (PaperExecutionScope, PaperExecutionAuthorizationStatus,
@@ -586,7 +588,20 @@ class _PaperOrderDispatchCoordinator:
             self._economic_observation = True
         self._last_status = status
 
+    def _callback_view(self, event):
+        if type(event) is not _QualifiedOrderStatusEvidence:
+            return event  # Existing old-type behavior is preserved.
+        if _consumer_support(event, _LedgerConsumer.DISPATCH) is not \
+                _ConsumerSupport.SUPPORTED_VIA_LOSSLESS_PROJECTION:
+            raise ReadOnlyError('UNSUPPORTED_QUALIFIED_STATUS')
+        view = _legacy_projection(event)
+        if (type(view) is not _OrderStatusEvidence or view.sequence != event.sequence
+                or view.generation != event.generation):
+            raise ReadOnlyError('UNSUPPORTED_QUALIFIED_STATUS')
+        return view  # Same-sequence temporary view; never retained or persisted.
+
     def _process_callback(self, event):
+        event = self._callback_view(event)
         pending = self._pending_order
         if event.order_id != pending.order_id:
             return  # Other well-formed orders cannot confirm this pending entry.
@@ -673,6 +688,7 @@ class _PaperOrderDispatchCoordinator:
                         for event in batch.events:
                             if event.sequence != self._callback_cursor + 1:
                                 raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_GAP')
+                            event = self._callback_view(event)
                             if (event.generation == pending.generation
                                     and event.sequence > pending.commit_sequence):
                                 self._process_callback(event)
@@ -693,6 +709,11 @@ class _PaperOrderDispatchCoordinator:
                 # confirmation; it cannot later confirm a newly reserved order.
                 for event in batch.events:
                     if event.sequence != self._callback_cursor + 1:
+                        self._mark_reconciliation()
+                        break
+                    try:
+                        event = self._callback_view(event)
+                    except Exception:
                         self._mark_reconciliation()
                         break
                     self._callback_cursor = event.sequence

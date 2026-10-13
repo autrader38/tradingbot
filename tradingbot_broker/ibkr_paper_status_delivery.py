@@ -1,7 +1,7 @@
 """Private, memory-only decoder registration and fenced status handoff.
 
-No production receiver is installed. An unaccepted handoff permanently inhibits
-the transport. The existing callback ledger and its sequences are not used here.
+One exact receiver publishes qualified occurrences through the captured transport
+method. Unaccepted or incompletely captured handoffs permanently inhibit delivery.
 """
 
 from dataclasses import dataclass, fields
@@ -112,17 +112,23 @@ def _values(value):
 
 class _Entry:
     __slots__ = ('receipt', 'receipt_values', 'thread', 'scope', 'invocation',
-                 'handler', 'handoff', 'observation', 'values', 'accepted', 'state')
+                 'handler', 'handoff', 'observation', 'values', 'accepted', 'state',
+                 'publication_attempted', 'publication_started', 'publication_sequence',
+                 'publication_complete', 'publication_result')
 
     def __init__(self, receipt, scope):
         self.receipt, self.scope, self.thread = receipt, scope, current_thread()
         self.receipt_values = (receipt.registration, receipt.number, receipt.protocol)
         self.invocation = self.handler = self.handoff = self.observation = self.values = None
         self.accepted, self.state = False, 'OPEN'
+        self.publication_attempted = self.publication_started = self.publication_complete = False
+        self.publication_sequence = self.publication_result = None
 
     def clear(self):
         self.invocation = self.handler = self.handoff = self.observation = self.values = None
         self.state = 'CLOSED'
+        self.publication_attempted = self.publication_started = self.publication_complete = False
+        self.publication_sequence = self.publication_result = None
 
 
 class _LegacyHandle:
@@ -150,7 +156,8 @@ class _PaperStatusDelivery:
                  '__decoder_type', '__legacy', '__protobuf', '__dispatcher', '__interpret',
                  '__legacy_name', '__legacy_table', '__legacy_items', '__shadow', '__shim',
                  '__interceptor', '__entries', '__dispatches', '__counter', '__receiver', '__closing',
-                 '__legacy_processors', '__version')
+                 '__legacy_processors', '__version', '__publisher', '__publication_type',
+                 '__publication_method')
 
     def __init__(self, *args, **kwargs):
         raise ReadOnlyError(_ERROR)
@@ -230,6 +237,7 @@ class _PaperStatusDelivery:
                      and decoder.serverVersion == version and decoder.wrapper is self.__wrapper)
             self._set('version', version)
             self._install(decoder, decoder_type)
+            self._arm_receiver()  # Complete capability BEFORE READY/run eligibility.
             with self.__guard:
                 _require(self.__decoder is decoder and self.__phase == 'REGISTERING')
                 self._set('ever_connected', True)
@@ -299,6 +307,11 @@ class _PaperStatusDelivery:
             _require(self.__phase == 'READY' and self.__registration is not None
                      and self.__decoder is not None and (decoder is None or decoder is self.__decoder))
             registration = self.__registration
+            _require(type(self.__receiver) is _StatusReceiver
+                     and self.__receiver.registration is registration
+                     and type(self.__publisher) is MethodType
+                     and self.__publisher.__self__ is self.__transport
+                     and self.__publisher.__func__ is self.__publication_method)
             _DecoderRegistration.__post_init__(registration)
             _require((registration.namespace, registration.generation) == self.__registration_values)
             d, cls = self.__decoder, self.__decoder_type
@@ -566,7 +579,9 @@ class _PaperStatusDelivery:
                 observation = paired.observation
             else:
                 observation = source._adapt_legacy_order_status(*values)
-            return self._make_handoff(entry, observation)
+            handoff = self._make_handoff(entry, observation)
+            self._receive_handoff(handoff, self.__receiver)
+            return handoff
         except BaseException as error:
             self._fail()
             if isinstance(error, Exception):
@@ -581,29 +596,68 @@ class _PaperStatusDelivery:
             entry.state = 'HANDOFF'
         return handoff
 
-    def _issue_handoff_receiver(self):
-        # Private future integration/test seam, not an arbitrary callback hook.
-        # The factory never invokes this or installs a production receiver.
-        self._check()
+    def _arm_receiver(self):
+        from .ibkr_paper_transport import PaperTWSTransport
         with self.__guard:
-            _require(self.__receiver is None)
+            _require(self.__phase == 'REGISTERING' and self.__registration is not None
+                     and self.__receiver is None and self.__publisher is None
+                     and type(self.__transport) is PaperTWSTransport)
             receiver = _StatusReceiver(self.__registration)
+            publisher = PaperTWSTransport._publish_qualified_status.__get__(self.__transport)
+            self._set('publisher', publisher)
+            self._set('publication_method', publisher.__func__)
+            self._set('publication_type', self.__transport._qualified_status_type)
             self._set('receiver', receiver)
-            return receiver
+
+    def _issue_handoff_receiver(self):
+        # Registration already issued the only receiver; never issue/replace later.
+        raise ReadOnlyError(_ERROR)
+
+    def _live_handoff(self, handoff, receiver):
+        # Caller owns PRE5 guard. No transport lock or SDK call here.
+        entry = self._top()
+        _require(type(receiver) is _StatusReceiver and receiver is self.__receiver
+                 and receiver.registration is self.__registration
+                 and type(handoff) is _StatusHandoff and handoff is entry.handoff
+                 and handoff.delivery is entry.receipt and not entry.accepted
+                 and entry.state == 'HANDOFF' and handoff.observation is entry.observation
+                 and handoff.generation == self.__generation)
+        _StatusHandoff.__post_init__(handoff)
+        _require(_values(handoff.observation) == entry.values)
+        return entry
+
+    def _receive_handoff(self, handoff, receiver):
+        try:
+            self._check()
+            with self.__guard:
+                entry = self._live_handoff(handoff, receiver)
+                _require(not entry.publication_attempted and self.__publisher is not None)
+                entry.publication_attempted = True
+                publisher = self.__publisher
+            # Neither PRE5 nor PRE4 guard spans transport arrival synchronization.
+            publisher(self, receiver, handoff, entry)
+            self._accept_handoff(handoff, receiver)
+        except BaseException:
+            self._fail()
+            raise
 
     def _accept_handoff(self, handoff, receiver):
         try:
             self._check()
             with self.__guard:
-                entry = self._top()
-                _require(type(receiver) is _StatusReceiver and receiver is self.__receiver
-                         and receiver.registration is self.__registration
-                         and type(handoff) is _StatusHandoff and handoff is entry.handoff
-                         and handoff.delivery is entry.receipt and not entry.accepted
-                         and entry.state == 'HANDOFF'
-                         and handoff.observation is entry.observation)
-                _StatusHandoff.__post_init__(handoff)
-                _require(_values(handoff.observation) == entry.values)
+                entry = self._live_handoff(handoff, receiver)
+                result = entry.publication_result
+                _require(entry.publication_attempted is True and entry.publication_started is True
+                         and entry.publication_complete is True
+                         and type(entry.publication_sequence) is int and entry.publication_sequence > 0
+                         and type(result) is tuple and len(result) == 2
+                         and type(result[0]) is self.__publication_type
+                         and type(result[1]) is int
+                         and type(result[0].sequence) is int and type(result[0].generation) is int
+                         and result[0].sequence == result[1] == entry.publication_sequence
+                         and result[0].generation == handoff.generation
+                         and _values(result[0].observation) == entry.values)
+                source._OrderStatusObservation.__post_init__(result[0].observation)
                 entry.accepted = True  # Fence remains until handler/delivery exit.
         except BaseException:
             self._fail()

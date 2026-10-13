@@ -13,6 +13,8 @@ from .ibkr_readonly import (_ReconciliationReadRequest, _ReconciliationReadRecei
     _ReconciliationOrderEvidence, _ReconciliationExecutionEvidence, _ReconciliationPresence)
 from .ibkr_paper_transport import (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence,
                                   _CommissionEvidence)
+from .ibkr_qualified_status_ledger import (_QualifiedOrderStatusEvidence, _validate_event,
+    _consumer_support, _legacy_projection, _LedgerConsumer, _ConsumerSupport)
 from .paper_execution import PaperExecutionAuthorizationStatus
 from .readonly_models import ReadOnlyError, ReadOnlySnapshot
 from .models import identifier
@@ -223,7 +225,10 @@ def _local(local, pending):
     _require(type(local.unread_events) is tuple and len(local.unread_events) <= 128)
     for event in local.unread_events:
         _require(type(event) in (_OpenOrderEvidence, _OrderStatusEvidence, _ExecutionEvidence,
-                                _CommissionEvidence))
+                                _CommissionEvidence, _QualifiedOrderStatusEvidence))
+        if type(event) is _QualifiedOrderStatusEvidence:
+            _validate_event(event)
+            continue
         if type(event) is _CommissionEvidence:
             # Recheck exact producer primitives, fingerprint and UTC receipt time.
             # Signed commissions have no order identity or nonnegative quantity semantics.
@@ -375,6 +380,14 @@ def _unread(local, pending):
         if event.sequence != expected:
             unresolved = True
         expected = event.sequence + 1
+        if type(event) is _QualifiedOrderStatusEvidence:
+            if _consumer_support(event, _LedgerConsumer.RECONCILIATION) is not \
+                    _ConsumerSupport.SUPPORTED_VIA_LOSSLESS_PROJECTION:
+                return True, conflict  # No later event bypasses unsupported source.
+            view = _legacy_projection(event)
+            _require(type(view) is _OrderStatusEvidence and view.sequence == event.sequence
+                     and view.generation == event.generation)
+            event = view  # Local view only; immutable unread source stays qualified.
         if event.generation != pending.generation or event.sequence <= pending.commit_sequence:
             continue
         if type(event) is _CommissionEvidence:

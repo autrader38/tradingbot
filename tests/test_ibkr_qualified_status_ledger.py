@@ -614,11 +614,12 @@ class BoundaryTests(PureCase):
                           '_StatusHandoff', '_issue_handoff_receiver', '_accept_handoff'):
             self.assertNotIn(forbidden, text)
 
-    def test_production_modules_do_not_import_contract(self):
-        for path in ('ibkr_paper_transport.py', 'ibkr_paper_status_delivery.py',
-                     'paper_dispatch.py', 'paper_reconciliation.py', 'paper_dispatch_journal.py'):
-            self.assertNotIn('ibkr_qualified_status_ledger',
-                             Path(contract.__file__).with_name(path).read_text())
+    def test_qualified_source_durability_still_does_not_import_contract(self):
+        self.assertNotIn('ibkr_qualified_status_ledger',
+            Path(contract.__file__).with_name('paper_dispatch_journal.py').read_text())
+        for path in ('ibkr_paper_transport.py', 'paper_dispatch.py', 'paper_reconciliation.py'):
+            self.assertIn('ibkr_qualified_status_ledger',
+                          Path(contract.__file__).with_name(path).read_text())
 
     def test_transport_state_and_receiver_remain_unchanged(self):
         api = sdk()

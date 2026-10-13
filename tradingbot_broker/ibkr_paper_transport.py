@@ -21,13 +21,26 @@ from .ibkr_paper_wire import (_guarded_connection, _LEGACY_POLICY, _PROTOBUF_POL
                               _LEGACY_WRITES, _PROTOBUF_WRITES)
 from .ibkr_paper_status_delivery import (_new_status_delivery, _PaperStatusDelivery,
                                        _DecoderRegistration, _StatusDeliveryReceipt,
-                                       _StatusArrivalFence)
+                                       _StatusArrivalFence, _StatusHandoff, _StatusReceiver,
+                                       _Entry, _values as _status_values)
 from .models import Side, identifier, validate_timestamp
 from .readonly_models import AccountMode, ReadOnlyError
 
 
 MIN_ORDER_ID = 0
 MAX_ORDER_ID = 2_147_483_647
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _StatusLedgerContract:
+    event_type: object
+    validate: object
+    identity: object
+    known_id: object
+    collision: object
+    collision_state: object
+
+    def __repr__(self): return '<PrivateStatusLedgerContract>'
 
 
 def _valid_order_id(value):
@@ -622,6 +635,13 @@ Private session/dispatch methods support offline qualification only in this phas
         config.__post_init__()
         api = sdk_call('SDK_INITIALIZATION_FAILED', _load_paper_api)
         sdk_call('UNSUPPORTED_PAPER_IBAPI_CONTRACT', _qualify, api)
+        # PRE6 imports transport models. Load only after this module is complete,
+        # before client construction/callbacks, with no arrival lock or import I/O
+        # on the callback thread. Retain exact reviewed references, not a module hook.
+        from . import ibkr_qualified_status_ledger as ledger
+        self.__status_contract = _StatusLedgerContract(ledger._QualifiedOrderStatusEvidence,
+            ledger._validate_event, ledger._source_identity, ledger._known_order_id,
+            ledger._reservation_collision, ledger._ReservationCollision)
         self._config = config
         self._lock = RLock()
         # Never held while waiting for _lock or calling SDK methods. An error can
@@ -661,6 +681,8 @@ Private session/dispatch methods support offline qualification only in this phas
     def account_mode(self): return AccountMode.UNKNOWN
 
     def __setattr__(self, name, value):
+        if name == '_PaperTWSTransport__status_contract' and hasattr(self, name):
+            raise ReadOnlyError('PAPER_STATUS_CONTRACT_IMMUTABLE')
         if (name == '_callback_evidence_lost_at' or
                 name == '_PaperTWSTransport__callback_evidence_lost_at' and hasattr(self, name)):
             raise ReadOnlyError('PAPER_CALLBACK_LOSS_IMMUTABLE')
@@ -669,6 +691,8 @@ Private session/dispatch methods support offline qualification only in this phas
         super().__setattr__(name, value)
 
     def __delattr__(self, name):
+        if name == '_PaperTWSTransport__status_contract':
+            raise ReadOnlyError('PAPER_STATUS_CONTRACT_IMMUTABLE')
         if name in ('_callback_evidence_lost_at', '_PaperTWSTransport__callback_evidence_lost_at'):
             raise ReadOnlyError('PAPER_CALLBACK_LOSS_IMMUTABLE')
         if name == '_PaperTWSTransport__dispatch_binding':
@@ -678,6 +702,10 @@ Private session/dispatch methods support offline qualification only in this phas
     @property
     def _callback_evidence_lost_at(self):
         return self.__callback_evidence_lost_at
+
+    @property
+    def _qualified_status_type(self):
+        return self.__status_contract.event_type
 
     @property
     def _dispatch_coordinator_owner(self):
@@ -909,11 +937,14 @@ Private session/dispatch methods support offline qualification only in this phas
         expected = 1
         for event, end in zip(self._callback_evidence, self._callback_run_ends):
             if (type(event) not in (_OpenOrderEvidence, _OrderStatusEvidence,
-                                   _ExecutionEvidence, _CommissionEvidence)
+                                   _ExecutionEvidence, _CommissionEvidence,
+                                   self.__status_contract.event_type)
                     or type(event.generation) is not int or event.generation < 1
                     or type(event.sequence) is not int or event.sequence != expected
                     or type(end) is not int or not event.sequence <= end <= self._callback_sequence):
                 invalid()
+            if type(event) is self.__status_contract.event_type:
+                self.__status_contract.validate(event)
             expected = end + 1
         lost = self.__callback_evidence_lost_at
         if lost is None:
@@ -944,6 +975,57 @@ Private session/dispatch methods support offline qualification only in this phas
             raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_INVALID')
         self._callback_sequence = sequence
 
+    def _callback_content_identity(self, event):
+        if type(event) is self.__status_contract.event_type:
+            return self.__status_contract.identity(event)
+        return _evidence_identity(event)  # Preserve all four old content identities.
+
+    def _commit_callback_occurrence(self, event, identity, known_id):
+        """Shared arrival-owned PRE7 retention for an already validated occurrence."""
+        sequence = event.sequence
+        if type(sequence) is not int or sequence != self._callback_sequence + 1:
+            raise ReadOnlyError('PAPER_CALLBACK_SEQUENCE_INVALID')
+        if self.__callback_evidence_lost_at is not None:
+            self._last_callback_identity = None
+        elif (self._callback_evidence and self._callback_run_ends
+                and self._callback_run_ends[-1] == sequence - 1
+                and identity == self._last_callback_identity
+                and identity == self._callback_content_identity(self._callback_evidence[-1])):
+            ends = self._callback_run_ends.copy()
+            ends[-1] = sequence
+            self._publish_callback_evidence(self._callback_evidence.copy(), ends, identity)
+        elif len(self._callback_evidence) == _EVIDENCE_CAPACITY:
+            self._record_callback_evidence_loss(sequence)
+        else:
+            self._publish_callback_evidence(self._callback_evidence + [event],
+                                            self._callback_run_ends + [sequence], identity)
+        self._advance_callback_sequence(sequence)
+        if known_id is not None:
+            self._raise_observed_floor(known_id)
+        self._check_callback_evidence()
+        return self.__callback_evidence_lost_at is None
+
+    def _failed_callback_capture(self, sequence, known_id, events, ends):
+        # Cleanup bypasses fallible commit helpers. Never decrease the watermark
+        # or allocator safety, and never retain a partially committed occurrence.
+        object.__setattr__(self, '_callback_evidence', events)
+        object.__setattr__(self, '_callback_run_ends', ends)
+        object.__setattr__(self, '_last_callback_identity', None)
+        current = self._callback_sequence
+        object.__setattr__(self, '_callback_sequence',
+                           current if type(current) is int and current > sequence else sequence)
+        if self.__callback_evidence_lost_at is None:
+            object.__setattr__(self, '_PaperTWSTransport__callback_evidence_lost_at', sequence)
+        object.__setattr__(self, '_arrival_unusable', True)
+        object.__setattr__(self, '_reconciliation_required', True)
+        if known_id is not None:
+            if known_id == MAX_ORDER_ID:
+                object.__setattr__(self, '_lifetime_order_ids_exhausted', True)
+                object.__setattr__(self, '_lifetime_order_floor', MAX_ORDER_ID)
+            else:
+                object.__setattr__(self, '_lifetime_order_floor',
+                                   max(self._lifetime_order_floor, known_id + 1))
+
     def _capture_callback_evidence(self, generation, kind, value):
         """One arrival-owned update; no SDK, journal, acknowledgement or authority."""
         try:
@@ -963,49 +1045,69 @@ Private session/dispatch methods support offline qualification only in this phas
                     or type(event.sequence) is not int or event.sequence != sequence):
                 event = None
                 raise ReadOnlyError('PAPER_CALLBACK_EVIDENCE_INVALID')
-            identity = _evidence_identity(event)
-            if self.__callback_evidence_lost_at is not None:
-                # Watermark still records valid occurrences; retained prefix is frozen.
-                self._last_callback_identity = None
-            elif (original_events and original_ends
-                    and original_ends[-1] == sequence - 1
-                    and identity == self._last_callback_identity
-                    and identity == _evidence_identity(original_events[-1])):
-                ends = original_ends.copy()
-                ends[-1] = sequence
-                self._publish_callback_evidence(original_events.copy(), ends, identity)
-            elif len(original_events) == _EVIDENCE_CAPACITY:
-                self._record_callback_evidence_loss(sequence)
-            else:
-                self._publish_callback_evidence(original_events + [event],
-                                                original_ends + [sequence], identity)
-            self._advance_callback_sequence(sequence)
-            if type(event) is not _CommissionEvidence:
-                self._raise_observed_floor(event.order_id)
-            self._check_callback_evidence()
+            identity = self._callback_content_identity(event)
+            self._commit_callback_occurrence(event, identity,
+                None if type(event) is _CommissionEvidence else event.order_id)
         except BaseException:
             if event is not None:
                 # A valid copied occurrence exists but its transition failed.
                 # Restore only the untouched prefix, NEVER roll back the watermark
                 # or lifetime allocator safety. Cleanup bypasses fallible helpers.
-                object.__setattr__(self, '_callback_evidence', original_events)
-                object.__setattr__(self, '_callback_run_ends', original_ends)
-                object.__setattr__(self, '_last_callback_identity', None)
-                current = self._callback_sequence
-                object.__setattr__(self, '_callback_sequence',
-                                   current if type(current) is int and current > sequence else sequence)
-                if self.__callback_evidence_lost_at is None:
-                    object.__setattr__(self, '_PaperTWSTransport__callback_evidence_lost_at', sequence)
-                object.__setattr__(self, '_arrival_unusable', True)
-                object.__setattr__(self, '_reconciliation_required', True)
-                if type(event) is not _CommissionEvidence:
-                    if event.order_id == MAX_ORDER_ID:
-                        object.__setattr__(self, '_lifetime_order_ids_exhausted', True)
-                        object.__setattr__(self, '_lifetime_order_floor', MAX_ORDER_ID)
-                    else:
-                        object.__setattr__(self, '_lifetime_order_floor',
-                                           max(self._lifetime_order_floor, event.order_id + 1))
+                self._failed_callback_capture(sequence,
+                    None if type(event) is _CommissionEvidence else event.order_id,
+                    original_events, original_ends)
             raise
+
+    def _publish_qualified_status(self, delivery, receiver, handoff, entry):
+        """Exact live PRE5 claim only. No SDK, receipt retention or callback I/O."""
+        with self._arrival_lock:
+            sequence, known_id = None, None
+            events, ends = self._callback_evidence, self._callback_run_ends
+            try:
+                if (type(delivery) is not _PaperStatusDelivery or type(receiver) is not _StatusReceiver
+                        or type(handoff) is not _StatusHandoff or type(entry) is not _Entry):
+                    raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+                self._check_status_registration(delivery, receiver.registration)
+                entries = object.__getattribute__(delivery, '_PaperStatusDelivery__entries')
+                if (type(delivery) is not _PaperStatusDelivery
+                        or delivery is not self._status_delivery_owner
+                        or object.__getattribute__(delivery, '_PaperStatusDelivery__transport') is not self
+                        or type(receiver) is not _StatusReceiver
+                        or receiver is not object.__getattribute__(delivery, '_PaperStatusDelivery__receiver')
+                        or type(entry) is not _Entry or not entries or entries[-1] is not entry
+                        or entry.thread is not _current_thread() or entry.state != 'HANDOFF'
+                        or entry.publication_attempted is not True or entry.publication_started
+                        or entry.publication_complete or entry.publication_sequence is not None
+                        or type(handoff) is not _StatusHandoff or handoff is not entry.handoff
+                        or handoff.delivery is not entry.receipt or entry.accepted
+                        or handoff.generation != self._callback_generation
+                        or handoff.observation is not entry.observation
+                        or not any(f.delivery is entry.receipt for f in self._status_fences)):
+                    raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+                _StatusHandoff.__post_init__(handoff)
+                if _status_values(handoff.observation) != entry.values:
+                    raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+                entry.publication_started = True
+                self._check_callback_evidence()
+                sequence = self._callback_sequence + 1
+                entry.publication_sequence = sequence  # One-shot consumption before construction.
+                event = self.__status_contract.event_type(self._callback_generation,
+                                                          sequence, handoff.observation)
+                self.__status_contract.validate(event)
+                known_id = self.__status_contract.known_id(event)
+                identity = self._callback_content_identity(event)
+                if not self._commit_callback_occurrence(event, identity, known_id):
+                    raise ReadOnlyError('PAPER_CALLBACK_EVIDENCE_LOST')
+                entry.publication_result = (event, sequence)
+                entry.publication_complete = True
+            except BaseException:
+                if delivery is self._status_delivery_owner:
+                    self._status_registration_eligible = False
+                if sequence is not None:
+                    self._failed_callback_capture(sequence, known_id, events, ends)
+                elif delivery is self._status_delivery_owner:
+                    self._arrival_unusable = self._reconciliation_required = True
+                raise
 
     def _raise_observed_floor(self, order_id):
         # Caller owns arrival. Only lifetime safety state changes here; current
@@ -1259,10 +1361,9 @@ Private session/dispatch methods support offline qualification only in this phas
                 or self._status_fences or not self._status_registration_eligible
                 or self._closed or self._invalid_callback or not self._initialized
                 or self._sync != 'COMPLETED' or reservation.order_id in self._known
-                or any(type(e) is not _CommissionEvidence and
-                       e.generation == reservation.generation and
-                       e.order_id == reservation.order_id
-                       for e in self._callback_evidence)):
+                or self.__status_contract.collision(tuple(self._callback_evidence),
+                    generation=reservation.generation, order_id=reservation.order_id)
+                    is not self.__status_contract.collision_state.NO_COLLISION_OBSERVED):
             raise ReadOnlyError('PAPER_RESERVATION_STALE')
 
     def _stage_commitment(self, reservation):

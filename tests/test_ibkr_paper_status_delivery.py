@@ -17,6 +17,7 @@ from tradingbot_broker import ibkr_paper_transport as paper
 from tradingbot_broker import ibkr_paper_status_delivery as delivery
 from tradingbot_broker import ibkr_order_status_pairing as pairing
 from tradingbot_broker import ibkr_order_status_evidence as source
+from tradingbot_broker import ibkr_qualified_status_ledger as ledger
 from tradingbot_broker.readonly_models import AccountMode, ReadOnlyError
 from tests.test_ibkr_paper_transport import sdk, transport
 from tests.test_ibkr_order_status_evidence import Proto, RAW, LEGACY, normalized
@@ -129,16 +130,20 @@ class Case(unittest.TestCase):
             with patch.object(pairing, '_load_pairing_sdk', return_value=(decoder_type, incoming)):
                 self.assertEqual(c.connect(), 'offline-connect-result')
             f.decoder, f.registration = c.decoder, t._status_registration
-            if accept:
-                f.receiver = f.owner._issue_handoff_receiver()
-                original = delivery._PaperStatusDelivery._make_handoff
-                def published(owner, entry, observation):
-                    handoff = original(owner, entry, observation)
-                    if owner is f.owner:
-                        f.handoffs.append(handoff)
-                        owner._accept_handoff(handoff, f.receiver)
-                    return handoff
-                self.enterContext(patch.object(delivery._PaperStatusDelivery, '_make_handoff', published))
+            f.receiver = f.owner._PaperStatusDelivery__receiver
+            original = delivery._PaperStatusDelivery._make_handoff
+            def observed(owner, entry, observation):
+                handoff = original(owner, entry, observation)
+                if owner is f.owner: f.handoffs.append(handoff)
+                return handoff
+            self.enterContext(patch.object(delivery._PaperStatusDelivery, '_make_handoff', observed))
+            if not accept:
+                # Test-only blocked consumption; production has no disable hook.
+                receive = delivery._PaperStatusDelivery._receive_handoff
+                def blocked(owner, handoff, receiver):
+                    if owner is f.owner: raise ReadOnlyError('INVALID_PAPER_STATUS_DELIVERY')
+                    return receive(owner, handoff, receiver)
+                self.enterContext(patch.object(delivery._PaperStatusDelivery, '_receive_handoff', blocked))
         return f
 
     def protobuf(self, f, **changes):
@@ -164,8 +169,9 @@ class Case(unittest.TestCase):
         self.assertEqual(f.transport._status_fences, [])
         self.assertEqual(f.owner._PaperStatusDelivery__entries, [])
         self.assertEqual(f.owner._PaperStatusDelivery__dispatches, [])
-        self.assertEqual(f.transport._callback_sequence, 0)
-        self.assertEqual(f.transport._callback_evidence, [])
+        with f.transport._arrival_lock: f.transport._check_callback_evidence()
+        self.assertTrue(all(type(e) is ledger._QualifiedOrderStatusEvidence
+                            for e in f.transport._callback_evidence))
 
     def inhibited(self, f):
         self.assertTrue(f.transport._arrival_unusable)
@@ -410,7 +416,8 @@ class ProtocolTests(Case):
     def test_supplied_int32_max_is_not_absence(self):
         f = self.build(); self.protobuf(f, orderId=2147483647)
         self.assertEqual(f.handoffs[0].observation.order_id, 2147483647)
-        self.assertEqual(f.transport._lifetime_order_floor, 0)
+        self.assertEqual(f.transport._lifetime_order_floor, paper.MAX_ORDER_ID)
+        self.assertTrue(f.transport._lifetime_order_ids_exhausted)
 
     def test_perm_id_preserved_without_ownership(self):
         f = self.build(); self.protobuf(f, permId=12345)
@@ -508,7 +515,7 @@ class HandoffTests(Case):
             with self.assertRaises(FrozenInstanceError): setattr(value, fields(value)[0].name, None)
 
     def test_reconstructed_receiver_rejected(self):
-        f = self.build(accept=False); receiver = f.owner._issue_handoff_receiver()
+        f = self.build(accept=False); receiver = f.receiver
         original = delivery._PaperStatusDelivery._make_handoff
         def receive(owner, entry, observation):
             h = original(owner, entry, observation)
@@ -518,7 +525,7 @@ class HandoffTests(Case):
         self.inhibited(f)
 
     def test_equal_handoff_reconstruction_rejected(self):
-        f = self.build(accept=False); receiver = f.owner._issue_handoff_receiver()
+        f = self.build(accept=False); receiver = f.receiver
         original = delivery._PaperStatusDelivery._make_handoff
         def receive(owner, entry, observation):
             h = original(owner, entry, observation)
@@ -529,7 +536,7 @@ class HandoffTests(Case):
 
     def test_foreign_receiver_rejected(self):
         f = self.build(accept=False); foreign = self.build(accept=False)
-        receiver = foreign.owner._issue_handoff_receiver()
+        receiver = foreign.receiver
         original = delivery._PaperStatusDelivery._make_handoff
         def receive(owner, entry, observation):
             h = original(owner, entry, observation)
@@ -546,7 +553,7 @@ class HandoffTests(Case):
         self.inhibited(f)
 
     def test_receipt_cannot_be_swapped_after_creation(self):
-        f = self.build(accept=False); receiver = f.owner._issue_handoff_receiver()
+        f = self.build(accept=False); receiver = f.receiver
         original = delivery._PaperStatusDelivery._make_handoff
         def receive(owner, entry, observation):
             h = original(owner, entry, observation)
@@ -617,7 +624,7 @@ class SafetyTests(Case):
         self.assertEqual(f.handoffs, []); self.inhibited(f)
 
     def test_decimal_representation_tampering_rejected(self):
-        f = self.build(accept=False); receiver = f.owner._issue_handoff_receiver()
+        f = self.build(accept=False); receiver = f.receiver
         original = delivery._PaperStatusDelivery._make_handoff
         def changed(owner, entry, observation):
             h = original(owner, entry, observation)
@@ -655,10 +662,10 @@ class SafetyTests(Case):
             self.legacy(f)
         self.assertIs(caught.exception, primary); self.inhibited(f)
 
-    def test_no_floor_adoption_from_status_handoff(self):
+    def test_qualified_status_raises_conservative_floor_without_ownership(self):
         f = self.build(); floor = f.transport._lifetime_order_floor
         self.protobuf(f, orderId=200000)
-        self.assertEqual(f.transport._lifetime_order_floor, floor)
+        self.assertEqual(f.transport._lifetime_order_floor, max(floor, 200001))
 
     def test_counter_exhaustion_fails_closed(self):
         f = self.build()
@@ -712,13 +719,15 @@ class SafetyTests(Case):
         self.assertTrue(f.transport._reconciliation_required)
         self.assertEqual(f.transport._status_fences, [])
 
-    def test_paging_unchanged_by_handoffs(self):
+    def test_qualified_handoffs_publish_one_logical_occurrence_each(self):
         f = self.build()
         before = (tuple(f.transport._callback_evidence), tuple(f.transport._callback_run_ends),
                   f.transport._callback_sequence, f.transport._last_callback_identity)
         self.protobuf(f); self.legacy(f)
-        self.assertEqual(before, (tuple(f.transport._callback_evidence), tuple(f.transport._callback_run_ends),
-                  f.transport._callback_sequence, f.transport._last_callback_identity))
+        self.assertEqual(f.transport._callback_sequence, before[2] + 2)
+        self.assertEqual(len(f.transport._callback_evidence), 2)  # Protocols differ.
+        self.assertTrue(all(type(e) is ledger._QualifiedOrderStatusEvidence
+                            for e in f.transport._callback_evidence))
 
     def test_error_repr_does_not_include_source_text(self):
         f = self.build(); f.decoder.override = tuple('private-source-text' if i == 1 else x for i,x in enumerate(LEGACY))
@@ -780,12 +789,12 @@ class SafetyTests(Case):
         self.assertEqual(f.handoffs[0].observation.protocol, source._OrderStatusProtocol.LEGACY)
         self.closed(f)
 
-    def test_no_production_receiver(self):
+    def test_test_only_blocked_receiver_inhibits_protobuf(self):
         f = self.build(accept=False)
         with self.assertRaises(ReadOnlyError): self.protobuf(f)
         self.inhibited(f)
 
-    def test_no_legacy_receiver(self):
+    def test_test_only_blocked_receiver_inhibits_legacy(self):
         f = self.build(accept=False)
         with self.assertRaises(ReadOnlyError): self.legacy(f)
         self.inhibited(f)
@@ -941,15 +950,8 @@ class ReservationTests(ReservationFixture, Case):
         with patch.object(pairing, '_load_pairing_sdk', return_value=(Decoder, Incoming)): c.connect()
         c.wrapper.nextValidId(10); w._synchronize_open_orders()
         owner = w._status_delivery_owner
-        receiver = owner._issue_handoff_receiver()
         f = NS(client=c, decoder=c.decoder, transport=w, owner=owner,
                decoder_type=Decoder, incoming=Incoming)
-        original = delivery._PaperStatusDelivery._make_handoff
-        def receive(current, entry, observation):
-            h = original(current, entry, observation)
-            if current is owner: current._accept_handoff(h, receiver)
-            return h
-        self.enterContext(patch.object(delivery._PaperStatusDelivery, '_make_handoff', receive))
         return f
 
     def test_existing_reservation_invalidated_before_parser(self):

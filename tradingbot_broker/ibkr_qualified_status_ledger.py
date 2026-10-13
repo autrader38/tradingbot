@@ -1,8 +1,8 @@
-"""Private pure PRE6 values and prospective consumer coverage, never publication.
+"""Private pure PRE6 values and consumer coverage, never publication authority.
 
 Synthetic generation/sequence values do not authenticate transport provenance.
-No production consumer calls this module. A compatibility view never preserves
-the entire qualified source, and is never proof of source-aware durability.
+PRE8 captures these helpers for memory publication and consumer stop boundaries.
+A compatibility view is never proof of complete source-aware durability.
 """
 
 from dataclasses import dataclass, fields, replace

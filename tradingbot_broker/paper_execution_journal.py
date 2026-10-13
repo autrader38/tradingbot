@@ -1,7 +1,8 @@
 """Private journal contract and pure replay; no storage or execution authority.
 
-Only a complete, explicitly supplied journal is replayed. Schema v1 contains
-entry facts, not correction, migration, retirement or reconciliation-clear APIs.
+Only a complete, explicitly supplied journal is replayed. V1 retains its original
+producer-certified progress. Inactive V2 adds historical occurrence coverage,
+not correction, migration, retirement or reconciliation-clear APIs.
 """
 
 from dataclasses import dataclass, field, fields
@@ -9,6 +10,7 @@ from datetime import date, datetime, timezone
 from decimal import (Context, Decimal, DivisionByZero, Inexact, InvalidOperation,
                      Overflow, Rounded, localcontext)
 from enum import StrEnum
+from hashlib import sha256 as _sha256
 import re
 from zoneinfo import ZoneInfo
 
@@ -19,6 +21,7 @@ from .readonly_models import AccountMode, ReadOnlyError
 
 _SCHEMA_VERSION = 1
 _FORMAT_ID = 'paper-execution-journal-v1'
+_FORMAT_ID_V2 = 'paper-execution-journal-v2'
 # Copied from the reviewed C1 contract; importing the transport would add coupling.
 _MIN_ORDER_ID = 0
 _MAX_ORDER_ID = 2_147_483_647
@@ -163,10 +166,11 @@ class _JournalHeader(_PrivateJournalValue):
     account_mode: AccountMode = field(default=AccountMode.UNKNOWN, init=False)
 
     def __post_init__(self):
-        _integer(self.schema_version, 1, 1)
+        _integer(self.schema_version, 1, 2)
         _opaque_id(self.journal_id, 'journal')
         _exact(self.account_binding, _JournalAccountBinding)
-        _require(type(self.format_id) is str and self.format_id == _FORMAT_ID
+        _require(type(self.format_id) is str and self.format_id ==
+                 (_FORMAT_ID if self.schema_version == 1 else _FORMAT_ID_V2)
                  and self.account_mode is AccountMode.UNKNOWN)
 
 
@@ -557,6 +561,190 @@ class _CommissionReceived(_PrivateJournalValue):
         _timestamp(self.received_at)
 
 
+def _snapshot_order_ids(order_id, client_id, *, optional_client=False):
+    _integer(order_id, _MIN_ORDER_ID, _MAX_ORDER_ID)
+    if client_id is not None or not optional_client:
+        _integer(client_id, 0, _MAX_ORDER_ID)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _OpenOrderCallbackSnapshot(_PrivateJournalValue):
+    order_id: int
+    client_id: int | None
+    order_ref: str | None
+    con_id: int
+    security_type: str
+    exchange: str | None
+    symbol: str | None
+    currency: str | None
+    side: str
+    quantity: Decimal
+    order_type: str
+    tif: str
+    status: _LifecycleStatus
+
+    def __post_init__(self):
+        _snapshot_order_ids(self.order_id, self.client_id, optional_client=True)
+        if self.order_ref is not None:
+            _identifier(self.order_ref)
+        _integer(self.con_id, 1, (1 << 64) - 1)
+        for value in (self.security_type, self.side, self.order_type, self.tif):
+            _text(value)
+        for value in (self.exchange, self.symbol, self.currency):
+            _text(value, optional=True)
+        _amount(self.quantity, positive=True)
+        _require(type(self.status) is _LifecycleStatus)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _OrderStatusCallbackSnapshot(_PrivateJournalValue):
+    order_id: int
+    client_id: int
+    status: _LifecycleStatus
+    filled: Decimal
+    remaining: Decimal
+    average_price: Decimal
+    last_price: Decimal
+    parent_id: int
+
+    def __post_init__(self):
+        _snapshot_order_ids(self.order_id, self.client_id)
+        _integer(self.parent_id, _MIN_ORDER_ID, _MAX_ORDER_ID)
+        _require(type(self.status) is _LifecycleStatus)
+        for value in (self.filled, self.remaining, self.average_price, self.last_price):
+            _amount(value)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _ExecutionCallbackSnapshot(_PrivateJournalValue):
+    order_id: int
+    client_id: int | None
+    order_ref: str | None
+    execution_id: str
+    con_id: int
+    side: str
+    shares: Decimal
+    price: Decimal
+
+    def __post_init__(self):
+        _snapshot_order_ids(self.order_id, self.client_id, optional_client=True)
+        if self.order_ref is not None:
+            _identifier(self.order_ref)
+        _identifier(self.execution_id)
+        _integer(self.con_id, 1, (1 << 64) - 1)
+        _text(self.side)
+        _amount(self.shares, positive=True)
+        _amount(self.price)
+
+
+def _commission_snapshot_report_id(exec_id, amount, currency):
+    # Same versioned, typed framing as the qualified commission producer. No
+    # Decimal normalize/arithmetic: economic equality ignores scale/signed zero.
+    sign, digits, exponent = amount.as_tuple()
+    if not any(digits):
+        number = '0'
+    else:
+        digits = list(digits)
+        while digits[-1] == 0:
+            digits.pop()
+            exponent += 1
+        number = f'{sign}:{"".join(map(str, digits))}:{exponent}'
+    encoded = b'paper-commission-report-v1\0'
+    for tag, value in ((b'exec_id:str', exec_id), (b'amount:decimal', number),
+                       (b'currency:str', currency)):
+        data = value.encode('ascii')
+        encoded += tag + b'\0' + len(data).to_bytes(4, 'big') + data
+    return 'commission-' + _sha256(encoded).hexdigest()
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CommissionCallbackSnapshot(_PrivateJournalValue):
+    exec_id: str
+    report_id: str
+    amount: Decimal
+    currency: str
+    received_at: datetime
+
+    def __post_init__(self):
+        _identifier(self.exec_id)
+        _amount(self.amount, signed=True)
+        _require(type(self.currency) is str and len(self.currency) == 3
+                 and all('A' <= char <= 'Z' for char in self.currency))
+        _require(type(self.report_id) is str and self.report_id ==
+                 _commission_snapshot_report_id(self.exec_id, self.amount, self.currency))
+        # Reject caller tzinfo before the common timestamp validator can ask it
+        # for an offset. The qualified producer and codec supply fixed UTC only.
+        _require(type(self.received_at) is datetime
+                 and type(self.received_at.tzinfo) is timezone)
+        _timestamp(self.received_at)
+        # The codec reconstructs a fixed UTC timezone object. Require the exact
+        # UTC metadata, not Python singleton identity, which is not serialized.
+        _require(self.received_at.utcoffset() == timezone.utc.utcoffset(None)
+                 and self.received_at.tzname() == 'UTC')
+
+
+_ORDINARY_CALLBACK_SNAPSHOTS = (_OpenOrderCallbackSnapshot,
+                              _OrderStatusCallbackSnapshot, _ExecutionCallbackSnapshot)
+
+
+def _ordinary_snapshot_exact(snapshot):
+    _require(type(snapshot) in _ORDINARY_CALLBACK_SNAPSHOTS)
+    _exact(snapshot, type(snapshot))
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DuplicateCallbackCovered(_PrivateJournalValue):
+    source: _CallbackSource
+    snapshot: object
+    root_record_sequence: int
+
+    def __post_init__(self):
+        _exact(self.source, _CallbackSource)
+        _require(self.source.sequence > 1)
+        _ordinary_snapshot_exact(self.snapshot)
+        _integer(self.root_record_sequence, 1)
+
+
+class _UntrackedCallbackReason(StrEnum):
+    NO_TRACKED_NUMERIC_ORDER_IN_SESSION = 'NO_TRACKED_NUMERIC_ORDER_IN_SESSION'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _UntrackedCallbackObserved(_PrivateJournalValue):
+    source: _CallbackSource
+    snapshot: object
+    reason: _UntrackedCallbackReason
+
+    def __post_init__(self):
+        _exact(self.source, _CallbackSource)
+        _ordinary_snapshot_exact(self.snapshot)
+        _require(type(self.reason) is _UntrackedCallbackReason)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _CommissionCallbackCovered(_PrivateJournalValue):
+    source: _CallbackSource
+    snapshot: _CommissionCallbackSnapshot
+    commission_record_sequence: int
+
+    def __post_init__(self):
+        _exact(self.source, _CallbackSource)
+        _exact(self.snapshot, _CommissionCallbackSnapshot)
+        _integer(self.commission_record_sequence, 1)
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _UntrackedCommissionCallbackCovered(_PrivateJournalValue):
+    source: _CallbackSource
+    snapshot: _CommissionCallbackSnapshot
+    execution_record_sequence: int
+
+    def __post_init__(self):
+        _exact(self.source, _CallbackSource)
+        _exact(self.snapshot, _CommissionCallbackSnapshot)
+        _integer(self.execution_record_sequence, 1)
+
+
 @dataclass(frozen=True, slots=True, repr=False)
 class _CallbackProgress(_PrivateJournalValue):
     session_id: str
@@ -570,11 +758,15 @@ class _CallbackProgress(_PrivateJournalValue):
         _require(self.processed_sequence <= self.through_sequence)
 
 
-_EVENT_TYPES = (_SessionRegistered, _AttemptConsumed, _NumericOrderIdReserved,
+_EVENT_TYPES_V1 = (_SessionRegistered, _AttemptConsumed, _NumericOrderIdReserved,
     _OrderIdFloorObserved, _BrokerOrderIdObserved, _AllocatorExhausted,
     _InvocationMayOccur, _SdkReturnedNormally, _AttemptClosedWithoutInvocation,
     _ReconciliationRequired, _OpenOrderObserved, _OrderStatusObserved,
     _ExecutionObserved, _CommissionReceived, _CallbackProgress)
+_COVERAGE_EVENT_TYPES = (_DuplicateCallbackCovered, _UntrackedCallbackObserved,
+                       _CommissionCallbackCovered, _UntrackedCommissionCallbackCovered)
+_EVENT_TYPES_V2 = _EVENT_TYPES_V1 + _COVERAGE_EVENT_TYPES
+_EVENT_TYPES = _EVENT_TYPES_V2  # Storage's closed union; record enforces version.
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -587,10 +779,11 @@ class _JournalRecord(_PrivateJournalValue):
 
     def __post_init__(self):
         _integer(self.sequence, 1)
-        _integer(self.schema_version, 1, 1)
+        _integer(self.schema_version, 1, 2)
         _opaque_id(self.journal_id, 'journal')
         _exact(self.account_binding, _JournalAccountBinding)
-        _require(type(self.payload) in _EVENT_TYPES)
+        allowed = _EVENT_TYPES_V1 if self.schema_version == 1 else _EVENT_TYPES_V2
+        _require(type(self.payload) in allowed)
         _exact(self.payload, type(self.payload))
 
 
@@ -695,6 +888,137 @@ def _execution_identity(event):
     return tuple(getattr(event, f.name) for f in fields(event) if f.name != 'source')
 
 
+def _ordinary_source_snapshot(event):
+    """Retained old callback facts only; no SDK/transport import or attribution."""
+    models = {_OpenOrderObserved: _OpenOrderCallbackSnapshot,
+              _OrderStatusObserved: _OrderStatusCallbackSnapshot,
+              _ExecutionObserved: _ExecutionCallbackSnapshot}
+    _require(type(event) in models)
+    _exact(event, type(event))
+    model = models[type(event)]
+    values = {}
+    for item in fields(model):
+        name = 'exec_id' if item.name == 'execution_id' else item.name
+        value = getattr(event, name)
+        values[item.name] = Decimal(value.as_tuple()) if type(value) is Decimal else value
+    return model(**values)
+
+
+def _callback_snapshot_identity(snapshot):
+    """Closed representation identity. It describes expanded retained evidence."""
+    _require(type(snapshot) in _ORDINARY_CALLBACK_SNAPSHOTS + (_CommissionCallbackSnapshot,))
+    _exact(snapshot, type(snapshot))
+    values = []
+    for item in fields(type(snapshot)):
+        value = getattr(snapshot, item.name)
+        if type(value) is Decimal:
+            value = (Decimal, value.as_tuple())
+        elif type(value) is datetime:
+            value = (datetime, value.isoformat(), value.fold)
+        else:
+            _require(type(value) in (str, int, type(None), _LifecycleStatus))
+            value = (type(value), value)
+        values.append((item.name, value))
+    return type(snapshot), tuple(values)
+
+
+class _V2CallbackCoverage:
+    """Replay-local proof over actual records; never a producer or recovery owner."""
+    __slots__ = ('sessions', 'attempts', 'executions', 'records', 'occurrences',
+                 'frontiers', 'high_water', 'untracked_executions')
+
+    def __init__(self, sessions, attempts, executions):
+        self.sessions, self.attempts, self.executions = sessions, attempts, executions
+        self.records, self.occurrences = {}, {}
+        self.frontiers, self.high_water, self.untracked_executions = {}, {}, {}
+
+    def _key(self, source):
+        _exact(source, _CallbackSource)
+        _require(source.session_id in self.sessions and source.write_generation ==
+                 self.sessions[source.session_id].write_generation)
+        return source.session_id, source.write_generation, source.sequence
+
+    def _register(self, source, root=None):
+        # Future exact direct-source branches can call this AFTER validating
+        # their own semantics. No wildcard event acceptance is introduced here.
+        key = self._key(source)
+        _require(key not in self.occurrences)
+        self.occurrences[key] = root
+        sid, generation, _ = key
+        self.high_water[sid] = max(self.high_water.get(sid, 0), source.sequence)
+        frontier = self.frontiers.get(sid, 0)
+        # O(actual explanations), never O(an untrusted processed integer).
+        while (sid, generation, frontier + 1) in self.occurrences:
+            frontier += 1
+        self.frontiers[sid] = frontier
+
+    def _backing(self, sequence):
+        _integer(sequence, 1)
+        _require(sequence in self.records)  # Only the already validated prefix.
+        return self.records[sequence]
+
+    def direct(self, record):
+        event = record.payload
+        if type(event) is _ExecutionObserved:
+            _require(event.exec_id not in self.untracked_executions)
+        self._register(event.source, record.sequence)
+
+    def exceptional(self, record):
+        event = record.payload
+        key = self._key(event.source)
+        _require(key not in self.occurrences)
+        snapshot, kind = event.snapshot, type(event)
+        if kind is _DuplicateCallbackCovered:
+            root = self._backing(event.root_record_sequence)
+            _require(type(root.payload) in (_OpenOrderObserved, _OrderStatusObserved, _ExecutionObserved)
+                     and self._key(root.payload.source)[:2] == key[:2])
+            preceding = key[:2] + (event.source.sequence - 1,)
+            _require(preceding in self.occurrences and
+                     self.occurrences[preceding] == root.sequence)
+            _require(_callback_snapshot_identity(snapshot) ==
+                     _callback_snapshot_identity(_ordinary_source_snapshot(root.payload)))
+            self._register(event.source, root.sequence)
+        elif kind is _UntrackedCallbackObserved:
+            _require(not any(state['consumed'].session_id == event.source.session_id
+                             and state['order_id'] == snapshot.order_id
+                             for state in self.attempts.values()))
+            if type(snapshot) is _ExecutionCallbackSnapshot:
+                _require(snapshot.execution_id not in self.executions)
+                identity = _callback_snapshot_identity(snapshot)
+                prior = self.untracked_executions.get(snapshot.execution_id)
+                _require(prior is None or prior == identity)
+                self.untracked_executions[snapshot.execution_id] = identity
+            self._register(event.source)
+        elif kind is _CommissionCallbackCovered:
+            backing = self._backing(event.commission_record_sequence).payload
+            _require(type(backing) is _CommissionReceived)
+            state = self.attempts[backing.client_order_id]
+            _require(state['consumed'].session_id == event.source.session_id
+                     and backing.exec_id in self.executions
+                     and self.executions[backing.exec_id].client_order_id == backing.client_order_id
+                     and (snapshot.exec_id, snapshot.report_id, snapshot.amount, snapshot.currency) ==
+                         (backing.exec_id, backing.report_id, backing.amount, backing.currency))
+            # Receipt instant/Decimal shape belong to THIS occurrence; accounting
+            # duplicates use the original producer's economic equality contract.
+            self._register(event.source)
+        else:
+            _require(kind is _UntrackedCommissionCallbackCovered)
+            backing = self._backing(event.execution_record_sequence).payload
+            _require(type(backing) is _UntrackedCallbackObserved
+                     and type(backing.snapshot) is _ExecutionCallbackSnapshot
+                     and self._key(backing.source)[:2] == key[:2]
+                     and backing.snapshot.execution_id == snapshot.exec_id
+                     and snapshot.exec_id not in self.executions)
+            self._register(event.source)
+
+    def progress(self, event):
+        _require(event.processed_sequence <= self.frontiers.get(event.session_id, 0)
+                 and event.through_sequence >= self.high_water.get(event.session_id, 0))
+
+    def accepted(self, record):
+        self.records[record.sequence] = record
+
+
 def _replay(header, records):
     _exact(header, _JournalHeader)
     _require(type(records) is tuple)
@@ -702,6 +1026,7 @@ def _replay(header, records):
     callbacks, watermarks, progress, executions, reports = {}, {}, {}, {}, {}
     reasons, session_reasons = set(), {}
     floor, exhausted = _MIN_ORDER_ID, False
+    coverage = _V2CallbackCoverage(sessions, attempts, executions) if header.schema_version == 2 else None
 
     def attempt(key):
         _require(key in attempts)
@@ -789,6 +1114,8 @@ def _replay(header, records):
             prior = progress.get(event.session_id)
             _require(prior is None or (event.processed_sequence >= prior.processed_sequence
                                       and event.through_sequence >= prior.through_sequence))
+            if coverage is not None:
+                coverage.progress(event)
             progress[event.session_id] = event
         elif kind is _CommissionReceived:
             state = attempt(event.client_order_id)
@@ -801,6 +1128,9 @@ def _replay(header, records):
             if prior is None:
                 reports[event.exec_id] = identity
                 state['commissions'].append(event)
+        elif kind in _COVERAGE_EVENT_TYPES:
+            _require(coverage is not None)
+            coverage.exceptional(record)
         else:
             state = attempt(event.client_order_id)
             consumed = state['consumed']
@@ -812,6 +1142,8 @@ def _replay(header, records):
             callback_key = (source.session_id, source.sequence)
             prior = callbacks.get(callback_key)
             _require(prior is None or prior == event)
+            if coverage is not None:
+                _require(prior is None)  # V1's identical physical repeats remain valid.
             if prior is not None:
                 continue  # Exact source callback replay, not a second observation.
             callbacks[callback_key] = event
@@ -862,6 +1194,10 @@ def _replay(header, records):
             if kind in (_OpenOrderObserved, _OrderStatusObserved) and event.status is _LifecycleStatus.UNKNOWN:
                 state['reasons'].add(_ReconciliationReason.UNRESOLVED_LIFECYCLE)
                 reasons.add(_ReconciliationReason.UNRESOLVED_LIFECYCLE)
+            if coverage is not None:
+                coverage.direct(record)
+        if coverage is not None:
+            coverage.accepted(record)
 
     result_attempts = []
     for key in sorted(attempts):

@@ -6,7 +6,7 @@ Private Python isolation does not protect against hostile interpreter access.
 """
 
 from dataclasses import dataclass, fields
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from enum import StrEnum
 import secrets
@@ -17,8 +17,9 @@ from .paper_execution_journal_sqlite import _SQLiteJournalStore, _CommittedRecor
 from .paper_dispatch_journal_context import _DispatchJournalContext
 from .paper_execution import _timestamp_value
 from .readonly_models import ReadOnlyError
-from .ibkr_readonly import _JournalAccountBindingReceipt, _JournalAccountAssociation
-from .ibkr_paper_transport import (PaperTWSTransport, _OpenOrderEvidence,
+from .ibkr_readonly import (_JournalAccountBindingReceipt, _JournalAccountAssociation,
+                            TWSReadOnlyConfig)
+from .ibkr_paper_transport import (PaperTWSTransport, PaperTWSConfig, PaperTransportIntent, _OpenOrderEvidence,
     _OrderStatusEvidence, _ExecutionEvidence, _CommissionEvidence, _EVIDENCE_CAPACITY)
 from .ibkr_qualified_status_ledger import _QualifiedOrderStatusEvidence
 from .paper_qualified_status_journal import (_adapt_qualified_status,
@@ -26,6 +27,17 @@ from .paper_qualified_status_journal import (_adapt_qualified_status,
 
 
 _ERROR = 'PAPER_DISPATCH_JOURNAL_UNAVAILABLE'
+
+
+class _DecisionBoundaryUnavailable(ReadOnlyError):
+    """No boundary was attempted: busy/pending capture or an unusable clock."""
+    def __init__(self):
+        super().__init__('PAPER_DECISION_BOUNDARY_NOT_READY')
+
+
+def _decision_utc_now():
+    # Private test seam, never a caller-supplied historical time/frontier API.
+    return datetime.now(timezone.utc)
 
 
 def _require(condition):
@@ -69,6 +81,23 @@ class _DurableInvocationProof:
 
     def __repr__(self):
         return '<PrivateDurableInvocationProof>'
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _DecisionBoundaryReceipt:
+    event: j._QualifiedDecisionBoundaryObserved
+    committed: _CommittedRecord
+
+    def __post_init__(self):
+        _require(type(self.event) is j._QualifiedDecisionBoundaryObserved
+                 and type(self.committed) is _CommittedRecord)
+        j._QualifiedDecisionBoundaryObserved.__post_init__(self.event)
+        _CommittedRecord.__post_init__(self.committed)
+        _require(self.committed.record.schema_version == 3
+                 and self.committed.record.payload is self.event)
+
+    def __repr__(self):
+        return '<PrivateDecisionBoundaryReceipt local-stream-evidence-only>'
 
 
 class _CallbackPersistenceState(StrEnum):
@@ -193,7 +222,9 @@ class _PaperDispatchJournalOwner:
                  '__persistence_cursor', '__persistence_failed', '__staged', '__covered',
                  '__executions', '__commissions', '__foreign_executions', '__anchors', '__draining',
                  '__invocation_boundaries', '__adjacent_observation',
-                 '__accounting_owner', '__accounting_setup_started', '__accounting_handoff')
+                 '__accounting_owner', '__accounting_setup_started', '__accounting_handoff',
+                 '__decision_runtime', '__decision_runtime_values', '__decision_active',
+                 '__decision_pending', '__decision_last_at', '__decision_receipt')
 
     def __init__(self, *args, **kwargs):
         # Only the controlled setup factory publishes a registered owner.
@@ -206,6 +237,8 @@ class _PaperDispatchJournalOwner:
                     '_PaperDispatchJournalOwner__append',
                     '_PaperDispatchJournalOwner__load',
                     '_PaperDispatchJournalOwner__close',
+                    '_PaperDispatchJournalOwner__decision_runtime',
+                    '_PaperDispatchJournalOwner__decision_runtime_values',
                     '_PaperDispatchJournalOwner__accounting_owner') and hasattr(self, name):
             raise ReadOnlyError(_ERROR)
         object.__setattr__(self, name, value)
@@ -256,7 +289,7 @@ class _PaperDispatchJournalOwner:
                  and control._transport is read and write._dispatch_coordinator_owner is c
                  and type(store) is _SQLiteJournalStore and store._header is header
                  and type(header) is j._JournalHeader and type(session) is j._SessionRegistered
-                 and header.schema_version == 2 and header.format_id == j._FORMAT_ID_V2
+                 and header.schema_version == 3 and header.format_id == j._FORMAT_ID_V3
                  and not self.__closed
                  and (_values(header), _values(session), _values(receipt)) == self.__identity)
         _require(not store._closed and not store._poisoned and not store._quarantined)
@@ -277,6 +310,10 @@ class _PaperDispatchJournalOwner:
         c, _, _, write = self.__association[:4]
         self._local_check(c, current=not diagnostic, healthy=not diagnostic, setup=setup)
         _require(not write._arrival_lock._is_owned())
+        if type(event) is j._QualifiedDecisionBoundaryObserved:
+            # Fixture construction cannot bypass the sole runtime certification path.
+            _require(self.__decision_active and event is self.__decision_pending
+                     and not diagnostic and not setup)
         try:
             loaded = self.__load()
             _require(_values(loaded.header) == _values(self._header)
@@ -300,7 +337,10 @@ class _PaperDispatchJournalOwner:
             return committed
         except BaseException:
             self._inhibit()
-            c._mark_reconciliation(audit=False)
+            try:
+                c._mark_reconciliation(audit=False)
+            except BaseException:
+                pass  # Cleanup must not replace the original append interruption.
             raise
 
     def _authenticate(self, coordinator, *, setup=False):
@@ -527,6 +567,186 @@ class _PaperDispatchJournalOwner:
             self._inhibit()
             c._mark_reconciliation(audit=False)
 
+    def _decision_configuration_values(self):
+        """Only reviewed memory values; no SDK getters or authentication I/O."""
+        account, _, _, read_config, write_config, snapshot, _ = self.__decision_runtime
+        _require(type(account) is _JournalAccountAssociation
+                 and type(read_config) is TWSReadOnlyConfig and type(write_config) is PaperTWSConfig
+                 and type(write_config.intent) is PaperTransportIntent)
+        return _values((account.receipt, account.opaque_id, account.generation,
+            account.configuration, account.revision, account.valid_until,
+            tuple(getattr(read_config, f.name) for f in fields(read_config)),
+            write_config.intent.value, write_config.host, write_config.port,
+            write_config.client_id, write_config.timeout_seconds,
+            snapshot.account.available_at, snapshot.account.valid_until,
+            snapshot.account.verified, snapshot.account.mode))
+
+    def _decision_state(self):
+        """Pure association/safety check under the complete capture lock order."""
+        c, control, read, write = self.__association[:4]
+        self._local_check(c)
+        _require(c._lock._is_owned() and control._lock._is_owned()
+                 and read._lifecycle._is_owned() and read._condition._is_owned()
+                 and write._lock._is_owned() and write._arrival_lock._is_owned())
+        account, read_client, write_client, rc, wc, snapshot, clock = self.__decision_runtime
+        _require(read._journal_account_association is account
+                 and read._client is read_client and write._client is write_client
+                 and read.config is rc and write._config is wc
+                 and read._snapshot is snapshot and read._clock is clock
+                 and self._decision_configuration_values() == self.__decision_runtime_values
+                 and read._generation == self._receipt.read_generation
+                 and write._generation == write._callback_generation == self._session.write_generation
+                 and wc.client_id == self._session.client_id
+                 and read._ready is True and read._collecting is False
+                 and read._failure is None and read._disconnect_emitted is False
+                 and write._closed is False and write._invalid_callback is False
+                 and write._arrival_unusable is False
+                 and write._callback_evidence_lost_at is None and not write._status_fences
+                 and c._active_attempt is None and not self.__draining
+                 and not self.__persistence_failed)
+        for value in (write._callback_sequence, write._arrival_sequence, self.__persistence_cursor):
+            j._integer(value, 0, j._MAX_DECISION_BOUNDARY_INTEGER)
+        _require(all(type(v) is bool for v in (c._pending_confirmation,
+            c._broker_state_reconciliation_required, c._reconciliation_required,
+            control._reconciliation_required, write._reconciliation_required)))
+        self._callback_snapshot(c)  # Truthful retained spans, never invented paging coverage.
+        pending = c._pending_order
+        return (pending, None if pending is None else tuple(
+            (f.name, _values(getattr(pending, f.name))) for f in fields(type(pending))),
+            c._pending_confirmation, c._broker_state_reconciliation_required,
+            c._reconciliation_required, control._reconciliation_required, write._reconciliation_required)
+
+    def _decision_authenticate(self):
+        c, _, read, write = self.__association[:4]
+        self._callback_io_boundary(c)
+        self._authenticate(c)
+        # Local SDK connection inspection only, outside all capture/arrival locks.
+        _require(read._client is self.__decision_runtime[1]
+                 and write._client is self.__decision_runtime[2]
+                 and self.__decision_runtime[2].isConnected() is True)
+
+    def _capture_decision_event(self):
+        """One internally timed, serialized memory capture; no durable append here."""
+        c, _, _, write = self.__association[:4]
+        state = self._decision_state()
+        if self.__staged or self.__covered or self.__persistence_cursor != write._callback_sequence:
+            raise _DecisionBoundaryUnavailable()  # A callback raced the bounded drain.
+        self._require_persistence_current(c)
+        before = (write._callback_sequence, write._arrival_sequence, self.__history)
+        try:
+            at = _decision_utc_now()
+            event = j._QualifiedDecisionBoundaryObserved(self._session.session_id,
+                self._session.write_generation, at, before[0])
+        except Exception:
+            raise _DecisionBoundaryUnavailable() from None
+        if self.__decision_last_at is not None and at <= self.__decision_last_at:
+            raise _DecisionBoundaryUnavailable()  # Never edit a clock or quarantine on regression.
+        _require(self.__decision_runtime[5].account.available_at <= at <
+                 self.__decision_runtime[0].valid_until
+                 and self._decision_state() == state
+                 and (write._callback_sequence, write._arrival_sequence) == before[:2]
+                 and self.__history is before[2])
+        self._require_persistence_current(c)
+        return event, state, before[2]
+
+    def _publish_decision_receipt(self, event, committed, state, history):
+        # Private interruption seam. Caller holds the complete capture lock order.
+        c, _, _, write = self.__association[:4]
+        _require(self._decision_state() == state
+                 and write._callback_sequence >= event.through_sequence
+                 and self.__history == history + (_values(committed.record),))
+        self._require_committed_callback(event, committed)
+        receipt = _DecisionBoundaryReceipt(event, committed)
+        self.__decision_receipt = (receipt, event, committed, _values(event), _values(committed))
+        return receipt
+
+    def _append_decision_event(self, event, history):
+        """Preflight the exact durable prefix; retain the existing sole store writer."""
+        c = self.__association[0]
+        self._callback_io_boundary(c)
+        _require(self.__decision_active and self.__decision_pending is event)
+        loaded = self._load()
+        _require(self.__history is history
+                 and tuple(_values(r) for r in loaded.records) == history)
+        prospective = j._JournalRecord(len(loaded.records) + 1, 3,
+            self._header.journal_id, self._header.account_binding, event)
+        # Coverage/high-water/progress and boundary ordering are the unchanged
+        # PRE4-PRE1 replay rules. Reject before touching a healthy store's tail.
+        j._replay_paper_execution_journal(loaded.header, loaded.records + (prospective,))
+        return self._append_event(event)
+
+    def _require_decision_receipt(self, receipt):
+        """Exact latest producer publication, not reconstructed fixture authority."""
+        self._local_check(self.__association[0])
+        issued = self.__decision_receipt
+        _require(type(receipt) is _DecisionBoundaryReceipt and issued is not None
+                 and issued[0] is receipt and receipt.event is issued[1]
+                 and receipt.committed is issued[2])
+        _DecisionBoundaryReceipt.__post_init__(receipt)
+        _require((_values(receipt.event), _values(receipt.committed)) == issued[3:])
+        self._require_committed_callback(receipt.event, receipt.committed)
+
+    def _certify_decision_boundary(self):
+        """Sole explicit runtime producer. No caller time/session/frontier arguments.
+
+        Certifies local received-stream provenance only. New arrivals after capture
+        are allowed; their persistence waits until this boundary is durably ordered.
+        """
+        self._thread_check()
+        c, control, read, write = self.__association[:4]
+        with c._lock, control._lock:
+            entered = False
+            append_attempted = False
+            try:
+                self._local_check(c)
+                if self.__decision_active or self.__draining or c._active_attempt is not None:
+                    raise _DecisionBoundaryUnavailable()
+                self._decision_authenticate()
+                drained = self._drain_callbacks(c)  # Exactly one reviewed bounded attempt.
+                if drained.state is not _CallbackPersistenceState.CURRENT:
+                    raise _DecisionBoundaryUnavailable()
+                self.__decision_active = True
+                entered = True
+                self._decision_authenticate()
+                with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+                    event, state, history = self._capture_decision_event()
+                    self.__decision_pending = event
+                # New callbacks may arrive now; never drain them ahead of this record.
+                self._decision_authenticate()
+                with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+                    _require(self._decision_state() == state
+                             and write._callback_sequence >= event.through_sequence
+                             and self.__history is history)
+                self._callback_io_boundary(c)
+                append_attempted = True
+                committed = self._append_decision_event(event, history)
+                self.__decision_pending = None  # One append, no reusable certified pair.
+                self.__decision_last_at = event.decision_at
+                self._decision_authenticate()
+                with read._lifecycle, read._condition, write._lock, write._arrival_lock:
+                    return self._publish_decision_receipt(event, committed, state, history)
+            except _DecisionBoundaryUnavailable:
+                if append_attempted:
+                    self.__decision_receipt = None
+                    self._inhibit()
+                    try:
+                        c._mark_reconciliation(audit=False)
+                    except BaseException:
+                        pass
+                raise  # Only a pre-append unavailable capture leaves a healthy owner usable.
+            except BaseException:
+                self.__decision_receipt = None
+                self._inhibit()
+                try:
+                    c._mark_reconciliation(audit=False)
+                except BaseException:
+                    pass  # Safety/notification failure must not replace the interruption.
+                raise
+            finally:
+                if entered:
+                    self.__decision_pending = None
+                    self.__decision_active = False
+
     def _require_persistence_current(self, coordinator):
         """Pure gate; caller holds arrival. No store, clock or authentication call."""
         self._local_check(coordinator)
@@ -611,7 +831,8 @@ class _PaperDispatchJournalOwner:
     def _append_callback(self, coordinator, event, staged):
         # Restricted evidence-only path; inhibition remains monotonic. No general
         # invocation/attempt/authorization event may enter through this method.
-        _require(type(event) in _OCCURRENCE_TYPES + (j._CommissionReceived,)
+        _require(not self.__decision_active
+                 and type(event) in _OCCURRENCE_TYPES + (j._CommissionReceived,)
                  and self.__staged.get(staged.evidence.sequence) is staged
                  and _callback_values(staged.evidence) == staged.values)
         _callback_event_agreement(staged.evidence, event, self._session)
@@ -754,7 +975,7 @@ class _PaperDispatchJournalOwner:
                     self.__persistence_cursor, through, len(self.__staged))
             self._local_check(coordinator, current=False, healthy=False)
             _require(not self.__persistence_failed)
-            if coordinator._active_attempt is not None or self.__draining:
+            if coordinator._active_attempt is not None or self.__draining or self.__decision_active:
                 return _CallbackPersistenceResult(_CallbackPersistenceState.DEFERRED,
                     self.__persistence_cursor, through, len(self.__staged))
             self._callback_io_boundary(coordinator)
@@ -855,8 +1076,8 @@ def _create_paper_dispatch_journal_owner(coordinator, path):
             generation, client_id = write._generation, write._config.client_id
             receipt = read._issue_journal_account_binding()
             binding = read._validate_journal_account_binding(receipt)
-            header = j._JournalHeader(2, 'journal-' + secrets.token_hex(16), binding,
-                                      format_id=j._FORMAT_ID_V2)
+            header = j._JournalHeader(3, 'journal-' + secrets.token_hex(16), binding,
+                                      format_id=j._FORMAT_ID_V3)
             store = _SQLiteJournalStore._create(path, header)
             loaded = store._load()
             _require(not loaded.records and _values(loaded.header) == _values(header)
@@ -888,8 +1109,14 @@ def _create_paper_dispatch_journal_owner(coordinator, path):
                 ('__commissions', {}), ('__foreign_executions', {}), ('__anchors', {}),
                 ('__draining', False), ('__invocation_boundaries', {}), ('__adjacent_observation', None),
                 ('__accounting_owner', None), ('__accounting_setup_started', False),
-                ('__accounting_handoff', None)):
+                ('__accounting_handoff', None),
+                ('__decision_runtime', (read._journal_account_association, read._client,
+                    write._client, read.config, write._config, read._snapshot, read._clock)),
+                ('__decision_active', False), ('__decision_pending', None),
+                ('__decision_last_at', None), ('__decision_receipt', None)):
                 object.__setattr__(owner, prefix + name, value)
+            object.__setattr__(owner, prefix + '__decision_runtime_values',
+                               owner._decision_configuration_values())
             owner._authenticate(c, setup=True)
             owner._append_event(session, setup=True)
             owner._authenticate(c, setup=True)

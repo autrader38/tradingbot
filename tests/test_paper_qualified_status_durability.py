@@ -357,9 +357,9 @@ SCENARIOS = ('open','status','execution','duplicate_open','duplicate_status','du
 
 
 class ProducerTests(ProductionCase):
-    def test_fresh_owner_exact_v2_header_store_session(self):
+    def test_fresh_owner_exact_v3_header_store_session(self):
         self.build(); h=self.journal._header
-        self.assertEqual((h.schema_version,h.format_id),(2,'paper-execution-journal-v2'))
+        self.assertEqual((h.schema_version,h.format_id),(3,'paper-execution-journal-v3'))
         self.assertIs(self.journal._store._header,h)
         self.assertIs(self.journal._load().records[0].payload.__class__,j._SessionRegistered)
         object.__setattr__(h,'schema_version',1)

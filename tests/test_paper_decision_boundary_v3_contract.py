@@ -474,13 +474,14 @@ class StorageTests(sql_fixture.Fixture):
 
 
 class InactivityTests(PureCase):
-    def test_no_runtime_boundary_constructor_or_producer(self):
+    def test_only_separately_qualified_owner_may_produce_boundary(self):
         # Source inspection is a test check, never part of replay semantics.
         root=Path(j.__file__).parent
         references=[]
         for path in root.glob('*.py'):
             if 'QualifiedDecisionBoundary' in path.read_text(): references.append(path.name)
-        self.assertEqual(sorted(references),['paper_execution_journal.py','paper_execution_journal_sqlite.py'])
+        self.assertEqual(sorted(references),['paper_dispatch_journal.py',
+            'paper_execution_journal.py','paper_execution_journal_sqlite.py'])
         self.assertFalse(hasattr(j,'_create_qualified_decision_boundary'))
         self.assertFalse(hasattr(j,'_evaluate_decision_status_intervals'))
 
@@ -510,7 +511,7 @@ class InactivityTests(PureCase):
 
 
 class RuntimeInactivityTests(unittest.TestCase):
-    def test_fake_runtime_still_creates_and_produces_v2_only(self):
+    def test_fresh_v3_runtime_never_produces_boundary_implicitly(self):
         from tests.test_ibkr_qualified_status_publication import RuntimeCase
         for name in ('socket.socket.connect','socket.create_connection','socket.getaddrinfo'):
             self.enterContext(patch(name,side_effect=AssertionError('network forbidden')))
@@ -518,8 +519,8 @@ class RuntimeInactivityTests(unittest.TestCase):
         try:
             case.registered(); case.qualified(); case.drain()
             loaded=case.journal._load()
-            self.assertEqual((loaded.header.schema_version,loaded.header.format_id),(2,j._FORMAT_ID_V2))
-            self.assertTrue(all(record.schema_version==2 for record in loaded.records))
+            self.assertEqual((loaded.header.schema_version,loaded.header.format_id),(3,j._FORMAT_ID_V3))
+            self.assertTrue(all(record.schema_version==3 for record in loaded.records))
             self.assertFalse(any(type(record.payload) is Boundary for record in loaded.records))
             self.assertTrue(loaded.replay.restart_quarantine_required)
         finally: case.tearDown(); case.doCleanups()

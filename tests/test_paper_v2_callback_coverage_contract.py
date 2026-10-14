@@ -610,11 +610,11 @@ for exception in (KeyboardInterrupt,SystemExit,GeneratorExit):
 
 
 class BoundaryTests(PureCase):
-    def test_fresh_owner_v2_and_qualified_occurrence_is_durable(self):
+    def test_fresh_v3_owner_preserves_v2_qualified_occurrence_durability(self):
         from tests.test_ibkr_qualified_status_publication import RuntimeCase
         case=RuntimeCase('runTest'); case.setUp()
         try:
-            case.registered(); self.assertEqual(case.journal._header.schema_version,2)
+            case.registered(); self.assertEqual(case.journal._header.schema_version,3)
             case.qualified(); self.assertEqual(case.drain().state.value,'CURRENT')
             self.assertEqual(case.journal._persistence_cursor,1)
             self.assertEqual(len(case.of_type(j._QualifiedOrderStatusObserved)),1)

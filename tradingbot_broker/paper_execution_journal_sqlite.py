@@ -76,7 +76,7 @@ _MODELS = (journal._JournalAccountBinding, journal._JournalHeader,
     journal._DuplicateCallbackCovered, journal._UntrackedCallbackObserved,
     journal._CommissionCallbackCovered, journal._UntrackedCommissionCallbackCovered,
     journal._QualifiedStatusPresence, journal._QualifiedStatusObservation,
-    journal._QualifiedOrderStatusObserved)
+    journal._QualifiedOrderStatusObserved, journal._QualifiedDecisionBoundaryObserved)
 _MODEL_TAGS = {model.__name__: model for model in _MODELS}
 _ENUMS = (journal._LifecycleStatus, journal._ReconciliationReason,
           journal._ClosureReason, journal._WitnessKind, AccountMode,
@@ -181,6 +181,18 @@ def _decode_value(value):
     model = _MODEL_TAGS[tag]
     _keys(value, ('type', 'fields'))
     _keys(value['fields'], (f.name for f in fields(model)))
+    if model is journal._QualifiedDecisionBoundaryObserved:
+        # V3 accepts fixed UTC only. Reject ZoneInfo before the generic datetime
+        # decoder could consult timezone files. Existing V1/V2 decoding is unchanged.
+        timestamp = value['fields']['decision_at']
+        _keys(timestamp, ('type', 'parts', 'fold', 'zone'))
+        _check(timestamp['type'] == 'datetime' and type(timestamp['fold']) is int
+               and timestamp['fold'] == 0)
+        zone = timestamp['zone']
+        _keys(zone, ('kind', 'name', 'offset_us'))
+        _check(type(zone['kind']) is str and zone['kind'] == 'fixed'
+               and type(zone['name']) is str and zone['name'] == 'UTC'
+               and type(zone['offset_us']) is int and zone['offset_us'] == 0)
     decoded = {name: _decode_value(v) for name, v in value['fields'].items()}
     result = model(**{f.name: decoded[f.name] for f in fields(model) if f.init})
     _check(all(getattr(result, f.name) == decoded[f.name] for f in fields(model)))

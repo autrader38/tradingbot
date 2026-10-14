@@ -2,7 +2,8 @@
 
 Only a complete, explicitly supplied journal is replayed. V1 retains its original
 producer-certified progress. V2 adds historical occurrence coverage,
-not correction, migration, retirement or reconciliation-clear APIs.
+not correction, migration, retirement or reconciliation-clear APIs. Initially
+inactive V3 adds decision-boundary declarations validated against that coverage.
 """
 
 from dataclasses import dataclass, field, fields
@@ -22,6 +23,8 @@ from .readonly_models import AccountMode, ReadOnlyError
 _SCHEMA_VERSION = 1
 _FORMAT_ID = 'paper-execution-journal-v1'
 _FORMAT_ID_V2 = 'paper-execution-journal-v2'
+_FORMAT_ID_V3 = 'paper-execution-journal-v3'
+_MAX_DECISION_BOUNDARY_INTEGER = (1 << 63) - 1
 # Copied from the reviewed C1 contract; importing the transport would add coupling.
 _MIN_ORDER_ID = 0
 _MAX_ORDER_ID = 2_147_483_647
@@ -166,11 +169,12 @@ class _JournalHeader(_PrivateJournalValue):
     account_mode: AccountMode = field(default=AccountMode.UNKNOWN, init=False)
 
     def __post_init__(self):
-        _integer(self.schema_version, 1, 2)
+        _integer(self.schema_version, 1, 3)
         _opaque_id(self.journal_id, 'journal')
         _exact(self.account_binding, _JournalAccountBinding)
         _require(type(self.format_id) is str and self.format_id ==
-                 (_FORMAT_ID if self.schema_version == 1 else _FORMAT_ID_V2)
+                 (_FORMAT_ID if self.schema_version == 1 else
+                  _FORMAT_ID_V2 if self.schema_version == 2 else _FORMAT_ID_V3)
                  and self.account_mode is AccountMode.UNKNOWN)
 
 
@@ -847,6 +851,30 @@ class _QualifiedOrderStatusObserved(_PrivateJournalValue):
 
 
 @dataclass(frozen=True, slots=True, repr=False)
+class _QualifiedDecisionBoundaryObserved(_PrivateJournalValue):
+    """Inactive V3 declaration; construction cannot certify a runtime decision.
+
+    A future qualified producer must establish the explicit datetime-to-stream
+    relationship. Replay checks durable prefix consistency, never broker truth.
+    """
+    session_id: str
+    write_generation: int
+    decision_at: datetime
+    through_sequence: int
+
+    def __post_init__(self):
+        _opaque_id(self.session_id, 'session')
+        _integer(self.write_generation, 1, _MAX_DECISION_BOUNDARY_INTEGER)
+        _integer(self.through_sequence, 0, _MAX_DECISION_BOUNDARY_INTEGER)
+        # Reject arbitrary tzinfo before any timestamp validator/getter touches it.
+        _require(type(self.decision_at) is datetime
+                 and type(self.decision_at.tzinfo) is timezone and self.decision_at.fold == 0)
+        _timestamp(self.decision_at)
+        _require(self.decision_at.utcoffset() == timezone.utc.utcoffset(None)
+                 and self.decision_at.tzname() == 'UTC')
+
+
+@dataclass(frozen=True, slots=True, repr=False)
 class _CallbackProgress(_PrivateJournalValue):
     session_id: str
     processed_sequence: int
@@ -867,7 +895,8 @@ _EVENT_TYPES_V1 = (_SessionRegistered, _AttemptConsumed, _NumericOrderIdReserved
 _COVERAGE_EVENT_TYPES = (_DuplicateCallbackCovered, _UntrackedCallbackObserved,
                        _CommissionCallbackCovered, _UntrackedCommissionCallbackCovered)
 _EVENT_TYPES_V2 = _EVENT_TYPES_V1 + _COVERAGE_EVENT_TYPES + (_QualifiedOrderStatusObserved,)
-_EVENT_TYPES = _EVENT_TYPES_V2  # Storage's closed union; record enforces version.
+_EVENT_TYPES_V3 = _EVENT_TYPES_V2 + (_QualifiedDecisionBoundaryObserved,)
+_EVENT_TYPES = _EVENT_TYPES_V3  # Storage's closed union; record enforces version.
 
 
 @dataclass(frozen=True, slots=True, repr=False)
@@ -880,10 +909,11 @@ class _JournalRecord(_PrivateJournalValue):
 
     def __post_init__(self):
         _integer(self.sequence, 1)
-        _integer(self.schema_version, 1, 2)
+        _integer(self.schema_version, 1, 3)
         _opaque_id(self.journal_id, 'journal')
         _exact(self.account_binding, _JournalAccountBinding)
-        allowed = _EVENT_TYPES_V1 if self.schema_version == 1 else _EVENT_TYPES_V2
+        allowed = (_EVENT_TYPES_V1 if self.schema_version == 1 else
+                   _EVENT_TYPES_V2 if self.schema_version == 2 else _EVENT_TYPES_V3)
         _require(type(self.payload) in allowed)
         _exact(self.payload, type(self.payload))
 
@@ -977,6 +1007,28 @@ class _JournalReplayState(_PrivateJournalValue):
         _require(type(self.reconciliation_reasons) is tuple
                  and all(type(v) is _ReconciliationReason for v in self.reconciliation_reasons)
                  and self.reconciliation_reasons == _ordered_reasons(self.reconciliation_reasons))
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class _V3DecisionBoundaryReplayEvidence(_PrivateJournalValue):
+    """Complete validated V3 input and boundary references; never producer authority.
+
+    The original replay-state layout remains unchanged. Independent construction
+    reruns complete replay and requires references to the actual supplied records.
+    """
+    replay: _JournalReplayState
+    records: tuple[_JournalRecord, ...]
+    boundary_records: tuple[_JournalRecord, ...]
+
+    def __post_init__(self):
+        _exact(self.replay, _JournalReplayState)
+        _require(self.replay.header.schema_version == 3
+                 and type(self.records) is tuple and type(self.boundary_records) is tuple)
+        _require(self.replay == _replay_paper_execution_journal(self.replay.header, self.records))
+        expected = tuple(record for record in self.records
+                         if type(record.payload) is _QualifiedDecisionBoundaryObserved)
+        _require(len(self.boundary_records) == len(expected)
+                 and all(record is original for record, original in zip(self.boundary_records, expected)))
 
 
 def _ordered_reasons(values):
@@ -1116,6 +1168,18 @@ class _V2CallbackCoverage:
         _require(event.processed_sequence <= self.frontiers.get(event.session_id, 0)
                  and event.through_sequence >= self.high_water.get(event.session_id, 0))
 
+    def decision_boundary(self, event, progress):
+        # Reuse this exact occurrence proof. The boundary registers NO occurrence.
+        _exact(event, _QualifiedDecisionBoundaryObserved)
+        sid = event.session_id
+        _require(sid in self.sessions and event.write_generation ==
+                 self.sessions[sid].write_generation)
+        frontier = self.frontiers.get(sid, 0)
+        _require(event.through_sequence == frontier and self.high_water.get(sid, 0) == frontier)
+        prior_progress = progress.get(sid)
+        # A known observed/undurable suffix cannot be concealed by a zero or old frontier.
+        _require(prior_progress is None or prior_progress.through_sequence <= frontier)
+
     def accepted(self, record):
         self.records[record.sequence] = record
 
@@ -1127,7 +1191,9 @@ def _replay(header, records):
     callbacks, watermarks, progress, executions, reports = {}, {}, {}, {}, {}
     reasons, session_reasons = set(), {}
     floor, exhausted = _MIN_ORDER_ID, False
-    coverage = _V2CallbackCoverage(sessions, attempts, executions) if header.schema_version == 2 else None
+    coverage = (_V2CallbackCoverage(sessions, attempts, executions)
+                if header.schema_version in (2, 3) else None)
+    decision_boundaries = {}
 
     def attempt(key):
         _require(key in attempts)
@@ -1237,6 +1303,15 @@ def _replay(header, records):
             # lifecycle interpretation. Every logical occurrence is direct.
             _require(coverage is not None)
             coverage.direct(record)
+        elif kind is _QualifiedDecisionBoundaryObserved:
+            _require(header.schema_version == 3 and coverage is not None)
+            coverage.decision_boundary(event, progress)
+            stream = event.session_id, event.write_generation
+            prior = decision_boundaries.get(stream)
+            # Equal decision instants are rejected even at an identical frontier.
+            _require(prior is None or (event.decision_at > prior.decision_at
+                                      and event.through_sequence >= prior.through_sequence))
+            decision_boundaries[stream] = event
         else:
             state = attempt(event.client_order_id)
             consumed = state['consumed']
@@ -1340,5 +1415,18 @@ def _replay_paper_execution_journal(header, records):
     """
     try:
         return _replay(header, records)
+    except Exception:
+        raise ReadOnlyError(_ERROR) from None
+
+
+def _replay_v3_decision_boundary_evidence(header, records):
+    """Pure complete-history companion; neither a boundary producer nor evaluator."""
+    try:
+        _exact(header, _JournalHeader)
+        _require(header.schema_version == 3)
+        replay = _replay_paper_execution_journal(header, records)
+        boundaries = tuple(record for record in records
+                           if type(record.payload) is _QualifiedDecisionBoundaryObserved)
+        return _V3DecisionBoundaryReplayEvidence(replay, records, boundaries)
     except Exception:
         raise ReadOnlyError(_ERROR) from None

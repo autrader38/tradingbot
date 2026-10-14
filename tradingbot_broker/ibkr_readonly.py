@@ -370,6 +370,46 @@ class _FreshExecutionCapture:
         return '<PrivateFreshExecutionCapture>'
 
 
+@dataclass(slots=True, repr=False)
+class _FreshCompletedOrderCapture:
+    """One untagged completed-order interval; no lifecycle or ownership claim."""
+    local_id: int
+    generation: int
+    start_marker: int
+    start_sequence: int
+    accounts: tuple[str, ...]
+    observations: list
+    identities: dict
+    envelope: object = None
+    encoding: str | None = None
+    outcome: str | None = None
+    attempted: bool = False
+    returned: bool = False
+    end_observed: bool = False
+    end_marker: int | None = None
+    sealed: bool = False
+
+    def __repr__(self): return '<PrivateFreshCompletedOrderCapture>'
+
+
+def _completed_order_keys(event):
+    # Source consistency only. Legacy/missing numeric identity cannot create a
+    # key from reference, symbol, quantity or permanent ID alone.
+    if (event.order_id is None or event.client_id is None
+            or not event.presence.order_id or not event.presence.client_id):
+        return ()
+    result = (('numeric', event.order_id, event.client_id),)
+    if event.perm_id is not None and event.presence.perm_id:
+        result += (('permanent', event.perm_id),)
+    return result
+
+
+def _completed_order_agreement(left, right):
+    # No latest-wins, unknown-field enrichment or economic aggregation.
+    return all(getattr(left, f.name) == getattr(right, f.name)
+               for f in fields(left) if f.name != 'sequence')
+
+
 def _reconciliation_clock(value):
     if type(value) not in (int, float) or not math.isfinite(value) or value < 0:
         raise ReadOnlyError('INVALID_RECONCILIATION_READ_CLOCK')
@@ -719,6 +759,11 @@ class ReadOnlyTWSTransport:
         self._fresh_execution_sdk_request_sequence = 0
         self._fresh_execution_sequence = 0
         self._fresh_execution_marker = 0
+        self._fresh_completed_order_owner = None
+        self._fresh_completed_order_capture = None
+        self._fresh_completed_order_request_sequence = 0
+        self._fresh_completed_order_sequence = 0
+        self._fresh_completed_order_marker = 0
         self._reset()
 
     def _reset(self):
@@ -908,6 +953,7 @@ class ReadOnlyTWSTransport:
     def _reconciliation_intervening(self, generation):
         """Boundary only: no status arguments, evidence or earlier-plane locks."""
         with self._condition:
+            self._fresh_completed_order_intervening(generation)
             self._fresh_execution_intervening(generation)
             capture = self._fresh_open_order_active(generation)
             if capture is not None and capture.envelope is not None:
@@ -945,6 +991,10 @@ class ReadOnlyTWSTransport:
 
     def _reconciliation_proto(self, generation, source, raw):
         with self._condition:
+            if source == 'completed':
+                self._fresh_completed_order_proto(generation, raw)
+            else:
+                self._fresh_completed_order_intervening(generation)
             if source == 'executions':
                 self._fresh_execution_proto(generation, raw)
             else:
@@ -971,6 +1021,10 @@ class ReadOnlyTWSTransport:
     def _reconciliation_decoded(self, generation, source, contract, payload,
                                 state=None, callback_order_id=None, request_id=None):
         with self._condition:
+            if source == 'completed':
+                self._fresh_completed_order_decoded(generation, contract, payload, state)
+            else:
+                self._fresh_completed_order_intervening(generation)
             if source == 'executions':
                 self._fresh_execution_decoded(generation, request_id, contract, payload)
             else:
@@ -1268,6 +1322,137 @@ class ReadOnlyTWSTransport:
             if not isinstance(error, Exception):
                 raise
 
+    def _fresh_completed_order_active(self, generation):
+        capture = self._fresh_completed_order_capture
+        if (type(capture) is not _FreshCompletedOrderCapture or capture.sealed
+                or capture.outcome is not None or not capture.attempted):
+            return None
+        if (type(self._generation) is not int or type(capture.generation) is not int
+                or self._generation != capture.generation):
+            self._fresh_completed_order_fail('INVALIDATED')
+            return None
+        if type(generation) is not int or generation != capture.generation:
+            return None
+        return capture
+
+    def _fresh_completed_order_fail(self, outcome):
+        capture = self._fresh_completed_order_capture
+        if type(capture) is _FreshCompletedOrderCapture and not capture.sealed:
+            if capture.outcome is None:
+                capture.outcome = outcome
+            capture.envelope = None
+            self._condition.notify_all()
+
+    def _fresh_completed_order_intervening(self, generation):
+        capture = self._fresh_completed_order_active(generation)
+        if capture is not None and capture.envelope is not None:
+            self._fresh_completed_order_fail('FAILED')
+
+    def _fresh_completed_order_proto(self, generation, raw):
+        capture = self._fresh_completed_order_active(generation)
+        if capture is None:
+            return
+        try:
+            if capture.end_observed or capture.envelope is not None or capture.encoding == 'LEGACY':
+                raise ValueError()
+            envelope = _reconciliation_proto_copy(generation, 'completed', raw)
+            capture.encoding, capture.envelope = 'PROTOBUF', envelope
+        except BaseException as error:
+            try:
+                self._fresh_completed_order_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
+            except BaseException:
+                pass
+            if not isinstance(error, Exception):
+                raise
+
+    def _fresh_completed_order_decoded(self, generation, contract, payload, state):
+        capture = self._fresh_completed_order_active(generation)
+        if capture is None:
+            return
+        try:
+            if capture.end_observed:
+                raise ValueError()
+            envelope = capture.envelope
+            if envelope is not None:
+                if (type(envelope) is not _ReconciliationProtoEnvelope
+                        or envelope.source != 'completed' or envelope.generation != generation
+                        or envelope.thread_id != get_ident()):
+                    raise ValueError()
+                capture.envelope = None
+            elif capture.encoding == 'PROTOBUF':
+                raise ValueError()
+            else:
+                capture.encoding = 'LEGACY'
+            account = payload.account
+            if type(account) is not str:
+                raise ValueError()
+            if account not in capture.accounts:
+                return
+            if state is None or type(getattr(state, 'status', None)) is not str:
+                raise ValueError()
+            _reconciliation_integer(self._fresh_completed_order_sequence, wide=True)
+            sequence = self._fresh_completed_order_sequence + 1
+            _reconciliation_integer(sequence, positive=True, wide=True)
+            event = _reconciliation_decoded_copy(generation, sequence, 'completed',
+                contract, payload, state, None, envelope)
+            keys = _completed_order_keys(event)
+            for key in keys:
+                prior = capture.identities.get(key)
+                if prior is not None and not _completed_order_agreement(prior, event):
+                    raise ValueError()
+            self._fresh_completed_order_sequence = sequence
+            if len(capture.observations) >= _RECONCILIATION_CAPACITY:
+                self._fresh_completed_order_fail('OVERFLOW')
+                return
+            capture.observations.append(event)
+            for key in keys:
+                capture.identities.setdefault(key, event)
+        except BaseException as error:
+            try:
+                self._fresh_completed_order_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
+            except BaseException:
+                pass
+            if not isinstance(error, Exception):
+                raise
+        finally:
+            if capture.outcome is None:
+                try:
+                    self._condition.notify_all()
+                except BaseException as error:
+                    try:
+                        self._fresh_completed_order_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
+                    except BaseException:
+                        pass
+                    raise
+
+    def _fresh_completed_order_callback(self, generation, kind, args):
+        capture = self._fresh_completed_order_active(generation)
+        if capture is None:
+            return
+        try:
+            if kind == 'closed' or kind == 'error' and (not args or args[0] not in _INFO_CODES):
+                self._fresh_completed_order_fail('INVALIDATED')
+                return
+            if capture.envelope is not None:
+                self._fresh_completed_order_fail('FAILED')
+                return
+            if kind == 'completed_end':
+                if capture.end_observed:
+                    raise ValueError()
+                _reconciliation_integer(self._fresh_completed_order_marker, wide=True)
+                marker = self._fresh_completed_order_marker + 1
+                _reconciliation_integer(marker, positive=True, wide=True)
+                self._fresh_completed_order_marker = marker
+                capture.end_marker, capture.end_observed = marker, True
+                self._condition.notify_all()
+        except BaseException as error:
+            try:
+                self._fresh_completed_order_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
+            except BaseException:
+                pass
+            if not isinstance(error, Exception):
+                raise
+
     @property
     def connected(self):
         with self._condition:
@@ -1450,6 +1635,7 @@ class ReadOnlyTWSTransport:
 
     def _callback(self, generation, kind, *args):
         with self._condition:
+            self._fresh_completed_order_callback(generation, kind, args)
             self._fresh_open_order_callback(generation, kind, args)
             self._fresh_execution_callback(generation, kind, args)
             if generation != self._generation:
@@ -1462,6 +1648,10 @@ class ReadOnlyTWSTransport:
                 now = self._clock()
                 validate_timestamp(now)
             except BaseException as error:
+                try:
+                    self._fresh_completed_order_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
+                except BaseException:
+                    pass
                 self._fresh_open_order_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
                 try:
                     self._fresh_execution_fail('FAILED' if isinstance(error, Exception) else 'INTERRUPTED')
@@ -1700,6 +1890,7 @@ class ReadOnlyTWSTransport:
 
     def _disconnect(self):
         with self._condition:
+            self._fresh_completed_order_fail('INVALIDATED')
             self._fresh_open_order_fail('INVALIDATED')
             self._fresh_execution_fail('INVALIDATED')
             self._journal_account_association = None

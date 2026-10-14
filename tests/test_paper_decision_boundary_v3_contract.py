@@ -480,8 +480,14 @@ class InactivityTests(PureCase):
         references=[]
         for path in root.glob('*.py'):
             if 'QualifiedDecisionBoundary' in path.read_text(): references.append(path.name)
-        self.assertEqual(sorted(references),['paper_dispatch_journal.py',
+        self.assertEqual(sorted(references),['paper_decision_status_evidence.py', 'paper_dispatch_journal.py',
             'paper_execution_journal.py','paper_execution_journal_sqlite.py'])
+        constructors=[]
+        for path in root.glob('*.py'):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node,ast.Call) and getattr(node.func,'attr',getattr(node.func,'id','')) == '_QualifiedDecisionBoundaryObserved':
+                    constructors.append(path.name)
+        self.assertEqual(constructors,['paper_dispatch_journal.py'])
         self.assertFalse(hasattr(j,'_create_qualified_decision_boundary'))
         self.assertFalse(hasattr(j,'_evaluate_decision_status_intervals'))
 

@@ -481,7 +481,7 @@ class InactivityTests(PureCase):
         for path in root.glob('*.py'):
             if 'QualifiedDecisionBoundary' in path.read_text(): references.append(path.name)
         self.assertEqual(sorted(references),['paper_decision_status_evidence.py', 'paper_dispatch_journal.py',
-            'paper_execution_journal.py','paper_execution_journal_sqlite.py'])
+            'paper_execution_journal.py','paper_execution_journal_sqlite.py', 'paper_prepared_decision_evidence.py'])
         constructors=[]
         for path in root.glob('*.py'):
             for node in ast.walk(ast.parse(path.read_text())):

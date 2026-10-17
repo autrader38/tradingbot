@@ -116,7 +116,26 @@ Phase C3C5D-PRE7 adds [private exact local attempt attribution](docs/phase-10c3c
 
 Phase C3C5D-PRE8 adds [private attributed execution evidence](docs/phase-10c3c5d-pre8-attributed-execution-evidence.md): the exact PRE7 issuer qualifies frozen durable attempt executions and PRE6 fresh execution candidates. Agreeing execIds count once toward an exact historical execution lower bound, preserving all supplied occurrence references; proven conflicts withhold the bound. No completeness, lifecycle/remainder, current position, accounting, management or trading authority is added. Independent review and actual Windows qualification were reported complete before PRE9.
 
-Phase C3C5D-PRE9 adds [private historical decision-boundary lifecycle evidence](docs/phase-10c3c5d-pre9-decision-lifecycle-evidence.md): the exact PRE8 issuer and retained PRE4 selected status support historical reported classifications and an exact execution-derived possible remaining upper bound. Only selected-status/local-order contradictions are classified; independent execution/status quantity differences do not prove conflict. Missing source fields remain missing. No broker currentness, current remainder, inventory, accounting, management or trading authority is added. Independent review and actual Windows qualification remain required.
+Phase C3C5D-PRE9 adds [private historical decision-boundary lifecycle evidence](docs/phase-10c3c5d-pre9-decision-lifecycle-evidence.md): the exact PRE8 issuer and retained PRE4 selected status support historical reported classifications and an exact execution-derived possible remaining upper bound. Only selected-status/local-order contradictions are classified; independent execution/status quantity differences do not prove conflict. Missing source fields remain missing. No broker currentness, current remainder, inventory, accounting, management or trading authority is added. Independent review and actual Windows qualification were reported complete before VELOCITY-DASHBOARD-PRE1.
+
+## Open the Velocity Dashboard
+
+From the repository folder on Windows, run:
+
+```powershell
+py -3.12 -m tradingbot_dashboard --open
+```
+
+The browser opens the local dashboard at `http://127.0.0.1:8765`. No installation,
+internet connection or broker connection is needed. Market data, scanner states,
+trade markers and performance are clearly labeled **DEMO**. Candles, timeframes,
+scanner selection and chart inspection work offline. Bot/trading state is read-only;
+**TRADING BLOCKED** remains visible and no order controls are provided.
+
+Keep the console open; **Ctrl+C** stops the server. Omit `--open` to start without
+opening a browser. See the [dashboard guide](docs/velocity-dashboard-pre1.md).
+Gateway Read-Only remains required, restart quarantine mandatory, AccountMode UNKNOWN,
+public snapshot mode None and LIVE unsupported. The first real PAPER order remains blocked.
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 

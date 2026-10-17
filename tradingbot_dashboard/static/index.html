@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <meta name="description" content="Velocity Trading Group local read-only demo workspace. No broker connection or trading authority.">
+  <title>Velocity Trading Group · Dashboard</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/styles.css">
+  <script src="/app.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#workspace">Skip to workspace</a>
+  <svg class="icon-definitions" aria-hidden="true" xmlns="http://www.w3.org/2000/svg">
+    <defs>
+      <symbol id="grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+      <symbol id="pulse" viewBox="0 0 24 24"><path d="M2 12h5l3-8 4 16 3-8h5"/></symbol>
+      <symbol id="shield" viewBox="0 0 24 24"><path d="m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6Z"/><path d="m8 12 3 3 5-6"/></symbol>
+      <symbol id="chart" viewBox="0 0 24 24"><path d="M4 3v17h17M7 15l4-5 4 3 5-8"/></symbol>
+      <symbol id="arrow" viewBox="0 0 24 24"><path d="M5 17 19 3M7 3h12v12"/></symbol>
+      <symbol id="layers" viewBox="0 0 24 24"><path d="m3 7 9-4 9 4-9 4Zm0 5 9 4 9-4M3 17l9 4 9-4"/></symbol>
+      <symbol id="lock" viewBox="0 0 24 24"><rect x="5" y="10" width="14" height="11" rx="2"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 14v3"/></symbol>
+    </defs>
+  </svg>
+
+  <header class="topbar">
+    <a class="brand" href="#workspace" aria-label="Velocity Trading Group dashboard">
+      <span class="velocity-mark" aria-hidden="true"><i></i><i></i></span>
+      <span>VELOCITY<span class="brand-sub">TRADING GROUP</span></span>
+    </a>
+    <nav aria-label="Main navigation" class="navigation">
+      <button class="nav-item active" data-section="workspace" aria-current="page"><svg class="icon"><use href="#grid"/></svg>Dashboard</button>
+      <button class="nav-item" data-section="scanner">Scanner</button>
+      <button class="nav-item" data-section="charts">Charts</button>
+      <button class="nav-item" data-section="trades">Trades</button>
+      <button class="nav-item" data-section="strategy">Strategies</button>
+      <button class="nav-item" data-section="analytics">Analytics</button>
+      <button class="nav-item" data-section="bot-health">Bot Health</button>
+    </nav>
+    <div class="header-status"><span class="badge blue">PAPER</span><span class="badge amber">READ-ONLY · TRADING BLOCKED</span><span class="local-health"><b></b><span id="health-label">LOCAL UI</span></span></div>
+  </header>
+
+  <main id="workspace">
+    <section class="page-heading" aria-labelledby="page-title">
+      <div><div class="eyebrow">YOUR WORKSPACE <span>/</span> OVERVIEW</div><h1 id="page-title">Market overview<span class="heading-dot">.</span></h1><p>A clear view. A disciplined approach.</p></div>
+      <div class="safety-banner"><svg class="icon"><use href="#lock"/></svg><div><strong>TRADING BLOCKED</strong><span>Visual workspace only · No broker connected</span></div></div>
+    </section>
+
+    <div class="demo-notice"><span class="demo-dot"></span><strong>DEMO MARKET DATA</strong><span>Synthetic symbols, prices and performance. No live market feed.</span><span class="notice-end">OFFLINE BY DESIGN</span></div>
+    <div id="load-error" class="load-error" role="alert" hidden>Demo data could not load. Trading remains blocked. Restart the local dashboard.</div>
+
+    <section class="metrics" aria-label="Demo performance summary">
+      <article class="metric"><div class="metric-label">Daily P&amp;L <span class="demo-tag">DEMO</span></div><div class="metric-value positive" id="metric-pnl">+$428.16</div><div class="metric-foot"><svg class="icon"><use href="#chart"/></svg>Illustrative performance only</div><svg class="metric-spark" viewBox="0 0 130 38" aria-hidden="true"><path d="M1 33 13 29 24 32 36 23 48 26 60 17 73 20 86 11 98 15 110 6 129 2"/></svg></article>
+      <article class="metric"><div class="metric-label">Completed trades <span class="demo-tag">DEMO</span></div><div class="metric-value" id="metric-trades">8<span class="metric-unit">trades</span></div><div class="metric-foot">Example session activity</div></article>
+      <article class="metric"><div class="metric-label">Win rate <span class="demo-tag">DEMO</span></div><div class="metric-value" id="metric-win">75.0<span class="metric-unit">%</span></div><div class="metric-foot"><span class="tiny-bar"><i></i></span>Sample values, no return claim</div></article>
+      <article class="metric"><div class="metric-label">Buying power <span class="demo-tag">DEMO</span></div><div class="metric-value" id="metric-power">$25,000<span class="metric-decimal">.00</span></div><div class="metric-foot">Not connected to an account</div></article>
+      <article class="metric"><div class="metric-label">Risk used <span class="demo-tag">DEMO</span></div><div class="metric-value" id="metric-risk">0.4<span class="metric-unit">%</span></div><div class="metric-foot">Illustrative · No active risk state</div></article>
+    </section>
+
+    <section class="terminal-grid" aria-label="Trading research workspace">
+      <article class="panel scanner-panel" id="scanner">
+        <div class="panel-heading"><div><h2><svg class="icon cyan"><use href="#pulse"/></svg>Momentum Scanner</h2><p>Find focus in the noise.</p></div><span class="demo-tag">DEMO</span></div>
+        <div class="scanner-toolbar"><span><b class="cyan">5</b> synthetic symbols</span><span>ABCD setups</span></div>
+        <table class="scanner-table" aria-label="Demo momentum scanner"><thead class="sr-only"><tr><th>Symbol</th><th>Price</th><th>Change %</th><th>Volume</th><th>Rel Vol</th><th>Setup</th><th>Score</th><th>Status</th></tr></thead><tbody id="scanner-rows"></tbody></table>
+        <div class="scanner-bottom"><span class="legend-square"></span>Click a symbol to explore its demo chart.<p>Setup scores and scanner states are visual examples, not strategy signals.</p></div>
+        <div class="scanner-foot"><svg class="icon"><use href="#shield"/></svg><span>No provider connected<br><strong>Demo universe only</strong></span></div>
+      </article>
+
+      <article class="panel chart-panel" id="charts">
+        <div class="chart-heading"><div class="chart-symbol"><span id="symbol-tile">A</span><div><h2 id="chart-symbol">ABCD</h2><p>Synthetic instrument <span>· DEMO</span></p></div></div><div class="chart-quote"><strong id="chart-price">—</strong><span id="chart-change" class="positive">DEMO PRICE</span></div></div>
+        <div class="chart-controls"><div class="timeframes" role="group" aria-label="Chart timeframe"><button class="selected" data-timeframe="1m" aria-pressed="true">1m</button><button data-timeframe="15m" aria-pressed="false">15m</button><button data-timeframe="1D" aria-pressed="false">1D</button><button data-timeframe="1W" aria-pressed="false">1W</button></div><div class="overlays"><button id="vwap-toggle" class="overlay-button on" aria-pressed="true"><span></span>VWAP</button><button id="levels-toggle" class="overlay-button on" aria-pressed="true">Example levels</button></div></div>
+        <div class="chart-context"><span id="chart-context">ABCD · 1m · Synthetic candles</span><span class="demo-tag">DEMO MARKET DATA</span></div>
+        <div class="chart-canvas-wrap" id="chart-wrap"><canvas id="candlestick-chart" tabindex="0" aria-label="Demo candlestick chart. Use left and right arrows to inspect candles; plus and minus to zoom.">Interactive demo OHLC candlestick chart with volume, VWAP and example trade levels. Values are also displayed below the chart.</canvas><div id="chart-tooltip" class="chart-tooltip" hidden></div><div class="chart-watermark" aria-hidden="true">VELOCITY<span>DEMO WORKSPACE</span></div></div>
+        <div class="ohlc-readout" id="ohlc-readout" aria-live="polite">Select a demo candle to inspect its OHLC values.</div>
+        <div class="chart-footer"><span><span class="line-key"></span>VWAP <b>DEMO</b></span><span><span class="dot-key"></span>ENTRY / STOP / TARGET <b>EXAMPLES</b></span><div class="chart-tools"><button id="zoom-out" aria-label="Zoom out">−</button><button id="reset-chart" aria-label="Reset chart zoom">Reset</button><button id="zoom-in" aria-label="Zoom in">+</button></div></div>
+      </article>
+
+      <aside class="status-column" aria-label="Bot safety, evidence and strategy">
+        <article class="panel status-panel" id="bot-health"><div class="panel-heading compact"><h2><svg class="icon cyan"><use href="#shield"/></svg>Bot Status</h2><span class="badge amber small">BLOCKED</span></div><dl class="status-list"><div><dt>Mode</dt><dd class="cyan">PAPER</dd></div><div><dt>Trading Authority</dt><dd class="warning">BLOCKED</dd></div><div><dt>Gateway</dt><dd>READ-ONLY REQUIRED</dd></div><div><dt>Restart Quarantine</dt><dd>MANDATORY</dd></div><div><dt>Account Mode</dt><dd>UNKNOWN</dd></div><div><dt>Broker / Session</dt><dd>NOT CONNECTED</dd></div><div><dt>LIVE</dt><dd class="muted">UNSUPPORTED</dd></div></dl></article>
+        <article class="panel evidence-panel" id="evidence"><div class="panel-heading compact"><h2><svg class="icon"><use href="#layers"/></svg>Order Evidence</h2><span class="neutral-dot"></span></div><div class="evidence-empty"><span></span>No active evidence loaded</div><dl class="status-list evidence-list"><div><dt>Historical Lifecycle</dt><dd>—</dd></div><div><dt>Execution Lower Bound</dt><dd>—</dd></div><div><dt>Possible Remaining Upper Bound</dt><dd>—</dd></div><div><dt>Current Remainder</dt><dd class="warning">UNKNOWN</dd></div><div><dt>Current Position</dt><dd class="warning">UNKNOWN</dd></div></dl><div class="evidence-warning">HISTORICAL EVIDENCE ≠ CURRENT BROKER STATE</div></article>
+        <article class="panel session-panel"><div class="panel-heading compact"><h2>Broker / Session</h2><span class="neutral-dot"></span></div><dl class="status-list"><div><dt>Connection</dt><dd>NOT CONNECTED</dd></div><div><dt>Public Snapshot Mode</dt><dd>None</dd></div></dl></article>
+        <article class="panel strategy-panel" id="strategy"><div class="strategy-title"><span class="strategy-icon">A<span><svg class="icon"><use href="#arrow"/></svg></span></span><div><div class="eyebrow">STRATEGY · FROZEN V1.0</div><h2>ABCD BREAKOUT</h2></div></div><div class="strategy-facts"><div><span>Direction</span><strong>LONG ONLY</strong></div><div><span>Timeframes</span><strong>1m / 15m</strong></div><div><span>Context</span><strong>Weekly</strong></div></div><div class="automation"><span class="neutral-dot"></span>Automation <strong>NOT AUTHORIZED</strong></div></article>
+      </aside>
+    </section>
+
+    <section class="lower-grid" aria-label="Demo trading history and system activity">
+      <article class="panel trades-panel" id="trades"><div class="panel-heading compact"><h2>Recent Trades <span class="demo-tag">DEMO</span></h2><span class="muted small-text">Example executions only</span></div><div class="table-scroll"><table class="trades-table"><thead><tr><th>Symbol / Setup</th><th>Entry</th><th>Exit</th><th>Shares</th><th>P&amp;L</th><th>Outcome</th><th>Time <span>DEMO UTC</span></th></tr></thead><tbody id="trade-rows"></tbody></table></div><div class="table-note">Sample trade rows are independent visual fixtures, not broker executions or accounting.</div></article>
+      <article class="panel equity-panel" id="analytics"><div class="panel-heading compact"><h2>Equity Curve <span class="demo-tag">DEMO</span></h2><svg class="icon cyan"><use href="#chart"/></svg></div><div class="equity-summary"><strong>+$428.16</strong><span>Illustrative session</span></div><div class="equity-canvas-wrap"><canvas id="equity-chart" aria-label="Demo equity curve. Illustrative sample account values only.">DEMO EQUITY CURVE — synthetic values, not actual performance.</canvas></div><div class="equity-caption"><span>DEMO EQUITY CURVE</span><span>Not account performance</span></div></article>
+      <article class="panel activity-panel"><div class="panel-heading compact"><h2>Activity Feed</h2><span class="local-tag">LOCAL</span></div><ol id="activity-items" class="activity-items"></ol></article>
+    </section>
+    <footer class="page-footer"><span><span class="velocity-mark mini" aria-hidden="true"><i></i><i></i></span>VELOCITY TRADING GROUP <b>·</b> VISUAL WORKSPACE PRE1</span><span>READ-ONLY <b>·</b> No live feed <b>·</b> First real PAPER order blocked</span></footer>
+  </main>
+  <noscript><p class="load-error">Enable JavaScript for demo charts. Trading remains blocked. No broker connection is made.</p></noscript>
+</body>
+</html>

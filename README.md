@@ -144,6 +144,22 @@ opening a browser. See the [dashboard guide](docs/velocity-dashboard-pre1.md).
 Gateway Read-Only remains required, restart quarantine mandatory, AccountMode UNKNOWN,
 public snapshot mode None and LIVE unsupported. The first real PAPER order remains blocked.
 
+An optional [real EOD market-data preview](docs/velocity-market-data-pre1.md) uses
+Massive Stocks Basic through a separate standard-library adapter. Default startup
+stays offline DEMO. For personal/non-business use, configure your own
+`MASSIVE_API_KEY` securely in the server environment, then start:
+
+```powershell
+py -3.12 -m tradingbot_dashboard --market-data-preview --watchlist "AAPL,MSFT" --open
+```
+
+This makes **no provider request on startup**. In Market Data, explicitly load one
+EOD bar or bounded daily history for a selected ticker. The preview shows source
+dates, quality, missing scanner fields and EOD/DELAYED/STALE/UNAVAILABLE states.
+The demo scanner and main chart remain separate. No credential goes to the browser;
+there is no broker connection or trading authority. See the guide for masked
+PowerShell credential entry, current provider terms and Windows validation.
+
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 
 After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.

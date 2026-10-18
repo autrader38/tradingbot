@@ -162,8 +162,12 @@ Cloud implementation checks on Python 3.12.14:
   byte-for-byte; server, CLI and package exports remain unchanged. Secret/account,
   credential/.env, external-resource, broker-call, storage and export scans passed.
 
-PRE2 still requires independent review and actual Windows qualification. Cloud
-tests and local Chromium inspection do not establish Windows qualification.
+Before MARKET-DATA-PRE1, the user subsequently reported PRE2 independent review and
+actual Windows qualification complete at `a961e625afb2cc01c8cc0467f2b1284c905164f2`:
+8,371 tests OK, skipped=15, 145 Python files compiled, compile/diff exit zero,
+clean tree/index and synchronized Windows main/origin/main. The count difference
+reflects optional installed-browser tests. Cloud tests alone did not establish
+that Windows qualification.
 
 ## Safety and remaining work
 

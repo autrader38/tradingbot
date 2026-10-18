@@ -9,6 +9,7 @@
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
+  <script src="/market-data.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -32,6 +33,7 @@
     <nav aria-label="Main navigation" class="navigation">
       <button class="nav-item active" data-section="workspace" aria-current="page"><svg class="icon"><use href="#grid"/></svg>Dashboard</button>
       <button class="nav-item" data-section="scanner">Scanner</button>
+      <button class="nav-item" data-section="market-data-preview">Market Data</button>
       <button class="nav-item" data-section="charts">Charts</button>
       <button class="nav-item" data-section="trades">Trades</button>
       <button class="nav-item" data-section="strategy">Strategies</button>
@@ -47,7 +49,7 @@
       <div class="safety-banner"><svg class="icon"><use href="#lock"/></svg><div><strong>TRADING BLOCKED</strong><span>Visual workspace only · No broker connected</span></div></div>
     </section>
 
-    <div class="demo-notice"><span class="demo-dot"></span><strong>DEMO MARKET DATA — NO LIVE FEED</strong><span>Synthetic symbols, prices and performance.</span><span class="notice-end">OFFLINE BY DESIGN</span></div>
+    <div class="demo-notice"><span class="demo-dot"></span><strong>DEMO MARKET DATA — NO LIVE FEED</strong><span>Synthetic scanner, charts and performance. Optional real EOD preview is separate below.</span><span class="notice-end">OFFLINE BY DEFAULT</span></div>
     <div id="load-error" class="load-error" role="alert" hidden>Demo data could not load. Trading remains blocked. Restart the local dashboard.</div>
 
     <section class="metrics" aria-label="Demo performance summary">
@@ -101,6 +103,21 @@
         <article class="panel session-panel"><div class="panel-heading compact"><h2>Broker / Session</h2><span class="neutral-dot"></span></div><dl class="status-list"><div><dt>Connection</dt><dd>NOT CONNECTED</dd></div><div><dt>Public Snapshot Mode</dt><dd>None</dd></div></dl></article>
         <article class="panel strategy-panel" id="strategy"><div class="strategy-title"><span class="strategy-icon">A<span><svg class="icon"><use href="#arrow"/></svg></span></span><div><div class="eyebrow">STRATEGY · FROZEN V1.0</div><h2>ABCD BREAKOUT</h2></div></div><div class="strategy-facts"><div><span>Direction</span><strong>LONG ONLY</strong></div><div><span>Timeframes</span><strong>1m / 15m</strong></div><div><span>Context</span><strong>Weekly</strong></div></div><div class="automation"><span class="neutral-dot"></span>Automation <strong>NOT AUTHORIZED</strong></div></article>
       </aside>
+    </section>
+
+    <section class="panel market-preview" id="market-data-preview" aria-labelledby="market-preview-title">
+      <div class="market-preview-heading"><div><div class="eyebrow">OPTIONAL · READ-ONLY · PERSONAL PREVIEW</div><h2 id="market-preview-title">Real Market Data Preview<span class="heading-dot">.</span></h2><p>Massive Stocks Basic · Daily source observations · No intraday signal or trading authority</p></div><span id="market-state" class="market-state" role="status" aria-live="polite">UNAVAILABLE</span></div>
+      <div class="market-preview-controls"><label for="market-ticker">Watchlist ticker</label><select id="market-ticker" disabled aria-describedby="market-message"><option>Preview disabled</option></select><button id="market-load-previous" disabled>Load EOD bar</button><button id="market-load-history" disabled>Load daily history</button><span class="market-quota">4 requests / minute maximum · Manual loads only</span></div>
+      <p id="market-message" class="market-message" role="status" aria-live="polite">UNAVAILABLE · Preview disabled. The demo workspace remains fully functional.</p>
+      <div id="market-observation" hidden>
+        <div class="market-source-line" id="market-source"></div>
+        <dl class="market-values" id="market-values"></dl>
+        <div class="market-provenance" id="market-provenance"></div>
+        <div id="real-history-wrap" class="real-history-wrap" hidden><div class="real-history-caption">REAL HISTORICAL DAILY OHLCV · <span id="real-history-state"></span> · No demo overlays or trade markers · NOT LIVE</div><canvas id="real-history-chart" tabindex="0" aria-label="Real historical daily aggregate chart. Source OHLCV values are listed in the table below.">Historical source candles only. This chart grants no currentness or trading authority.</canvas><details><summary>Source daily OHLCV values</summary><div class="table-scroll"><table class="real-history-table"><thead><tr><th>Session date ET</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Daily volume</th></tr></thead><tbody id="real-history-rows"></tbody></table></div></details></div>
+        <p id="market-missing" class="market-missing"></p>
+        <details class="market-quality"><summary>Source quality and coverage</summary><ul id="market-quality-list"></ul></details>
+      </div>
+      <div class="market-preview-foot">EOD ≠ live market state. No current breakout, scanner qualification or broker evidence. Demo scanner and main chart stay independent. Basic individual-plan data is for personal/non-business use; commercial display needs separate rights.</div>
     </section>
 
     <section class="lower-grid" aria-label="Demo trading history and system activity">

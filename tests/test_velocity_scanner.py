@@ -197,6 +197,9 @@ class ScannerBrowserTests(unittest.TestCase):
         self.page.goto(self.origin + '/')
         # A locator wait honors CSP; string-predicate polling can require eval.
         self.page.locator('#health-label').filter(has_text='LOCAL UI READY').wait_for()
+        # The separate local preview configuration must finish before counting
+        # requests made by later scanner interactions. It performs no provider I/O.
+        self.page.locator('#market-ticker option[value="AAPL"]').wait_for(state='attached')
 
     def tearDown(self):
         self.assertEqual(self.errors, [])

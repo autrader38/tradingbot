@@ -3,7 +3,24 @@
   'use strict';
   const $ = (id) => document.getElementById(id);
   const state = { snapshot: null, symbol: 'ABCD', timeframe: '1m', count: 72,
-    hover: null, vwap: true, levels: true, trade: null };
+    hover: null, vwap: true, levels: true, trade: null, matches: [] };
+  // Presentation-only defaults/bounds. No strategy configuration is read or changed.
+  const FILTER_FIELDS = Object.freeze([
+    { id: 'filter-max-price', label: 'Maximum stock price', min: .01, max: 10000, decimals: 2, initial: '5.00' },
+    { id: 'filter-min-change', label: 'Minimum price change', min: -100, max: 1000, decimals: 2, initial: '3.00' },
+    { id: 'filter-min-cap', label: 'Minimum market cap ($M)', min: 0, max: 1000000, decimals: 2, initial: '50' },
+    { id: 'filter-min-average-volume', label: 'Average 10-day volume', min: 0, max: 1000000000000, decimals: 0, initial: '1000000' },
+    { id: 'filter-min-relative-volume', label: 'Minimum relative volume', min: 0, max: 100, decimals: 2, initial: '', optional: true },
+    { id: 'filter-min-score', label: 'Minimum setup score', min: 0, max: 100, decimals: 0, initial: '0' }
+  ].map(Object.freeze));
+  const SORTS = Object.freeze({
+    'change-desc': (a, b) => b.change_percent - a.change_percent,
+    'price-asc': (a, b) => a.price - b.price,
+    'price-desc': (a, b) => b.price - a.price,
+    'relative-desc': (a, b) => b.relative_volume - a.relative_volume,
+    'volume-desc': (a, b) => b.volume - a.volume,
+    'score-desc': (a, b) => b.score - a.score
+  });
   const colors = { grid: '#213047', muted: '#6d819c', text: '#cad7e9', up: '#40d6a4',
     down: '#ef7b87', cyan: '#39cafa', gold: '#d8b972' };
   const money = (value) => Number(value).toFixed(2);
@@ -37,31 +54,161 @@
     $('chart-price').textContent = money(series().candles.at(-1).close);
     $('chart-change').textContent = `${row.change_percent > 0 ? '+' : ''}${row.change_percent.toFixed(2)}% · DEMO`;
     $('chart-change').className = row.change_percent >= 0 ? 'positive' : 'negative';
+    updateChartSelection();
     drawChart();
   }
 
-  function renderScanner() {
-    $('scanner-rows').replaceChildren(...state.snapshot.scanner.rows.map((row) => {
+  function updateChartSelection() {
+    const matching = state.matches.some((row) => row.symbol === state.symbol);
+    $('chart-selection-note').textContent = matching ? `${state.symbol} · In matching demo scanner results`
+      : state.matches.length ? `Outside filtered results · Viewing ${state.symbol}; no scanner match is implied.`
+        : `Outside filtered results · No matches; ${state.symbol} chart retained.`;
+    $('chart-selection-note').classList.toggle('outside', !matching);
+  }
+
+  function renderScanner(rows) {
+    $('scanner-rows').replaceChildren(...rows.map((row) => {
       const tr = node('tr');
       tr.dataset.symbol = row.symbol;
       const symbol = node('td');
       const button = node('button', row.symbol, 'symbol-button');
       button.type = 'button';
       button.setAttribute('aria-label', `Show ${row.symbol} demo chart`);
+      button.setAttribute('aria-pressed', String(row.symbol === state.symbol));
+      tr.classList.toggle('selected', row.symbol === state.symbol);
       button.append(node('span', 'SYNTHETIC'));
       symbol.append(button);
       const change = `${row.change_percent >= 0 ? '+' : ''}${row.change_percent.toFixed(2)}%`;
       tr.append(symbol, node('td', money(row.price)), node('td', change, row.change_percent >= 0 ? 'positive' : 'negative'));
-      for (const [label, value] of [['Vol', volume(row.volume)], ['Rel vol', `${row.relative_volume.toFixed(1)}×`],
-        ['Setup', row.setup], ['Score', String(row.score)], ['Status', row.status]]) {
+      for (const [label, value] of [['Rel vol', `${row.relative_volume.toFixed(1)}×`],
+        ['Score', String(row.score)], ['Status', row.status]]) {
         const td = node('td');
         td.append(node('span', label, 'mini-label'));
         td.append(node('span', value, label === 'Status' ? `state-pill ${row.status.toLowerCase()}` : ''));
         tr.append(td);
       }
-      tr.addEventListener('click', () => selectSymbol(row.symbol));
+      const profile = node('td', undefined, 'market-profile');
+      const details = node('details');
+      const summary = node('summary', 'Market profile');
+      summary.setAttribute('aria-label', `${row.symbol} market cap, average volume and volatility`);
+      summary.append(node('span', row.volatility, 'volatility-label'));
+      const facts = node('dl');
+      for (const [label, value] of [['Market cap', `$${row.market_cap.toLocaleString('en-US')}`],
+        ['Avg 10-day volume', `${row.average_volume_10d.toLocaleString('en-US')} shares`], ['Volatility', `${row.volatility} · SYNTHETIC`],
+        ['Volume', volume(row.volume)], ['Setup', row.setup]]) {
+        facts.append(node('dt', label), node('dd', value));
+      }
+      details.append(summary, facts); profile.append(details); tr.append(profile);
+      tr.addEventListener('click', (event) => {
+        if (!event.target.closest('details')) selectSymbol(row.symbol);
+      });
       return tr;
     }));
+  }
+
+  function readFilters() {
+    const values = [], errors = [];
+    for (const field of FILTER_FIELDS) {
+      const input = $(field.id), text = input.value.trim();
+      const value = text === '' && field.optional ? null : Number(text);
+      const decimalPlaces = text.includes('.') ? text.split('.')[1].length : 0;
+      const valid = !input.validity.badInput && (value === null || (text !== '' && /^-?(?:\d+\.?\d*|\.\d+)$/.test(text)
+        && Number.isFinite(value) && value >= field.min && value <= field.max
+        && (field.decimals === 0 ? Number.isInteger(value) : decimalPlaces <= field.decimals)));
+      input.setAttribute('aria-invalid', String(!valid));
+      if (!valid) errors.push(`${field.label}: use ${field.min}–${field.max}${field.decimals === 0 ? ' whole numbers' : `, up to ${field.decimals} decimals`}.`);
+      values.push(value);
+    }
+    const search = $('scanner-search').value.trim().toUpperCase();
+    const searchValid = search.length <= 12;
+    $('scanner-search').setAttribute('aria-invalid', String(!searchValid));
+    if (!searchValid) errors.push('Search must be at most 12 characters.');
+    const sort = $('scanner-sort').value;
+    if (!Object.hasOwn(SORTS, sort)) errors.push('Choose a supported sorting mode.');
+    const volatility = [];
+    if ($('volatility-high').checked) volatility.push('High');
+    if ($('volatility-very-high').checked) volatility.push('Very High');
+    return { values, search, sort, volatility, errors };
+  }
+
+  function applyScanner(message = '') {
+    if (!state.snapshot) return;
+    const filters = readFilters();
+    const [maxPrice, minChange, minCap, minAverage, minRelative, minScore] = filters.values;
+    // filter() creates a new array; sorting never mutates the source universe.
+    const rows = filters.errors.length ? [] : state.snapshot.scanner.rows.filter((row) =>
+      row.price < maxPrice && row.change_percent >= minChange && row.market_cap >= Math.round(minCap * 1000000)
+      && row.average_volume_10d > minAverage && filters.volatility.includes(row.volatility)
+      && (minRelative === null || row.relative_volume >= minRelative) && row.score >= minScore
+      && row.symbol.includes(filters.search));
+    if (!filters.errors.length) rows.sort((a, b) => SORTS[filters.sort](a, b)
+      || (a.symbol < b.symbol ? -1 : a.symbol > b.symbol ? 1 : 0));
+    state.matches = rows;
+    renderScanner(rows);
+    const total = state.snapshot.scanner.rows.length;
+    $('scanner-counts').textContent = `${rows.length} MATCHES / ${total} SCANNED`;
+    $('scanner-filtered').textContent = `${total - rows.length} filtered out`;
+    $('scanner-empty').hidden = rows.length !== 0;
+    $('scanner-empty-reason').textContent = filters.errors.length ? 'Correct the invalid filters above to resume screening.'
+      : !filters.volatility.length ? 'Select High and/or Very High volatility, or loosen the filters.'
+        : filters.search ? 'No matches for this search and filter combination. Clear search or loosen filters.'
+          : 'Try loosening the filters. No live market inference is made.';
+    $('filter-feedback').textContent = filters.errors.length ? filters.errors.join(' ')
+      : message || 'Browser-only filters · Frozen Strategy Spec v1.0 is unchanged.';
+    $('filter-feedback').classList.toggle('invalid', filters.errors.length > 0);
+    $('clear-search').disabled = $('scanner-search').value.length === 0;
+    if (!filters.errors.length && minScore !== null) $('filter-score-slider').value = String(minScore);
+    $('scanner-announcement').textContent = '';
+    if (rows.length && !rows.some((row) => row.symbol === state.symbol)) {
+      const previous = state.symbol;
+      selectSymbol(rows[0].symbol);
+      $('scanner-announcement').textContent = `${previous} no longer matches. Chart switched to ${state.symbol}.`;
+    } else updateChartSelection();
+  }
+
+  function resetFilters() {
+    FILTER_FIELDS.forEach((field) => { $(field.id).value = field.initial; });
+    $('volatility-high').checked = true;
+    $('volatility-very-high').checked = true;
+    $('scanner-search').value = '';
+    $('scanner-sort').value = 'change-desc';
+    applyScanner('Defaults restored · Search cleared · Sort: change % high to low.');
+  }
+
+  function loosenFilters() {
+    const filters = readFilters();
+    if (filters.errors.length) { applyScanner(''); return; }
+    const [price, change, cap, average, relative, score] = filters.values;
+    const next = [Math.min(10000, price + 2.5).toFixed(2), Math.max(-100, change - 1).toFixed(2),
+      Math.max(0, cap - 10).toFixed(2), String(Math.max(0, average - 250000)),
+      relative === null ? '' : Math.max(0, relative - .5).toFixed(2), String(Math.max(0, score - 10))];
+    FILTER_FIELDS.forEach((field, i) => { $(field.id).value = next[i]; });
+    $('volatility-high').checked = true;
+    $('volatility-very-high').checked = true;
+    applyScanner(`Loosened: price < $${next[0]}, change ≥ ${next[1]}%, cap ≥ $${next[2]}M, avg volume > ${next[3]}, relative volume ${next[4] || 'no minimum'}, score ≥ ${next[5]}; both volatility categories. Search and sort unchanged.`);
+  }
+
+  function bindScanner() {
+    for (const field of FILTER_FIELDS) $(field.id).addEventListener('input', () => applyScanner());
+    for (const id of ['scanner-search', 'volatility-high', 'volatility-very-high']) {
+      $(id).addEventListener('input', () => applyScanner());
+    }
+    $('scanner-sort').addEventListener('change', () => applyScanner());
+    $('filter-score-slider').addEventListener('input', () => {
+      $('filter-min-score').value = $('filter-score-slider').value;
+      applyScanner();
+    });
+    $('reset-filters').addEventListener('click', resetFilters);
+    $('loosen-filters').addEventListener('click', loosenFilters);
+    $('clear-search').addEventListener('click', () => {
+      $('scanner-search').value = ''; applyScanner(); $('scanner-search').focus();
+    });
+    $('filter-toggle').addEventListener('click', () => {
+      const controls = $('filter-controls');
+      controls.hidden = !controls.hidden;
+      $('filter-toggle').setAttribute('aria-expanded', String(!controls.hidden));
+      $('filter-toggle').querySelector('span').textContent = controls.hidden ? 'Show filters' : 'Hide filters';
+    });
   }
 
   function renderTrades() {
@@ -357,7 +504,7 @@
           || !snapshot.scanner.demo || !snapshot.chart.demo || !snapshot.performance.demo || !snapshot.trades.demo
           || snapshot.evidence.active !== false) throw new Error('unsupported snapshot');
       state.snapshot = snapshot;
-      renderScanner(); renderTrades(); renderActivity(); renderPerformance(); bindInteractions(); selectSymbol(state.symbol); drawEquity();
+      bindScanner(); applyScanner(); renderTrades(); renderActivity(); renderPerformance(); bindInteractions(); selectSymbol(state.symbol); drawEquity();
       $('health-label').textContent = 'LOCAL UI READY';
     } catch {
       $('load-error').hidden = false;

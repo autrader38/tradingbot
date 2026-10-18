@@ -1,5 +1,10 @@
 # VELOCITY-DASHBOARD-PRE1 — local read-only visual workspace
 
+This document records the original PRE1 surface. The subsequent
+[PRE2 scanner guide](velocity-dashboard-pre2.md) describes the expanded synthetic
+universe, presentation controls and revised scanner layout. PRE1 independent
+review and actual Windows qualification were reported complete before PRE2.
+
 This separately authorized visual phase supplies the first Velocity Trading Group
 dashboard. It is independent of the broker execution architecture. The starting
 checkpoint is `1a40fc48f402385d74e1294faf58be938f552876`; the user reports PRE9

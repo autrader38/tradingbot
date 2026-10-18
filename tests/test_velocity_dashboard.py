@@ -99,7 +99,8 @@ class SnapshotTests(unittest.TestCase):
 
     def test_scanner_schema_is_bounded_and_synthetic(self):
         self.assertEqual(tuple(row['symbol'] for row in self.payload['scanner']['rows']), SYMBOLS)
-        expected = {'symbol', 'price', 'change_percent', 'volume', 'relative_volume', 'setup', 'score', 'status', 'demo'}
+        expected = {'symbol', 'price', 'change_percent', 'volume', 'relative_volume', 'setup', 'score', 'status',
+                    'market_cap', 'average_volume_10d', 'volatility', 'demo'}
         for row in self.payload['scanner']['rows']:
             self.assertEqual(set(row), expected)
             self.assertIn(row['status'], ('WATCHING', 'FORMING', 'READY', 'WAITING'))
@@ -322,7 +323,7 @@ class StaticTests(unittest.TestCase):
 
     def test_semantic_tables_and_accessible_canvases(self):
         self.assertEqual(sum(tag == 'table' for tag, _ in self.page.elements), 2)
-        self.assertGreaterEqual(sum(tag == 'th' for tag, _ in self.page.elements), 15)
+        self.assertGreaterEqual(sum(tag == 'th' for tag, _ in self.page.elements), 14)
         self.assertEqual(sum(tag == 'canvas' and 'aria-label' in attrs for tag, attrs in self.page.elements), 2)
         self.assertIn('focus-visible', self.css)
         self.assertIn('prefers-reduced-motion', self.css)
@@ -356,8 +357,16 @@ class StaticTests(unittest.TestCase):
             if tag == 'script': self.assertEqual(attrs.get('src'), '/app.js')
 
     def test_no_trade_controls_forms_or_credential_inputs(self):
-        for tag, _ in self.page.elements:
-            self.assertNotIn(tag, ('form', 'input', 'textarea'))
+        allowed_inputs = {'filter-max-price': 'number', 'filter-min-change': 'number',
+            'filter-min-cap': 'number', 'filter-min-average-volume': 'number',
+            'filter-min-relative-volume': 'number', 'filter-min-score': 'number',
+            'filter-score-slider': 'range', 'volatility-high': 'checkbox',
+            'volatility-very-high': 'checkbox', 'scanner-search': 'search'}
+        actual_inputs = {}
+        for tag, attrs in self.page.elements:
+            self.assertNotIn(tag, ('form', 'textarea'))
+            if tag == 'input': actual_inputs[attrs['id']] = attrs.get('type')
+        self.assertEqual(actual_inputs, allowed_inputs)
         for action in ('placeOrder', 'cancelOrder', 'flatten', 'Enable Trading', 'Switch Live', 'Auto Trade On'):
             self.assertNotIn(action, self.html + self.js)
 

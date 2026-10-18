@@ -6,7 +6,10 @@ import math
 
 
 TIMEFRAMES = ('1m', '15m', '1D', '1W')
-SYMBOLS = ('ABCD', 'VELA', 'NEXA', 'QBIT', 'MTRX')
+SYMBOLS = ('ABCD', 'VELA', 'NEXA', 'QBIT', 'MTRX', 'LUMA', 'NOVA', 'AERO',
+           'FLUX', 'ORBI', 'VOLT', 'SOLA', 'KITE', 'PICO', 'PRSM', 'ZENA',
+           'CORA', 'IONX', 'AXON', 'LYRA', 'TESS', 'VYRA', 'ELIO', 'RUNE')
+VOLATILITIES = ('High', 'Very High')
 
 
 def _check(condition):
@@ -74,6 +77,9 @@ class ScannerRow:
     setup: str
     score: int
     status: str
+    market_cap: int
+    average_volume_10d: int
+    volatility: str
 
     def validate(self):
         _check(self.symbol in SYMBOLS)
@@ -83,12 +89,16 @@ class ScannerRow:
         _check(type(self.volume) is int and self.volume >= 0)
         _check(type(self.score) is int and 0 <= self.score <= 100)
         _check(self.setup == 'ABCD' and self.status in ('WATCHING', 'FORMING', 'READY', 'WAITING'))
+        for value in (self.market_cap, self.average_volume_10d):
+            _check(type(value) is int and 0 <= value <= 1_000_000_000_000)
+        _check(type(self.volatility) is str and self.volatility in VOLATILITIES)
 
     def payload(self):
         self.validate()
         return {'symbol': self.symbol, 'price': self.price, 'change_percent': self.change_percent,
                 'volume': self.volume, 'relative_volume': self.relative_volume, 'setup': self.setup,
-                'score': self.score, 'status': self.status, 'demo': True}
+                'score': self.score, 'status': self.status, 'market_cap': self.market_cap,
+                'average_volume_10d': self.average_volume_10d, 'volatility': self.volatility, 'demo': True}
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,7 +127,7 @@ class DemoTrade:
 
 @dataclass(frozen=True, slots=True, repr=False)
 class DashboardSnapshot:
-    """Closed PRE1 visual schema. Fixed safety facts cannot become runtime permits.
+    """Closed visual schema. Fixed safety facts cannot become runtime permits.
 
     Serialization is an explicit field allowlist, never arbitrary object dumping.
     Market/performance values are synthetic; no active evidence can be loaded here.
@@ -148,6 +158,7 @@ class DashboardSnapshot:
         for row in self.scanner:
             _check(type(row) is ScannerRow)
             row.validate()
+        prices = {row.symbol: row.price for row in self.scanner}
         _check(type(self.series) is tuple and len(self.series) == len(SYMBOLS) * len(TIMEFRAMES))
         _check(all(type(series) is ChartSeries for series in self.series))
         _check(tuple((s.symbol, s.timeframe) for s in self.series)
@@ -155,6 +166,7 @@ class DashboardSnapshot:
         for series in self.series:
             _check(type(series) is ChartSeries)
             series.validate()
+            _check(series.candles[-1].close == prices[series.symbol])
         _check(type(self.trades) is tuple and 0 < len(self.trades) <= 12)
         for trade in self.trades:
             _check(type(trade) is DemoTrade)

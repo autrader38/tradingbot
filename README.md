@@ -132,6 +132,13 @@ trade markers and performance are clearly labeled **DEMO**. Candles, timeframes,
 scanner selection and chart inspection work offline. Bot/trading state is read-only;
 **TRADING BLOCKED** remains visible and no order controls are provided.
 
+The [interactive scanner](docs/velocity-dashboard-pre2.md) screens 24 synthetic
+stocks locally. Adjust price, change, market cap, average volume, volatility,
+relative volume and setup score; search tickers or sort results immediately.
+Defaults show 13 matches. Reset restores defaults; Loosen updates the visible
+filters. **DEMO MARKET DATA — NO LIVE FEED** applies to the entire scanner.
+These browser-only settings do not change Strategy Spec v1.0 or risk rules.
+
 Keep the console open; **Ctrl+C** stops the server. Omit `--open` to start without
 opening a browser. See the [dashboard guide](docs/velocity-dashboard-pre1.md).
 Gateway Read-Only remains required, restart quarantine mandatory, AccountMode UNKNOWN,

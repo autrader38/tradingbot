@@ -47,7 +47,7 @@
       <div class="safety-banner"><svg class="icon"><use href="#lock"/></svg><div><strong>TRADING BLOCKED</strong><span>Visual workspace only · No broker connected</span></div></div>
     </section>
 
-    <div class="demo-notice"><span class="demo-dot"></span><strong>DEMO MARKET DATA</strong><span>Synthetic symbols, prices and performance. No live market feed.</span><span class="notice-end">OFFLINE BY DESIGN</span></div>
+    <div class="demo-notice"><span class="demo-dot"></span><strong>DEMO MARKET DATA — NO LIVE FEED</strong><span>Synthetic symbols, prices and performance.</span><span class="notice-end">OFFLINE BY DESIGN</span></div>
     <div id="load-error" class="load-error" role="alert" hidden>Demo data could not load. Trading remains blocked. Restart the local dashboard.</div>
 
     <section class="metrics" aria-label="Demo performance summary">
@@ -58,12 +58,30 @@
       <article class="metric"><div class="metric-label">Risk used <span class="demo-tag">DEMO</span></div><div class="metric-value" id="metric-risk">0.4<span class="metric-unit">%</span></div><div class="metric-foot">Illustrative · No active risk state</div></article>
     </section>
 
+    <section class="panel filter-panel" aria-labelledby="filter-title">
+      <div class="filter-heading"><div><div class="eyebrow">LOCAL SCANNER WORKSPACE</div><h2 id="filter-title">Find your focus<span class="heading-dot">.</span></h2><p>Screen synthetic stocks. These are visual filters, not trading rules.</p></div><button id="filter-toggle" class="filter-toggle" aria-expanded="true" aria-controls="filter-controls"><svg class="icon"><use href="#layers"/></svg><span>Hide filters</span></button></div>
+      <div id="filter-controls">
+        <div class="filter-fields">
+          <div class="filter-field"><label for="filter-max-price">Maximum stock price <span>$</span></label><input id="filter-max-price" type="number" min="0.01" max="10000" step="0.01" value="5.00" inputmode="decimal" aria-describedby="filter-feedback"><small>Strictly below this price</small></div>
+          <div class="filter-field"><label for="filter-min-change">Minimum price change <span>%</span></label><input id="filter-min-change" type="number" min="-100" max="1000" step="0.01" value="3.00" inputmode="decimal" aria-describedby="filter-feedback"><small>At or above this change</small></div>
+          <div class="filter-field"><label for="filter-min-cap">Minimum market cap <span>$M</span></label><input id="filter-min-cap" type="number" min="0" max="1000000" step="0.01" value="50" inputmode="decimal" aria-describedby="filter-feedback"><small>At or above · millions of dollars</small></div>
+          <div class="filter-field"><label for="filter-min-average-volume">Minimum average 10-day volume</label><input id="filter-min-average-volume" type="number" min="0" max="1000000000000" step="1" value="1000000" inputmode="numeric" aria-describedby="filter-feedback"><small>Strictly greater · shares</small></div>
+          <div class="filter-field"><label for="filter-min-relative-volume">Minimum relative volume <span>OPTIONAL</span></label><input id="filter-min-relative-volume" type="number" min="0" max="100" step="0.01" placeholder="No minimum" inputmode="decimal" aria-describedby="filter-feedback"><small>Blank means no threshold</small></div>
+          <div class="filter-field score-field"><label for="filter-min-score">Minimum setup score <span>0–100</span></label><div class="score-inputs"><input id="filter-min-score" type="number" min="0" max="100" step="1" value="0" inputmode="numeric" aria-describedby="filter-feedback"><input id="filter-score-slider" type="range" min="0" max="100" step="1" value="0" aria-label="Minimum setup score slider"></div><small>Synthetic score · not a signal</small></div>
+        </div>
+        <div class="filter-actions"><fieldset class="volatility-options"><legend>Synthetic volatility</legend><label><input id="volatility-high" type="checkbox" checked><span>High</span></label><label><input id="volatility-very-high" type="checkbox" checked><span>Very High</span></label></fieldset><div class="filter-buttons"><button id="loosen-filters" class="loosen-button">LOOSEN FILTERS <span aria-hidden="true">↗</span></button><button id="reset-filters" class="reset-button">RESET TO DEFAULTS</button></div></div>
+      </div>
+      <div class="filter-summary"><span id="filter-feedback" role="status" aria-live="polite">Browser-only filters · Frozen Strategy Spec v1.0 is unchanged.</span><span class="demo-tag">DEMO SCREENING ONLY</span></div>
+    </section>
+
     <section class="terminal-grid" aria-label="Trading research workspace">
       <article class="panel scanner-panel" id="scanner">
-        <div class="panel-heading"><div><h2><svg class="icon cyan"><use href="#pulse"/></svg>Momentum Scanner</h2><p>Find focus in the noise.</p></div><span class="demo-tag">DEMO</span></div>
-        <div class="scanner-toolbar"><span><b class="cyan">5</b> synthetic symbols</span><span>ABCD setups</span></div>
-        <table class="scanner-table" aria-label="Demo momentum scanner"><thead class="sr-only"><tr><th>Symbol</th><th>Price</th><th>Change %</th><th>Volume</th><th>Rel Vol</th><th>Setup</th><th>Score</th><th>Status</th></tr></thead><tbody id="scanner-rows"></tbody></table>
-        <div class="scanner-bottom"><span class="legend-square"></span>Click a symbol to explore its demo chart.<p>Setup scores and scanner states are visual examples, not strategy signals.</p></div>
+        <div class="panel-heading"><div><h2><svg class="icon cyan"><use href="#pulse"/></svg>Momentum Scanner</h2><p>DEMO MARKET DATA — NO LIVE FEED</p></div><span class="demo-tag">DEMO</span></div>
+        <div class="scanner-search"><label class="sr-only" for="scanner-search">Search demo tickers</label><input id="scanner-search" type="search" maxlength="12" placeholder="Search ticker…" autocomplete="off" spellcheck="false"><button id="clear-search" aria-label="Clear search" title="Clear search">×</button></div>
+        <div class="scanner-sort"><label for="scanner-sort">Sort results</label><select id="scanner-sort"><option value="change-desc">Change % · High to low</option><option value="price-asc">Price · Low to high</option><option value="price-desc">Price · High to low</option><option value="relative-desc">Relative volume · High to low</option><option value="volume-desc">Volume · High to low</option><option value="score-desc">Setup score · High to low</option></select></div>
+        <div class="scanner-toolbar"><strong id="scanner-counts" role="status" aria-live="polite">— MATCHES / — SCANNED</strong><span id="scanner-filtered">— filtered out</span></div>
+        <div class="scanner-results" tabindex="0" role="region" aria-label="Matching demo stocks"><table class="scanner-table" aria-label="Demo momentum scanner"><thead class="sr-only"><tr><th>Symbol</th><th>Price</th><th>Change %</th><th>Rel Vol</th><th>Score</th><th>Status</th><th>Market profile</th></tr></thead><tbody id="scanner-rows"></tbody></table><div id="scanner-empty" class="scanner-empty" hidden><svg class="icon"><use href="#pulse"/></svg><strong>No demo stocks match</strong><p id="scanner-empty-reason">Try loosening the filters or clearing search.</p></div></div>
+        <div class="scanner-bottom"><span class="legend-square"></span>Click a symbol to explore its demo chart.<p>READY and setup scores are synthetic labels, not authorization or recommendations.</p><p id="scanner-announcement" role="status" aria-live="polite"></p></div>
         <div class="scanner-foot"><svg class="icon"><use href="#shield"/></svg><span>No provider connected<br><strong>Demo universe only</strong></span></div>
       </article>
 
@@ -71,6 +89,7 @@
         <div class="chart-heading"><div class="chart-symbol"><span id="symbol-tile">A</span><div><h2 id="chart-symbol">ABCD</h2><p>Synthetic instrument <span>· DEMO</span></p></div></div><div class="chart-quote"><strong id="chart-price">—</strong><span id="chart-change" class="positive">DEMO PRICE</span></div></div>
         <div class="chart-controls"><div class="timeframes" role="group" aria-label="Chart timeframe"><button class="selected" data-timeframe="1m" aria-pressed="true">1m</button><button data-timeframe="15m" aria-pressed="false">15m</button><button data-timeframe="1D" aria-pressed="false">1D</button><button data-timeframe="1W" aria-pressed="false">1W</button></div><div class="overlays"><button id="vwap-toggle" class="overlay-button on" aria-pressed="true"><span></span>VWAP</button><button id="levels-toggle" class="overlay-button on" aria-pressed="true">Example levels</button></div></div>
         <div class="chart-context"><span id="chart-context">ABCD · 1m · Synthetic candles</span><span class="demo-tag">DEMO MARKET DATA</span></div>
+        <div id="chart-selection-note" class="chart-selection-note" role="status">Waiting for demo scanner results.</div>
         <div class="chart-canvas-wrap" id="chart-wrap"><canvas id="candlestick-chart" tabindex="0" aria-label="Demo candlestick chart. Use left and right arrows to inspect candles; plus and minus to zoom.">Interactive demo OHLC candlestick chart with volume, VWAP and example trade levels. Values are also displayed below the chart.</canvas><div id="chart-tooltip" class="chart-tooltip" hidden></div><div class="chart-watermark" aria-hidden="true">VELOCITY<span>DEMO WORKSPACE</span></div></div>
         <div class="ohlc-readout" id="ohlc-readout" aria-live="polite">Select a demo candle to inspect its OHLC values.</div>
         <div class="chart-footer"><span><span class="line-key"></span>VWAP <b>DEMO</b></span><span><span class="dot-key"></span>ENTRY / STOP / TARGET <b>EXAMPLES</b></span><div class="chart-tools"><button id="zoom-out" aria-label="Zoom out">−</button><button id="reset-chart" aria-label="Reset chart zoom">Reset</button><button id="zoom-in" aria-label="Zoom in">+</button></div></div>
@@ -89,7 +108,7 @@
       <article class="panel equity-panel" id="analytics"><div class="panel-heading compact"><h2>Equity Curve <span class="demo-tag">DEMO</span></h2><svg class="icon cyan"><use href="#chart"/></svg></div><div class="equity-summary"><strong>+$428.16</strong><span>Illustrative session</span></div><div class="equity-canvas-wrap"><canvas id="equity-chart" aria-label="Demo equity curve. Illustrative sample account values only.">DEMO EQUITY CURVE — synthetic values, not actual performance.</canvas></div><div class="equity-caption"><span>DEMO EQUITY CURVE</span><span>Not account performance</span></div></article>
       <article class="panel activity-panel"><div class="panel-heading compact"><h2>Activity Feed</h2><span class="local-tag">LOCAL</span></div><ol id="activity-items" class="activity-items"></ol></article>
     </section>
-    <footer class="page-footer"><span><span class="velocity-mark mini" aria-hidden="true"><i></i><i></i></span>VELOCITY TRADING GROUP <b>·</b> VISUAL WORKSPACE PRE1</span><span>READ-ONLY <b>·</b> No live feed <b>·</b> First real PAPER order blocked</span></footer>
+    <footer class="page-footer"><span><span class="velocity-mark mini" aria-hidden="true"><i></i><i></i></span>VELOCITY TRADING GROUP <b>·</b> VISUAL WORKSPACE PRE2</span><span>READ-ONLY <b>·</b> No live feed <b>·</b> First real PAPER order blocked</span></footer>
   </main>
   <noscript><p class="load-error">Enable JavaScript for demo charts. Trading remains blocked. No broker connection is made.</p></noscript>
 </body>

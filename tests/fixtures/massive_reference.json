@@ -1,0 +1,10 @@
+{
+  "status": "OK",
+  "results": {
+    "ticker": "AAPL",
+    "market": "stocks",
+    "locale": "us",
+    "currency_name": "usd",
+    "market_cap": 50000000
+  }
+}

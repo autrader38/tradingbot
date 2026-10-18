@@ -322,7 +322,7 @@ class StaticTests(unittest.TestCase):
         self.assertEqual([attrs['data-timeframe'] for _, attrs in self.page.elements if 'data-timeframe' in attrs], list(TIMEFRAMES))
 
     def test_semantic_tables_and_accessible_canvases(self):
-        self.assertEqual(sum(tag == 'table' for tag, _ in self.page.elements), 3)
+        self.assertEqual(sum(tag == 'table' for tag, _ in self.page.elements), 4)
         self.assertGreaterEqual(sum(tag == 'th' for tag, _ in self.page.elements), 14)
         self.assertEqual(sum(tag == 'canvas' and 'aria-label' in attrs for tag, attrs in self.page.elements), 3)
         self.assertIn('focus-visible', self.css)
@@ -354,14 +354,17 @@ class StaticTests(unittest.TestCase):
         self.assertNotIn('<style', self.html)
         for tag, attrs in self.page.elements:
             self.assertFalse(any(key.startswith('on') or key == 'style' for key in attrs), tag)
-            if tag == 'script': self.assertIn(attrs.get('src'), ('/app.js', '/market-data.js'))
+            if tag == 'script': self.assertIn(attrs.get('src'), ('/app.js', '/market-data.js', '/eod-scanner.js'))
 
     def test_no_trade_controls_forms_or_credential_inputs(self):
         allowed_inputs = {'filter-max-price': 'number', 'filter-min-change': 'number',
             'filter-min-cap': 'number', 'filter-min-average-volume': 'number',
             'filter-min-relative-volume': 'number', 'filter-min-score': 'number',
             'filter-score-slider': 'range', 'volatility-high': 'checkbox',
-            'volatility-very-high': 'checkbox', 'scanner-search': 'search'}
+            'volatility-very-high': 'checkbox', 'scanner-search': 'search',
+            'eod-max-price': 'number', 'eod-min-change': 'number', 'eod-min-cap': 'number',
+            'eod-min-average': 'number', 'eod-min-rvol': 'number', 'eod-require-cap': 'checkbox',
+            'eod-search': 'search', 'eod-matches-only': 'checkbox'}
         actual_inputs = {}
         for tag, attrs in self.page.elements:
             self.assertNotIn(tag, ('form', 'textarea'))

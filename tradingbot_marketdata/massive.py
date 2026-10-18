@@ -13,6 +13,8 @@ from threading import Lock
 import time
 
 from .models import _decode, _eastern, _ticker, _utc, _watchlist
+from .reference import _TickerReference, _decode_reference
+from .research import _research_row
 from .transport import _read_response
 
 __all__ = ()
@@ -67,7 +69,7 @@ def _unavailable(reason, retry_after=0):
 
 
 class _MarketDataPreview:
-    __slots__ = ('_enabled', '_watchlist', '_credential', '_cache', '_lock', '_active')
+    __slots__ = ('_enabled', '_watchlist', '_credential', '_cache', '_loaded', '_lock', '_active')
 
     def __init__(self, *, enabled=False, watchlist=_DEFAULT_WATCHLIST):
         if type(enabled) is not bool: raise ValueError('Invalid market preview configuration')
@@ -75,7 +77,7 @@ class _MarketDataPreview:
         value = os.environ.get('MASSIVE_API_KEY') if enabled else None
         self._credential = value if (type(value) is str and 1 <= len(value) <= 512
                                     and all(33 <= ord(char) <= 126 for char in value)) else None
-        self._cache, self._lock, self._active = {}, Lock(), False
+        self._cache, self._loaded, self._lock, self._active = {}, {}, Lock(), False
 
     def __repr__(self):
         return '<MarketDataPreview read-only>'
@@ -89,19 +91,36 @@ class _MarketDataPreview:
                 'entitlement': 'Stocks Basic · end-of-day · not live',
                 'license_scope': 'Personal, non-professional, non-business use only'}
 
+    def research(self):
+        # Local immutable evidence only. Never requests data or inspects credentials.
+        now = _utc(_now())
+        with self._lock: loaded = dict(self._loaded)
+        rows = [_research_row(ticker, loaded.get((ticker, 'history')),
+                              loaded.get((ticker, 'reference')), now) for ticker in self._watchlist]
+        return {'provider': 'Massive', 'demo': False, 'evaluated_at': now.isoformat(),
+                'watchlist_total': len(self._watchlist), 'rows': rows,
+                'scope': 'CONFIGURED_WATCHLIST_ONLY_NOT_FULL_MARKET',
+                'full_strategy_qualification': 'NOT AVAILABLE'}
+
     def observe(self, ticker, view):
         try:
             _ticker(ticker)
-            if ticker not in self._watchlist or view not in ('previous', 'history'):
+            if ticker not in self._watchlist or view not in ('previous', 'history', 'reference'):
                 return _unavailable('INVALID_REQUEST')
             if not self._enabled: return _unavailable('PREVIEW_DISABLED')
             if self._credential is None: return _unavailable('KEY_NOT_CONFIGURED')
             now, tick = _utc(_now()), time.monotonic()
+            requested_date = None
+            if view == 'reference':
+                with self._lock: history = self._loaded.get((ticker, 'history'))
+                if history is None or history[1] > now or history[0].payload(now)['state'] != 'REAL END-OF-DAY':
+                    return _unavailable('ELIGIBLE_HISTORY_REQUIRED')
+                requested_date = history[0].bars[-1].session_date
             key = (ticker, view)
             with self._lock:
                 if key in self._cache:
                     series, retrieved, expires = self._cache[key]
-                    if tick < expires:
+                    if tick < expires and (view != 'reference' or series.requested_date == requested_date):
                         return self._publication(series, now, retrieved, view, True)
                     del self._cache[key]
                 if self._active: return _unavailable('REQUEST_IN_PROGRESS', 1)
@@ -111,6 +130,7 @@ class _MarketDataPreview:
             try:
                 start = end = None
                 if view == 'previous': path = f'/v2/aggs/ticker/{ticker}/prev?adjusted=true'
+                elif view == 'reference': path = f'/v3/reference/tickers/{ticker}?date={requested_date}'
                 else:
                     end = _eastern(now).date() - timedelta(days=1)
                     start = end - timedelta(days=60)
@@ -126,10 +146,13 @@ class _MarketDataPreview:
                     return _unavailable(reason, delay)
                 if type(content_type) is not str or content_type.split(';')[0].strip().lower() != 'application/json':
                     raise ValueError('Invalid market response')
-                series = _decode(body, ticker, view, retrieved, start, end)
+                series = _decode_reference(body, ticker, requested_date) if view == 'reference' else \
+                    _decode(body, ticker, view, retrieved, start, end)
                 publication = self._publication(series, retrieved, retrieved, view, False)
-                if series.bars:
-                    with self._lock:
+                with self._lock:
+                    if view in ('history', 'reference'):
+                        self._loaded[key] = (series, retrieved)
+                    if view == 'reference' or series.bars:
                         self._cache[key] = (series, retrieved, time.monotonic() + 300)
                 return publication
             except TimeoutError:
@@ -150,5 +173,6 @@ class _MarketDataPreview:
         result = series.payload(now)
         result.update({'view': view, 'retrieved_at': retrieved.isoformat(),
                        'evaluated_at': now.isoformat(), 'cached': cached, 'retry_after_seconds': 0,
-                       'source_endpoint': 'previous-day-bar' if view == 'previous' else 'custom-daily-bars'})
+                       'source_endpoint': 'ticker-overview' if type(series) is _TickerReference else
+                           'previous-day-bar' if view == 'previous' else 'custom-daily-bars'})
         return result

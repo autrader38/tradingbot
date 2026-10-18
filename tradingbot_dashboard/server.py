@@ -17,6 +17,7 @@ _ASSETS = {'/': ('index.html', 'text/html; charset=utf-8'),
            '/styles.css': ('styles.css', 'text/css; charset=utf-8'),
            '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
            '/market-data.js': ('market-data.js', 'text/javascript; charset=utf-8'),
+           '/eod-scanner.js': ('eod-scanner.js', 'text/javascript; charset=utf-8'),
            '/favicon.svg': ('favicon.svg', 'image/svg+xml; charset=utf-8')}
 _CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
         "img-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; "
@@ -82,6 +83,8 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, 'application/json; charset=utf-8', self.server.snapshot_json)
         elif self.path == '/api/market-data':
             self._json(self.server.market_data.configuration())
+        elif self.path == '/api/market-data/research':
+            self._json(self.server.market_data.research())
         elif self.path.partition('?')[0] == '/api/market-data/observation':
             if self.command == 'HEAD':
                 self._respond(405, 'text/plain; charset=utf-8', b'Explicit GET load required.\n', allow='GET')
@@ -100,7 +103,7 @@ class _Handler(BaseHTTPRequestHandler):
                 if set(fields) != {'ticker', 'view'} or any(len(v) != 1 for v in fields.values()):
                     raise ValueError('Invalid query')
                 ticker, view = fields['ticker'][0], fields['view'][0]
-                if ticker not in self.server.market_data.configuration()['watchlist'] or view not in ('previous', 'history'):
+                if ticker not in self.server.market_data.configuration()['watchlist'] or view not in ('previous', 'history', 'reference'):
                     raise ValueError('Invalid query')
             except ValueError:
                 self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_REQUEST'}, status=400)

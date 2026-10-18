@@ -52,6 +52,7 @@
         {cache: 'no-store', credentials: 'omit', mode: 'same-origin', headers: {'X-Velocity-Market-Preview': '1'}});
       if (!response.ok) throw new Error('unavailable');
       const result = await response.json();
+      document.dispatchEvent(new CustomEvent('velocity-market-data-loaded'));
       status(result.state, result.reason, result.retry_after_seconds);
       if (!Array.isArray(result.bars) || !result.bars.length) return;
       const bar = result.bars.at(-1);

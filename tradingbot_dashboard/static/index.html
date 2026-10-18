@@ -10,6 +10,7 @@
   <link rel="stylesheet" href="/styles.css">
   <script src="/app.js" defer></script>
   <script src="/market-data.js" defer></script>
+  <script src="/eod-scanner.js" defer></script>
 </head>
 <body>
   <a class="skip-link" href="#workspace">Skip to workspace</a>
@@ -118,6 +119,28 @@
         <details class="market-quality"><summary>Source quality and coverage</summary><ul id="market-quality-list"></ul></details>
       </div>
       <div class="market-preview-foot">EOD ≠ live market state. No current breakout, scanner qualification or broker evidence. Demo scanner and main chart stay independent. Basic individual-plan data is for personal/non-business use; commercial display needs separate rights.</div>
+    </section>
+
+    <section class="panel market-preview eod-workspace" id="eod-watchlist" aria-labelledby="eod-title">
+      <div class="market-preview-heading"><div><div class="eyebrow">REAL END-OF-DAY · WATCHLIST RESEARCH</div><h2 id="eod-title">Real EOD Watchlist Scanner<span class="heading-dot">.</span></h2><p>Validated Massive daily history · One to five configured tickers · Personal use only</p></div><span class="market-state aged">FULL STRATEGY QUALIFICATION: NOT AVAILABLE</span></div>
+      <div class="market-preview-controls"><label for="eod-ticker">Load ticker</label><select id="eod-ticker" disabled><option>Preview disabled</option></select><button id="eod-load-history" disabled>Load ticker daily history</button><button id="eod-load-reference" disabled title="Load eligible history first. Separate manual request.">Load dated reference</button><button id="eod-recheck" title="Re-evaluate retained local evidence; no provider request.">Re-evaluate loaded data</button><span class="market-quota">Shared 4 / minute · At least 15 seconds apart · No automatic loads</span></div>
+      <p class="market-message" id="eod-message" role="status" aria-live="polite">Offline DEMO remains available. Real observations require explicit preview opt-in and a manual load.</p>
+      <div class="eod-coverage" aria-label="Whole watchlist coverage"><div><span>WATCHLIST</span><strong id="eod-total">0</strong></div><div><span>ELIGIBLE EOD HISTORY</span><strong id="eod-history-count">0</strong></div><div><span>QUALIFIED REFERENCE</span><strong id="eod-reference-count">0</strong></div><div><span>EOD CRITERIA MET</span><strong id="eod-match-count">0</strong></div><div><span>CRITERIA NOT MET</span><strong id="eod-fail-count">0</strong></div><div><span>INCOMPLETE / UNLOADED</span><strong id="eod-incomplete-count">0</strong></div></div>
+      <div class="eod-filters" aria-label="EOD research filters, separate from strategy and demo settings">
+        <label for="eod-max-price">Price strictly below ($)<input id="eod-max-price" type="number" value="5" min="0.000000000001" max="1000000" step="any"></label>
+        <label for="eod-min-change">EOD change at least (%)<input id="eod-min-change" type="number" value="3" min="-100" max="100000" step="any"></label>
+        <label for="eod-min-cap">Reference cap at least ($M)<input id="eod-min-cap" type="number" value="50" min="0" max="1000000000" step="any"></label>
+        <label for="eod-min-average">Previous 10-bar avg above<input id="eod-min-average" type="number" value="1000000" min="0" max="1000000000000000" step="any"></label>
+        <label for="eod-min-rvol">EOD relative volume at least<input id="eod-min-rvol" type="number" value="" placeholder="No minimum" min="0" max="1000000" step="any"></label>
+        <label class="eod-check" for="eod-require-cap"><input id="eod-require-cap" type="checkbox" checked>Require date-scoped market cap</label>
+        <div class="eod-filter-actions"><button id="eod-reset">Reset filters</button><button id="eod-loosen">Loosen filters</button><span>Research settings only · Frozen strategy and DEMO filters unchanged</span></div>
+      </div>
+      <p class="market-message" id="eod-filter-feedback" role="status" aria-live="polite"></p>
+      <div class="eod-table-tools"><label for="eod-search">Ticker search<input id="eod-search" type="search" maxlength="8" placeholder="Search watchlist"></label><label for="eod-sort">Sort<select id="eod-sort"><option value="change_pct">EOD change ↓</option><option value="price">Price ↑</option><option value="price_desc">Price ↓</option><option value="relative_volume">EOD relative volume ↓</option><option value="volume">Daily volume ↓</option><option value="market_cap">Reference cap ↓</option></select></label><label class="eod-check" for="eod-matches-only"><input id="eod-matches-only" type="checkbox">Show EOD criteria met only</label><span id="eod-visible-count" role="status" aria-live="polite"></span></div>
+      <div class="table-scroll eod-table-scroll" tabindex="0" aria-label="Real EOD watchlist results"><table class="eod-table"><caption>REAL END-OF-DAY RESEARCH — NOT LIVE MOMENTUM OR ENTRY SIGNALS</caption><thead><tr><th scope="col">Ticker</th><th scope="col">EOD close</th><th scope="col">Close-to-close %</th><th scope="col">Daily volume</th><th scope="col">Previous 10-bar avg</th><th scope="col">EOD rel vol</th><th scope="col">Reference cap ($)</th><th scope="col">Observation dates</th><th scope="col">Freshness</th><th scope="col">Assessment / coverage</th></tr></thead><tbody id="eod-rows"></tbody></table></div>
+      <p id="eod-empty" class="market-message" hidden>No rows match this view. Missing data never counts as passing. Review coverage or loosen research filters.</p>
+      <p id="eod-evaluated" class="market-message"></p>
+      <div class="market-preview-foot"><strong>ORIGINAL REQUIREMENTS UNVERIFIED:</strong> High / Very High volatility and ABCD setup qualification. No synthetic categories or scores are copied here. Independent dated records are not a synchronized snapshot. Market-cap source as-of time is unavailable. Missing sessions are not interpolated. Unloaded tickers have not been successfully scanned. No full-market coverage, intraday momentum, currentness or trading authority.</div>
     </section>
 
     <section class="lower-grid" aria-label="Demo trading history and system activity">

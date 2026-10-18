@@ -161,6 +161,12 @@ there is no broker connection or trading authority. See the guide for masked
 PowerShell credential entry, current provider terms and Windows validation.
 The [PRE1A timestamp compatibility repair](docs/velocity-market-data-pre1a.md)
 preserves endpoint-specific source timestamps; it adds no provider or broker requests.
+The [real EOD watchlist scanner](docs/velocity-market-data-pre2.md) calculates exact
+close-to-close change, previous ten-bar average volume and EOD relative volume from
+manually loaded history. Load date-scoped market-cap reference separately. Its
+one-to-five-ticker research filters are independent of DEMO and strategy rules;
+volatility/ABCD qualification and trading remain unavailable. Default startup is
+still offline DEMO; the existing preview flag enables only explicit manual loads.
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 

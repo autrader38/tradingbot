@@ -1,11 +1,13 @@
-"""Anonymous synthetic provider fixtures only; no real API credential or network.
+"""Offline synthetic fixtures and the public documented previous-day example.
 
-Fixture prices are invented test values, not claimed historical AAPL prices.
+The official sample retains documented source values, omitting its request ID.
+Other fixture prices are invented, not claimed historical AAPL prices. No key or
+real provider request is used.
 """
 
 import ast
 from contextlib import ExitStack
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, localcontext, Inexact, Rounded
 from http.client import HTTPConnection
@@ -26,12 +28,13 @@ from tradingbot_marketdata import massive, models, transport
 ROOT = Path(__file__).resolve().parents[1]
 PREVIOUS = (ROOT / 'tests/fixtures/massive_previous.json').read_bytes()
 HISTORY = (ROOT / 'tests/fixtures/massive_history.json').read_bytes()
+OFFICIAL_PREVIOUS = (ROOT / 'tests/fixtures/massive_previous_official_sample.json').read_bytes()
 NOW = datetime(2026, 10, 19, 16, tzinfo=timezone.utc)
 TEST_CREDENTIAL = 'SYNTHETIC_TEST_CREDENTIAL'
 
 
-def changed(*, field=None, value=None, root=None):
-    raw = json.loads(PREVIOUS)
+def changed(*, field=None, value=None, root=None, body=PREVIOUS):
+    raw = json.loads(body)
     if field is not None: raw['results'][0][field] = value
     if root: raw.update(root)
     return json.dumps(raw).encode()
@@ -61,6 +64,16 @@ class _Offline(unittest.TestCase):
 
 
 class ModelTests(_Offline):
+    def test_official_previous_day_example_accepts_exact_source_timestamp(self):
+        # Public Previous Day Bar docs; t is 16:00 ET, not ET midnight.
+        now = datetime(2020, 11, 11, 16, tzinfo=timezone.utc)
+        result = decode(OFFICIAL_PREVIOUS, now=now).payload(now)
+        self.assertEqual(result['state'], 'REAL END-OF-DAY')
+        bar = result['bars'][0]
+        self.assertEqual(bar['source_timestamp_ms'], 1605042000000)
+        self.assertEqual(bar['session_date'], '2020-11-10')
+        self.assertEqual(bar['close'], '115.97')
+
     def test_exact_source_values_and_dates(self):
         result = decode().payload(NOW)
         self.assertEqual(result['state'], 'REAL END-OF-DAY')
@@ -68,7 +81,8 @@ class ModelTests(_Offline):
         bar = result['bars'][0]
         self.assertEqual(bar['session_date'], '2026-10-16')
         self.assertEqual(bar['source_timestamp_ms'], 1792123200000)
-        self.assertEqual(bar['window_start_at'], '2026-10-16T04:00:00+00:00')
+        self.assertEqual(bar['source_at'], '2026-10-16T04:00:00+00:00')
+        self.assertIsNone(bar['window_start_at'])
         self.assertEqual(bar['open'], '120.00')
         self.assertEqual(bar['volume'], '1000001.0')
         self.assertFalse(result['demo'])
@@ -149,7 +163,7 @@ class ModelTests(_Offline):
     def test_naive_timestamp_rejected(self):
         with self.assertRaises(ValueError): decode(now=NOW.replace(tzinfo=None))
 
-    def test_daily_timestamp_must_be_et_midnight_on_weekday(self):
+    def test_daily_timestamp_rejects_unqualified_times_and_weekends(self):
         for stamp in (1792123200001, 1792137600000, 1792209600000):
             with self.subTest(stamp=stamp), self.assertRaises(ValueError): decode(changed(field='t', value=stamp))
 
@@ -198,6 +212,147 @@ class ModelTests(_Offline):
         with self.assertRaises(ValueError):decode(json.dumps(raw).encode())
 
 
+class TimestampCompatibilityTests(_Offline):
+    def test_official_timestamp_is_preserved_without_window_start_claim(self):
+        result = decode(OFFICIAL_PREVIOUS).payload(NOW)
+        bar = result['bars'][0]
+        self.assertEqual(bar['source_at'], '2020-11-10T21:00:00+00:00')
+        self.assertEqual(models._eastern(models._instant(bar['source_timestamp_ms'])).isoformat(),
+                         '2020-11-10T16:00:00-05:00')
+        self.assertIsNone(bar['window_start_at'])
+        self.assertIn('not asserted as window start', result['timestamp_semantics'])
+        self.assertIn('SOURCE_TIMESTAMP_IS_PROVIDER_PREVIOUS_DAY_TIMESTAMP', result['quality'])
+        self.assertNotIn('SOURCE_TIMESTAMP_IS_AGGREGATE_WINDOW_START', result['quality'])
+        self.assertEqual(result['state'], 'STALE')  # Old documentation is not current data.
+
+    def test_historical_midnight_metadata_remains_window_start(self):
+        result = decode(HISTORY, 'history').payload(NOW)
+        self.assertIn('SOURCE_TIMESTAMP_IS_AGGREGATE_WINDOW_START', result['quality'])
+        self.assertEqual(result['timestamp_semantics'], 'Aggregate window start; not economic event or receipt time')
+        for bar in result['bars']:
+            self.assertEqual(bar['source_at'], bar['window_start_at'])
+            self.assertEqual(models._eastern(models._instant(bar['source_timestamp_ms'])).hour, 0)
+
+    def test_previous_midnight_remains_compatible_but_has_conservative_label(self):
+        result = decode().payload(NOW)
+        self.assertEqual(result['bars'][0]['source_at'], '2026-10-16T04:00:00+00:00')
+        self.assertIsNone(result['bars'][0]['window_start_at'])
+        self.assertEqual(result['bars'][0]['session_date'], '2026-10-16')
+
+    def test_documented_previous_timestamp_is_not_accepted_as_historical_midnight(self):
+        with self.assertRaises(ValueError):
+            models._decode(OFFICIAL_PREVIOUS, 'AAPL', 'history', NOW,
+                           datetime(2020, 11, 1).date(), datetime(2020, 11, 30).date())
+
+    def test_previous_and_history_dst_weekday_boundaries(self):
+        for day, offset in (('2026-03-06', 5), ('2026-03-09', 4),
+                            ('2026-10-30', 4), ('2026-11-02', 5)):
+            for hour in (0, 16):
+                instant = datetime.fromisoformat(day).replace(hour=hour + offset, tzinfo=timezone.utc)
+                stamp = (instant - datetime(1970, 1, 1, tzinfo=timezone.utc)) // timedelta(milliseconds=1)
+                body = changed(field='t', value=stamp)
+                with self.subTest(day=day, hour=hour):
+                    bar = decode(body, now=instant + timedelta(days=1)).bars[0]
+                    self.assertEqual(bar.timestamp_ms, stamp)
+                    self.assertEqual(bar.session_date.isoformat(), day)
+                    self.assertEqual(models._eastern(instant).hour, hour)
+                    if hour == 0:
+                        history = models._decode(body, 'AAPL', 'history', instant + timedelta(days=1),
+                                                 instant.date(), instant.date())
+                        self.assertEqual(history.bars[0].timestamp_ms, stamp)
+                    else:
+                        with self.assertRaises(ValueError):
+                            models._decode(body, 'AAPL', 'history', instant + timedelta(days=1),
+                                           instant.date(), instant.date())
+
+    def test_arbitrary_previous_intraday_timestamps_stay_invalid(self):
+        # Neither a daytime bar, nor near-midnight/near-16:00, is qualified.
+        for delta in (-1, 1, 60_000, -60_000, 3_600_000, -3_600_000):
+            with self.subTest(delta=delta), self.assertRaises(ValueError):
+                decode(changed(body=OFFICIAL_PREVIOUS, field='t', value=1605042000000 + delta))
+
+    def test_midnight_validation_not_relaxed_on_either_endpoint(self):
+        for view in ('previous', 'history'):
+            for delta in (-1, 1, 3_600_000):
+                with self.subTest(view=view, delta=delta), self.assertRaises(ValueError):
+                    decode(changed(field='t', value=1792123200000 + delta), view)
+
+    def test_previous_weekend_at_16_remains_invalid(self):
+        for delta in (4, 5):  # Documentation sample is a Tuesday.
+            with self.subTest(delta=delta), self.assertRaises(ValueError):
+                decode(changed(body=OFFICIAL_PREVIOUS, field='t', value=1605042000000 + delta * 86_400_000))
+
+    def test_timestamp_type_and_range_validation_remain_strict(self):
+        for view in ('previous', 'history'):
+            for stamp in (None, True, False, '1605042000000', 1605042000000.0, -1, 0,
+                          1167609599999, 4102444800000, 10 ** 30):
+                with self.subTest(view=view, stamp=stamp), self.assertRaises(ValueError):
+                    decode(changed(field='t', value=stamp), view)
+
+    def test_previous_16_timestamp_in_future_rejected_even_on_same_session_date(self):
+        with self.assertRaises(ValueError):
+            decode(OFFICIAL_PREVIOUS, now=datetime(2020, 11, 10, 20, 59, 59, tzinfo=timezone.utc))
+
+    def test_previous_exact_now_does_not_establish_completed_eod(self):
+        now = datetime(2020, 11, 10, 21, tzinfo=timezone.utc)
+        result = decode(OFFICIAL_PREVIOUS, now=now).payload(now)
+        self.assertEqual(result['state'], 'DELAYED')
+        self.assertEqual(result['reason'], 'END_OF_DAY_NOT_ESTABLISHED')
+
+    def test_previous_decimal_shape_is_preserved_under_trapping_context(self):
+        body = OFFICIAL_PREVIOUS.replace(b'115.55', b'115.5500').replace(b'131704427', b'131704427.00')
+        with localcontext() as context:
+            context.prec = 2; context.traps[Inexact] = context.traps[Rounded] = True
+            bar = decode(body).payload(NOW)['bars'][0]
+        self.assertEqual(bar['open'], '115.5500')
+        self.assertEqual(bar['volume'], '131704427.00')
+
+    def test_official_sample_still_rejects_invalid_prices_and_volume(self):
+        for field, value in (('o', 0), ('h', 114), ('l', 118), ('c', 118), ('v', -1),
+                             ('o', True), ('c', '115.97'), ('v', 1e30)):
+            with self.subTest(field=field, value=value), self.assertRaises(ValueError):
+                decode(changed(body=OFFICIAL_PREVIOUS, field=field, value=value))
+
+    def test_official_sample_still_rejects_wrong_ticker_count_adjustment_and_status(self):
+        for root in ({'ticker': 'MSFT'}, {'resultsCount': True}, {'resultsCount': 0},
+                     {'resultsCount': 2}, {'adjusted': 'true'}, {'status': 'ERROR'},
+                     {'next_url': 'https://example.invalid/forbidden'}):
+            with self.subTest(root=root), self.assertRaises(ValueError):
+                decode(changed(body=OFFICIAL_PREVIOUS, root=root))
+
+    def test_official_missing_and_conflicting_adjustment_not_promoted(self):
+        for adjusted, reason in ((None, 'MISSING_SOURCE_FIELDS'), (False, 'ADJUSTMENT_MISMATCH')):
+            result = decode(changed(body=OFFICIAL_PREVIOUS, root={'adjusted': adjusted})).payload(NOW)
+            self.assertEqual(result['state'], 'UNAVAILABLE')
+            self.assertEqual(result['reason'], reason)
+
+    def test_official_missing_field_is_not_invented(self):
+        for field, name in zip(('o', 'h', 'l', 'c', 'v'), models._FIELDS):
+            result = decode(changed(body=OFFICIAL_PREVIOUS, field=field, value=None)).payload(NOW)
+            self.assertIsNone(result['bars'][0][name])
+            self.assertEqual(result['state'], 'UNAVAILABLE')
+            self.assertIn(name, result['missing_fields'])
+
+    def test_source_model_rejects_unknown_and_reconstructed_source_tags(self):
+        bar = decode().bars[0]
+        for source in (None, 'previous', 'history', True, object()):
+            with self.subTest(source=source), self.assertRaises(ValueError): replace(bar, source=source)
+
+    def test_series_cannot_relabel_a_previous_bar_as_history(self):
+        series = decode(OFFICIAL_PREVIOUS)
+        with self.assertRaises(ValueError): replace(series, source=models._DailySource.HISTORY)
+
+    def test_series_rejects_unknown_source_and_previous_multiple_bars(self):
+        series = decode()
+        with self.assertRaises(ValueError): replace(series, source='previous')
+        with self.assertRaises(ValueError):
+            replace(decode(HISTORY, 'history'), source=models._DailySource.PREVIOUS)
+
+    def test_unknown_view_cannot_select_a_more_permissive_timestamp_contract(self):
+        for view in (None, True, 'intraday', 'PREVIOUS', 'previous-day-bar'):
+            with self.subTest(view=view), self.assertRaises(ValueError): decode(OFFICIAL_PREVIOUS, view)
+
+
 def _bad_field(field, value):
     def test(self):
         with self.assertRaises((ValueError, TypeError)):
@@ -222,6 +377,29 @@ class AdapterTests(_Offline):
         self.read = self.stack.enter_context(patch.object(massive, '_read_response',
             return_value=(200, 'application/json; charset=utf-8', '', PREVIOUS)))
         self.preview = massive._MarketDataPreview(enabled=True)
+
+    def test_official_previous_example_publishes_and_caches_exact_timestamp(self):
+        self.read.return_value = (200, 'application/json', '', OFFICIAL_PREVIOUS)
+        now = datetime(2020, 11, 11, 16, tzinfo=timezone.utc)
+        with patch.object(massive, '_now', return_value=now):
+            first = self.preview.observe('AAPL', 'previous')
+            cached = self.preview.observe('AAPL', 'previous')
+        self.assertEqual(first['state'], 'REAL END-OF-DAY')
+        self.assertEqual(first['bars'][0]['source_at'], '2020-11-10T21:00:00+00:00')
+        self.assertIsNone(first['bars'][0]['window_start_at'])
+        self.assertEqual(first['source_endpoint'], 'previous-day-bar')
+        self.assertTrue(cached['cached'])
+        self.assertEqual(first['bars'], cached['bars'])
+        self.read.assert_called_once()
+        self.assertNotIn(TEST_CREDENTIAL, json.dumps(first))
+
+    def test_unqualified_previous_time_stays_sanitized_without_response_disclosure(self):
+        self.read.return_value = (200, 'application/json', '', changed(body=OFFICIAL_PREVIOUS,
+            field='t', value=1605042000001, root={'message': TEST_CREDENTIAL}))
+        result = self.preview.observe('AAPL', 'previous')
+        self.assertEqual(result, massive._unavailable('INVALID_RESPONSE', 60))
+        self.assertNotIn(TEST_CREDENTIAL, json.dumps(result))
+        self.assertNotIn('115.97', json.dumps(result))
 
     def test_constructor_import_configuration_and_default_never_request(self):
         self.preview.configuration(); massive._MarketDataPreview().configuration()
@@ -406,6 +584,18 @@ class PreviewHTTPTests(unittest.TestCase):
         self.assertEqual(headers['Content-Security-Policy'],_CSP)
         self.assertEqual(headers['Cache-Control'],'no-store');self.assertNotIn(TEST_CREDENTIAL.encode(),body)
 
+    def test_official_sample_over_loopback_keeps_accurate_source_metadata(self):
+        self.read.return_value = (200, 'application/json', '', OFFICIAL_PREVIOUS)
+        with patch.object(massive, '_now', return_value=datetime(2020, 11, 11, 16, tzinfo=timezone.utc)):
+            code, _, body = self.request('/api/market-data/observation?ticker=AAPL&view=previous',
+                                         headers={'X-Velocity-Market-Preview': '1'})
+        self.assertEqual(code, 200)
+        result = json.loads(body)
+        self.assertEqual(result['state'], 'REAL END-OF-DAY')
+        self.assertEqual(result['bars'][0]['source_at'], '2020-11-10T21:00:00+00:00')
+        self.assertIsNone(result['bars'][0]['window_start_at'])
+        self.assertNotIn(TEST_CREDENTIAL.encode(), body)
+
     def test_driveby_origin_fetch_site_missing_custom_header_rejected(self):
         for headers in ({},{'X-Velocity-Market-Preview':'1','Origin':'https://example.invalid'},
             {'X-Velocity-Market-Preview':'1','Sec-Fetch-Site':'cross-site'},
@@ -454,6 +644,9 @@ class PreviewStaticTests(unittest.TestCase):
         self.assertIn('X-Velocity-Market-Preview',text)
         self.assertIn('REAL END-OF-DAY',text)
         self.assertIn('DELAYED',text);self.assertIn('STALE',text);self.assertIn('UNAVAILABLE',text)
+        self.assertIn('Source timestamp: ${bar.source_at}', text)
+        self.assertNotIn('Source window start:', text)
+        self.assertIn('${result.timestamp_semantics}', text)
 
     def test_preview_launch_flag_does_not_make_request_and_demo_unchanged(self):
         server=Mock();server.serve_forever.side_effect=KeyboardInterrupt()
@@ -563,6 +756,21 @@ class PreviewBrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator('#chart-symbol').inner_text(),'ABCD')
         self.assertEqual(self.page.locator('#scanner-counts').inner_text(),'13 MATCHES / 24 SCANNED')
         self.assertFalse(self.page.locator('#real-history-wrap').is_visible())
+
+    def test_official_previous_day_example_displays_source_time_without_midnight_claim(self):
+        self.read.side_effect = None
+        self.read.return_value = (200, 'application/json', '', OFFICIAL_PREVIOUS)
+        with patch.object(massive, '_now', return_value=datetime(2020, 11, 11, 16, tzinfo=timezone.utc)):
+            server = self.open_page(); snapshot = server.snapshot_json
+            self.loaded()
+        provenance = self.page.locator('#market-provenance').inner_text()
+        self.assertIn('Source timestamp: 2020-11-10T21:00:00+00:00', provenance)
+        self.assertIn('not asserted as window start', provenance)
+        self.assertNotIn('Source window start:', provenance)
+        self.assertIn('Session 2020-11-10 ET', self.page.locator('#market-source').inner_text())
+        self.assertEqual(server.snapshot_json, snapshot)
+        self.assertEqual(self.page.locator('#chart-symbol').inner_text(), 'ABCD')
+        self.read.assert_called_once()
 
     def test_history_has_separate_real_canvas_source_table_and_no_demo_markers(self):
         self.open_page();self.loaded(button='market-load-history')

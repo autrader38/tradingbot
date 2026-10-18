@@ -59,7 +59,7 @@
       $('market-source').textContent = `${bar.ticker} · Massive · Session ${bar.session_date} ET · ${result.cached ? 'CACHED SOURCE' : 'PROVIDER RESPONSE'} · ${result.state}`;
       $('market-values').replaceChildren(...['open', 'high', 'low', 'close', 'volume'].flatMap((key) =>
         [node('dt', key === 'volume' ? 'DAILY VOLUME' : key.toUpperCase()), node('dd', bar[key] === null ? 'UNAVAILABLE' : bar[key])]));
-      $('market-provenance').textContent = `Source window start: ${bar.window_start_at} (${bar.source_timestamp_ms} ms). Retrieved: ${result.retrieved_at}. Split adjusted: ${result.adjusted_for_splits === null ? 'UNAVAILABLE' : String(result.adjusted_for_splits)}. Provider status: ${result.provider_status}. ${result.market_session}.`;
+      $('market-provenance').textContent = `Source timestamp: ${bar.source_at} (${bar.source_timestamp_ms} ms). ${result.timestamp_semantics}. Retrieved: ${result.retrieved_at}. Split adjusted: ${result.adjusted_for_splits === null ? 'UNAVAILABLE' : String(result.adjusted_for_splits)}. Provider status: ${result.provider_status}. ${result.market_session}.`;
       $('market-missing').textContent = `NOT A SCANNER RESULT · Missing qualification: ${result.missing_scanner_fields.map((field) => fieldLabels[field]).join(', ')}.${result.missing_fields.length ? ` Missing source: ${result.missing_fields.join(', ')}.` : ''}`;
       $('market-quality-list').replaceChildren(...result.quality.map((quality) => node('li', quality.replaceAll('_', ' '))));
       if (view === 'history' && ['REAL END-OF-DAY', 'DELAYED', 'STALE'].includes(result.state) && result.missing_fields.length === 0) {

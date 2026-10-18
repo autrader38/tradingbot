@@ -159,6 +159,8 @@ dates, quality, missing scanner fields and EOD/DELAYED/STALE/UNAVAILABLE states.
 The demo scanner and main chart remain separate. No credential goes to the browser;
 there is no broker connection or trading authority. See the guide for masked
 PowerShell credential entry, current provider terms and Windows validation.
+The [PRE1A timestamp compatibility repair](docs/velocity-market-data-pre1a.md)
+preserves endpoint-specific source timestamps; it adds no provider or broker requests.
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 

@@ -11,8 +11,7 @@ __all__ = ()
 
 _MISSING_SCANNER = ('market_cap', 'average_volume_10d', 'relative_volume',
                     'volatility', 'setup_score', 'intraday_price_change', 'ABCD_signal')
-_QUALITY = ('SOURCE_TIMESTAMP_IS_AGGREGATE_WINDOW_START',
-            'DAILY_ET_WINDOW_MAY_INCLUDE_EXTENDED_HOURS',
+_QUALITY = ('DAILY_ET_WINDOW_MAY_INCLUDE_EXTENDED_HOURS',
             'END_OF_DAY_IS_NOT_INTRADAY', 'RECENCY_IS_NOT_SESSION_COMPLETENESS',
             'NOT_A_SCANNER_RESULT_OR_TRADING_SIGNAL')
 _FIELDS = ('open', 'high', 'low', 'close', 'volume')
@@ -23,6 +22,11 @@ class _Availability(str, Enum):
     DELAYED = 'DELAYED'
     STALE = 'STALE'
     UNAVAILABLE = 'UNAVAILABLE'
+
+
+class _DailySource(str, Enum):
+    PREVIOUS = 'previous'
+    HISTORY = 'history'
 
 
 def _check(condition):
@@ -87,11 +91,16 @@ class _DailyBar:
     low: Decimal | None
     close: Decimal | None
     volume: Decimal | None
+    source: _DailySource
 
     def __post_init__(self):
         _ticker(self.ticker)
+        _check(type(self.source) is _DailySource)
         eastern = _eastern(_instant(self.timestamp_ms))
-        _check(eastern.hour == eastern.minute == eastern.second == eastern.microsecond == 0)
+        # The previous-day documentation includes a 16:00 ET source timestamp.
+        # Retain midnight compatibility there; custom daily bars stay midnight-only.
+        hours = (0, 16) if self.source is _DailySource.PREVIOUS else (0,)
+        _check(eastern.hour in hours and eastern.minute == eastern.second == eastern.microsecond == 0)
         _check(eastern.weekday() < 5)
         for field in _FIELDS:
             value = getattr(self, field)
@@ -110,7 +119,9 @@ class _DailyBar:
     def payload(self):
         self.__post_init__()
         return {'ticker': self.ticker, 'source_timestamp_ms': self.timestamp_ms,
-                'window_start_at': _instant(self.timestamp_ms).isoformat(),
+                'source_at': _instant(self.timestamp_ms).isoformat(),
+                'window_start_at': _instant(self.timestamp_ms).isoformat()
+                    if self.source is _DailySource.HISTORY else None,
                 'session_date': self.session_date.isoformat(),
                 **{field: None if getattr(self, field) is None else str(getattr(self, field))
                    for field in _FIELDS}}
@@ -122,14 +133,18 @@ class _DailySeries:
     bars: tuple[_DailyBar, ...]
     adjusted: bool | None
     delayed: bool
+    source: _DailySource
 
     def __post_init__(self):
         _ticker(self.ticker)
+        _check(type(self.source) is _DailySource)
         _check(self.adjusted is None or type(self.adjusted) is bool)
-        _check(type(self.delayed) is bool and type(self.bars) is tuple and len(self.bars) <= 64)
+        _check(type(self.delayed) is bool and type(self.bars) is tuple
+               and len(self.bars) <= (1 if self.source is _DailySource.PREVIOUS else 64))
         previous = 0
         for bar in self.bars:
-            _check(type(bar) is _DailyBar and bar.ticker == self.ticker and bar.timestamp_ms > previous)
+            _check(type(bar) is _DailyBar and bar.source is self.source
+                   and bar.ticker == self.ticker and bar.timestamp_ms > previous)
             bar.__post_init__()
             previous = bar.timestamp_ms
 
@@ -152,9 +167,14 @@ class _DailySeries:
                 'demo': False, 'adjusted_for_splits': self.adjusted,
                 'market_timezone': 'America/New_York',
                 'market_session': 'Provider daily ET aggregate; may include extended-hours qualifying trades',
-                'timestamp_semantics': 'Aggregate window start; not economic event or receipt time',
+                'timestamp_semantics': 'Aggregate window start; not economic event or receipt time'
+                    if self.source is _DailySource.HISTORY else
+                    'Provider previous-day timestamp; not asserted as window start, economic event or receipt time',
                 'age_calendar_days': age, 'missing_fields': missing,
-                'missing_scanner_fields': list(_MISSING_SCANNER), 'quality': list(_QUALITY),
+                'missing_scanner_fields': list(_MISSING_SCANNER),
+                'quality': ['SOURCE_TIMESTAMP_IS_AGGREGATE_WINDOW_START'
+                    if self.source is _DailySource.HISTORY else 'SOURCE_TIMESTAMP_IS_PROVIDER_PREVIOUS_DAY_TIMESTAMP',
+                    *_QUALITY],
                 'bars': [bar.payload() for bar in self.bars]}
 
 
@@ -172,7 +192,9 @@ def _constant(_):
 
 def _decode(body, ticker, view, now, start=None, end=None):
     _ticker(ticker)
-    _check(type(body) is bytes and len(body) <= 262144 and view in ('previous', 'history'))
+    _check(type(body) is bytes and len(body) <= 262144
+           and type(view) is str and view in ('previous', 'history'))
+    source = _DailySource(view)
     raw = json.loads(body.decode('utf-8'), parse_float=Decimal,
                      parse_constant=_constant, object_pairs_hook=_pairs)
     _check(type(raw) is dict and raw.get('ticker') == ticker and raw.get('status') in ('OK', 'DELAYED'))
@@ -187,8 +209,8 @@ def _decode(body, ticker, view, now, start=None, end=None):
         _check(type(row) is dict)
         values = [None if row.get(key) is None else _numeric(row[key], volume=key == 'v')
                   for key in ('o', 'h', 'l', 'c', 'v')]
-        bar = _DailyBar(ticker, row.get('t'), *values)
+        bar = _DailyBar(ticker, row.get('t'), *values, source)
         _check(_instant(bar.timestamp_ms) <= _utc(now))
         if view == 'history': _check(start <= bar.session_date <= end)
         bars.append(bar)
-    return _DailySeries(ticker, tuple(bars), adjusted, raw['status'] == 'DELAYED')
+    return _DailySeries(ticker, tuple(bars), adjusted, raw['status'] == 'DELAYED', source)

@@ -137,15 +137,20 @@ locks, callback ownership, persistence or SDK calls are involved.
 
 Validated observations retain ticker, exact source Unix-millisecond timestamp,
 source OHLCV, supplied-vs-missing fields and actual split-adjustment flag. UTC
-window-start and ET session date derive only from the documented daily timestamp.
-`retrieved_at` records local receipt/validation time separately. The provider's
-timestamp means **aggregate window start**, not trade time, close time or current
-intraday observation time. Daily aggregates may include extended-hours qualifying
-trades; they are not asserted to be regular-session-only or an atomic snapshot.
+`source_at` and ET session date derive from the unchanged source timestamp.
+`retrieved_at` records local receipt/validation time separately. Under the
+[PRE1A compatibility repair](velocity-market-data-pre1a.md), previous-day bars
+accept exact ET midnight or 16:00 timestamps. Their timestamp is preserved as a
+provider observation, with `window_start_at` null; it does not establish window
+start, economic event, regular-session close or receipt time. Custom historical
+daily bars retain ET-midnight window-start semantics. Daily aggregates may include
+extended-hours qualifying trades; they are not asserted to be regular-session-only
+or an atomic snapshot.
 
 ET interpretation uses explicit post-2007 US Eastern DST rules for modern dates,
 including the UTC transition instants. It needs no external Windows tzdata package.
-Only weekday ET-midnight daily windows are accepted. No exchange holiday calendar,
+Both endpoint policies require weekdays and exact zero minutes/seconds/milliseconds.
+Other intraday timestamps remain unsupported. No exchange holiday calendar,
 early-close inference, missing-bar interpolation or complete-history claim is made.
 
 Source ticker must match exactly, results counts must match, timestamps must
@@ -201,9 +206,10 @@ the key through the API. This preview is not authorized for hosting/redistributi
 
 ## Offline validation and Windows commands
 
-Tests use anonymous invented prices in provider-shaped JSON fixtures, never real
-API credentials. External sockets/DNS are blocked, transport reads mocked, and any
-available installed browser is constrained to an ephemeral loopback server. Tests
+Tests use anonymous invented prices in provider-shaped JSON fixtures and, since
+PRE1A, the public documented previous-day example with its request ID omitted;
+never real API credentials. External sockets/DNS are blocked, transport reads
+mocked, and any available installed browser is constrained to an ephemeral loopback server. Tests
 cover source/presence/Decimal/date/DST/quality, missing/delayed/stale/corrupt data,
 rate/backoff/cache/concurrency, all HTTP failures, credential non-disclosure,
 explicit opt-in and user loads, read policy and unchanged demo/safety state.
@@ -235,8 +241,12 @@ git status --short
 ```
 
 No actual key or provider API request is required to pass. These commands do not
-opt into market preview. Cloud validation does not establish Windows qualification;
-this phase still requires independent review and actual Windows validation.
+opt into market preview. The user subsequently reported PRE1 independent review
+and actual Windows qualification at `d78821ee25172f3683836980dc1599af802ed409`:
+191 focused tests OK, skipped=2; 8,456 full-suite tests OK, skipped=16; 150 Python
+files compiled, zero exits and clean synchronized refs. The PRE1A repair requires
+its own independent review and actual Windows validation; cloud checks do not
+establish that qualification.
 
 ## Preserved authority boundaries and remaining work
 

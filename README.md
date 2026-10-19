@@ -168,6 +168,18 @@ one-to-five-ticker research filters are independent of DEMO and strategy rules;
 volatility/ABCD qualification and trading remain unavailable. Default startup is
 still offline DEMO; the existing preview flag enables only explicit manual loads.
 
+The [EOD market discovery panel](docs/velocity-market-data-pre3.md) can now load one
+dated Massive grouped market summary on an explicit click, then filter/search/sort
+its validated preliminary candidates locally in pages of 50. Default price is
+strictly below $5; the optional same-day-volume heuristic is off at zero and is
+not the previous ten-day average rule. Select up to five discovered symbols for a
+visible session-only PRE2 research shortlist, then manually load history and dated
+reference separately. The configured watchlist and DEMO scanner stay unchanged.
+**PRELIMINARY EOD CANDIDATES — NOT FULLY QUALIFIED** is not a live signal or proof
+of complete U.S. coverage. No startup polling, automatic follow-up, persistence,
+commercial redistribution or trading authority. PRE3 still requires independent
+review and actual Windows qualification.
+
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 
 After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.

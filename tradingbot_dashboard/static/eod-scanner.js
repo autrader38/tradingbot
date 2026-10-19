@@ -157,12 +157,23 @@
   const localFailure = () => { $('eod-message').textContent = 'Local research evidence unavailable.'; };
   $('eod-recheck').addEventListener('click', () => refresh().catch(localFailure));
   document.addEventListener('velocity-market-data-loaded', () => refresh().catch(localFailure));
+  function researchSelection(config) {
+    const previous = $('eod-ticker').value;
+    $('eod-ticker').replaceChildren(...config.research_watchlist.map((ticker) => { const o = node('option', ticker); o.value = ticker; return o; }));
+    if (config.research_watchlist.includes(previous)) $('eod-ticker').value = previous;
+    $('eod-selection').textContent = config.session_shortlist.length
+      ? `SESSION DISCOVERY SHORTLIST: ${config.session_shortlist.join(', ')}. Original configured watchlist unchanged: ${config.watchlist.join(', ')}. Separate dated history/reference evidence is still required.`
+      : `CONFIGURED WATCHLIST: ${config.watchlist.join(', ')}. Discovery selection never loads data automatically.`;
+  }
+  document.addEventListener('velocity-research-selection', (event) => {
+    researchSelection(event.detail); refresh().catch(localFailure);
+  });
   async function start() {
     try {
       const response = await fetch('/api/market-data', {cache: 'no-store', credentials: 'omit', mode: 'same-origin'});
       if (!response.ok) throw new Error('unavailable');
       const config = await response.json(); ready = config.enabled === true && config.configured === true;
-      $('eod-ticker').replaceChildren(...config.watchlist.map((ticker) => { const o = node('option', ticker); o.value = ticker; return o; }));
+      researchSelection(config);
       $('eod-message').textContent = ready ? 'Manual loads only. Load one ticker’s history, then request its dated reference separately. The demo scanner is unchanged.' : messages[config.reason];
       await refresh();
     } catch { localFailure(); }

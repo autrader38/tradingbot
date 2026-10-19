@@ -18,6 +18,7 @@ _ASSETS = {'/': ('index.html', 'text/html; charset=utf-8'),
            '/app.js': ('app.js', 'text/javascript; charset=utf-8'),
            '/market-data.js': ('market-data.js', 'text/javascript; charset=utf-8'),
            '/eod-scanner.js': ('eod-scanner.js', 'text/javascript; charset=utf-8'),
+           '/market-discovery.js': ('market-discovery.js', 'text/javascript; charset=utf-8'),
            '/favicon.svg': ('favicon.svg', 'image/svg+xml; charset=utf-8')}
 _CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
         "img-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; "
@@ -85,6 +86,29 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(self.server.market_data.configuration())
         elif self.path == '/api/market-data/research':
             self._json(self.server.market_data.research())
+        elif self.path.partition('?')[0] == '/api/market-data/discovery':
+            try:
+                fields = self._query({'price', 'volume', 'search', 'sort', 'page'}, 256)
+                page = fields.get('page', '0')
+                if not page.isascii() or not page.isdigit() or len(page) > 3:
+                    raise ValueError('Invalid page')
+                self._json(self.server.market_data.discovery(max_price=fields.get('price', '5'),
+                    min_volume=fields.get('volume', '0'), search=fields.get('search', ''),
+                    sort=fields.get('sort', 'volume'), page=int(page)))
+            except ValueError:
+                self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_REQUEST', 'rows': []}, status=400)
+        elif self.path.partition('?')[0] in ('/api/market-data/discovery/load', '/api/market-data/shortlist'):
+            if not self._explicit_load(expected): return
+            try:
+                shortlist = self.path.partition('?')[0].endswith('/shortlist')
+                key = 'tickers' if shortlist else 'date'
+                fields = self._query({key}, 128)
+                if set(fields) != {key}: raise ValueError('Invalid selection')
+                result = self.server.market_data.select_research(tuple(fields[key].split(',')) if fields[key] else ()) if shortlist else \
+                    self.server.market_data.load_discovery(fields[key])
+                self._json(result)
+            except ValueError:
+                self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_REQUEST'}, status=400)
         elif self.path.partition('?')[0] == '/api/market-data/observation':
             if self.command == 'HEAD':
                 self._respond(405, 'text/plain; charset=utf-8', b'Explicit GET load required.\n', allow='GET')
@@ -103,7 +127,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if set(fields) != {'ticker', 'view'} or any(len(v) != 1 for v in fields.values()):
                     raise ValueError('Invalid query')
                 ticker, view = fields['ticker'][0], fields['view'][0]
-                if ticker not in self.server.market_data.configuration()['watchlist'] or view not in ('previous', 'history', 'reference'):
+                config = self.server.market_data.configuration()
+                if ticker not in config['watchlist'] + config['session_shortlist'] or view not in ('previous', 'history', 'reference'):
                     raise ValueError('Invalid query')
             except ValueError:
                 self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_REQUEST'}, status=400)
@@ -114,6 +139,25 @@ class _Handler(BaseHTTPRequestHandler):
             self._respond(200, mime, body)
         else:
             self._respond(404, 'text/plain; charset=utf-8', b'Not found.\n')
+
+    def _query(self, allowed, limit):
+        query = self.path.partition('?')[2]
+        if len(query) > limit: raise ValueError('Invalid query')
+        fields = parse_qs(query, strict_parsing=True, keep_blank_values=True, max_num_fields=len(allowed))
+        if not set(fields) <= allowed or any(len(v) != 1 for v in fields.values()):
+            raise ValueError('Invalid query')
+        return {key: value[0] for key, value in fields.items()}
+
+    def _explicit_load(self, expected):
+        if self.command != 'GET':
+            self._respond(405, 'text/plain; charset=utf-8', b'Explicit GET action required.\n', allow='GET')
+            return False
+        if (self.headers.get('X-Velocity-Market-Preview') != '1'
+            or self.headers.get('Origin') not in (None, f'http://{expected}')
+            or self.headers.get('Sec-Fetch-Site') not in (None, 'same-origin', 'none')):
+            self._json({'state': 'UNAVAILABLE', 'reason': 'EXPLICIT_LOCAL_LOAD_REQUIRED'}, status=403)
+            return False
+        return True
 
     def _json(self, payload, *, status=200):
         body = json.dumps(payload, allow_nan=False, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
@@ -127,7 +171,8 @@ class _Handler(BaseHTTPRequestHandler):
 
     def _not_allowed(self):
         self.close_connection = True
-        allow = 'GET' if self.path.partition('?')[0] == '/api/market-data/observation' else 'GET, HEAD'
+        allow = 'GET' if self.path.partition('?')[0] in ('/api/market-data/observation',
+            '/api/market-data/discovery/load', '/api/market-data/shortlist') else 'GET, HEAD'
         self._respond(405, 'text/plain; charset=utf-8', b'Read-only visual mode.\n', allow=allow)
 
     do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _not_allowed

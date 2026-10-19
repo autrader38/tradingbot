@@ -15,7 +15,8 @@ import time
 from .models import _decode, _eastern, _ticker, _utc, _watchlist
 from .reference import _TickerReference, _decode_reference
 from .research import _research_row
-from .transport import _read_response
+from .discovery import _DiscoveryFilters, _GroupedLimitError, _decode_grouped, _filter_decimal, _request_date
+from .transport import _read_response, _read_grouped_response
 
 __all__ = ()
 
@@ -69,7 +70,8 @@ def _unavailable(reason, retry_after=0):
 
 
 class _MarketDataPreview:
-    __slots__ = ('_enabled', '_watchlist', '_credential', '_cache', '_loaded', '_lock', '_active')
+    __slots__ = ('_enabled', '_watchlist', '_credential', '_cache', '_loaded', '_lock', '_active',
+                 '_discovery', '_discovery_cache', '_shortlist', '_shortlist_sources')
 
     def __init__(self, *, enabled=False, watchlist=_DEFAULT_WATCHLIST):
         if type(enabled) is not bool: raise ValueError('Invalid market preview configuration')
@@ -78,15 +80,22 @@ class _MarketDataPreview:
         self._credential = value if (type(value) is str and 1 <= len(value) <= 512
                                     and all(33 <= ord(char) <= 126 for char in value)) else None
         self._cache, self._loaded, self._lock, self._active = {}, {}, Lock(), False
+        self._discovery, self._discovery_cache = None, {}
+        self._shortlist, self._shortlist_sources = (), ()
 
     def __repr__(self):
         return '<MarketDataPreview read-only>'
 
     def configuration(self):
+        with self._lock:
+            shortlist, sources = self._shortlist, self._shortlist_sources
         return {'enabled': self._enabled, 'configured': self._credential is not None,
                 'state': 'UNAVAILABLE', 'reason': 'USER_LOAD_REQUIRED' if self._enabled and self._credential
                     else 'KEY_NOT_CONFIGURED' if self._enabled else 'PREVIEW_DISABLED',
                 'provider': 'Massive', 'watchlist': list(self._watchlist),
+                'research_watchlist': list(shortlist or self._watchlist),
+                'session_shortlist': list(shortlist),
+                'shortlist_sources': [{'ticker': ticker, 'discovery_date': observed} for ticker, observed in sources],
                 'maximum_requests_per_minute': 4, 'cache_seconds': 300,
                 'entitlement': 'Stocks Basic · end-of-day · not live',
                 'license_scope': 'Personal, non-professional, non-business use only'}
@@ -94,18 +103,127 @@ class _MarketDataPreview:
     def research(self):
         # Local immutable evidence only. Never requests data or inspects credentials.
         now = _utc(_now())
-        with self._lock: loaded = dict(self._loaded)
+        with self._lock:
+            loaded, watchlist = dict(self._loaded), self._shortlist or self._watchlist
+            shortlisted = bool(self._shortlist)
         rows = [_research_row(ticker, loaded.get((ticker, 'history')),
-                              loaded.get((ticker, 'reference')), now) for ticker in self._watchlist]
+                              loaded.get((ticker, 'reference')), now) for ticker in watchlist]
         return {'provider': 'Massive', 'demo': False, 'evaluated_at': now.isoformat(),
-                'watchlist_total': len(self._watchlist), 'rows': rows,
-                'scope': 'CONFIGURED_WATCHLIST_ONLY_NOT_FULL_MARKET',
+                'watchlist_total': len(watchlist), 'rows': rows,
+                'scope': 'SESSION_DISCOVERY_SHORTLIST' if shortlisted else 'CONFIGURED_WATCHLIST_ONLY_NOT_FULL_MARKET',
                 'full_strategy_qualification': 'NOT AVAILABLE'}
+
+    def select_research(self, tickers):
+        """Explicit, bounded session presentation selection. Never provider I/O."""
+        try:
+            if type(tickers) is not tuple or len(tickers) > 5 or len(set(tickers)) != len(tickers):
+                raise ValueError('Invalid shortlist')
+            for ticker in tickers: _ticker(ticker)
+            with self._lock:
+                if self._active: return _unavailable('REQUEST_IN_PROGRESS', 1)
+                if tickers:
+                    valid = dict(self._shortlist_sources)
+                    if self._discovery is not None:
+                        valid.update({row.ticker: self._discovery[0].requested_date.isoformat()
+                                      for row in self._discovery[0].rows})
+                    if not valid: return _unavailable('DISCOVERY_REQUIRED')
+                    if any(ticker not in valid for ticker in tickers): return _unavailable('INVALID_SHORTLIST')
+                self._shortlist = tickers
+                self._shortlist_sources = tuple((ticker, valid[ticker]) for ticker in tickers)
+                allowed = set(self._watchlist + tickers)
+                # Removed research selections cannot cause unbounded cache growth.
+                self._loaded = {key: value for key, value in self._loaded.items() if key[0] in allowed}
+                self._cache = {key: value for key, value in self._cache.items() if key[0] in allowed}
+            return {**self.configuration(), 'state': 'RESEARCH_SELECTION_UPDATED'}
+        except Exception:
+            return _unavailable('INVALID_SHORTLIST')
+
+    def discovery(self, *, max_price='5', min_volume='0', search='', sort='volume', page=0):
+        """Local filtering/pagination only, over the last validated response."""
+        try:
+            now = _utc(_now())
+            filters = _DiscoveryFilters(_filter_decimal(max_price), _filter_decimal(min_volume))
+            with self._lock: loaded = self._discovery
+            if loaded is None:
+                result = _unavailable('USER_LOAD_REQUIRED' if self._enabled and self._credential
+                                      else 'KEY_NOT_CONFIGURED' if self._enabled else 'PREVIEW_DISABLED')
+                result.update({'rows': [], 'requested_date': None})
+            else:
+                series, retrieved = loaded
+                if now < retrieved: raise ValueError('Invalid discovery time')
+                result = series.page(now, filters=filters, search=search, sort=sort, page=page)
+                result['retrieved_at'] = retrieved.isoformat()
+            today = _eastern(now).date()
+            suggested = today - timedelta(days=1)
+            while suggested.weekday() >= 5: suggested -= timedelta(days=1)
+            result.update({'earliest_date': (today - timedelta(days=730)).isoformat(),
+                           'latest_date': (today - timedelta(days=1)).isoformat(),
+                           'suggested_date': suggested.isoformat(), 'evaluated_at': now.isoformat(),
+                           'date_policy': 'PAST_ET_WEEKDAY_ONLY_NOT_A_HOLIDAY_OR_SESSION_CALENDAR'})
+            return result
+        except Exception:
+            return {**_unavailable('INVALID_DISCOVERY_FILTERS'), 'rows': []}
+
+    def load_discovery(self, date_text):
+        """One explicit grouped request, sharing the exact existing rate gate."""
+        try:
+            now, tick = _utc(_now()), time.monotonic()
+            requested = _request_date(date_text, now)
+            if not self._enabled: return _unavailable('PREVIEW_DISABLED')
+            if self._credential is None: return _unavailable('KEY_NOT_CONFIGURED')
+            with self._lock:
+                if self._active: return _unavailable('REQUEST_IN_PROGRESS', 1)
+                cached = self._discovery_cache.get(requested)
+                if cached and tick < cached[2] and now >= cached[1]:
+                    self._discovery = cached[:2]
+                    result = cached[0].page(now)
+                    result.update({'retrieved_at': cached[1].isoformat(), 'cached': True, 'retry_after_seconds': 0})
+                    return result
+                delay = _RATE.reserve(tick)
+                if delay: return _unavailable('RATE_LIMITED', delay)
+                self._active, self._discovery = True, None
+            try:
+                path = f'/v2/aggs/grouped/locale/us/market/stocks/{requested}?adjusted=true&include_otc=false'
+                code, content_type, retry_after, body = _read_grouped_response(path, self._credential)
+                retrieved = _utc(_now())
+                if retrieved < now: raise ValueError('Invalid discovery time')
+                if code != 200:
+                    delay = _retry_delay(retry_after, now) if code in (429, 503) else 300 if code in (401, 403) else 60
+                    _RATE.backoff(delay)
+                    reason = {401: 'AUTHENTICATION_FAILED', 403: 'ACCESS_DENIED', 404: 'NOT_FOUND',
+                              429: 'RATE_LIMITED'}.get(code, 'REDIRECT_REJECTED' if 300 <= code < 400 else 'PROVIDER_UNAVAILABLE')
+                    return _unavailable(reason, delay)
+                if type(content_type) is not str or content_type.split(';')[0].strip().lower() != 'application/json':
+                    raise ValueError('Invalid discovery content')
+                series = _decode_grouped(body, requested, retrieved)
+                result = series.page(retrieved)
+                with self._lock:
+                    self._discovery = (series, retrieved)
+                    self._discovery_cache = {requested: (series, retrieved, time.monotonic() + 300)}
+                result.update({'retrieved_at': retrieved.isoformat(), 'cached': False, 'retry_after_seconds': 0})
+                return result
+            except _GroupedLimitError:
+                _RATE.backoff(60)
+                return _unavailable('RESPONSE_LIMIT_EXCEEDED', 60)
+            except TimeoutError:
+                _RATE.backoff(15)
+                return _unavailable('TIMEOUT', 15)
+            except OSError:
+                _RATE.backoff(15)
+                return _unavailable('NETWORK_UNAVAILABLE', 15)
+            except Exception:
+                _RATE.backoff(60)
+                return _unavailable('INVALID_RESPONSE', 60)
+            finally:
+                with self._lock: self._active = False
+        except Exception:
+            return _unavailable('INVALID_REQUEST')
 
     def observe(self, ticker, view):
         try:
             _ticker(ticker)
-            if ticker not in self._watchlist or view not in ('previous', 'history', 'reference'):
+            with self._lock: allowed = self._watchlist + self._shortlist
+            if ticker not in allowed or view not in ('previous', 'history', 'reference'):
                 return _unavailable('INVALID_REQUEST')
             if not self._enabled: return _unavailable('PREVIEW_DISABLED')
             if self._credential is None: return _unavailable('KEY_NOT_CONFIGURED')
@@ -118,6 +236,7 @@ class _MarketDataPreview:
                 requested_date = history[0].bars[-1].session_date
             key = (ticker, view)
             with self._lock:
+                if ticker not in self._watchlist + self._shortlist: return _unavailable('INVALID_REQUEST')
                 if key in self._cache:
                     series, retrieved, expires = self._cache[key]
                     if tick < expires and (view != 'reference' or series.requested_date == requested_date):

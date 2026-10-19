@@ -26,6 +26,23 @@
     'ROOT_METADATA_INVALID', 'RESULT_COUNTS_INVALID', 'ROW_FIELDS_UNEXPECTED',
     'ROW_IDENTITY_INVALID', 'ROW_IDENTITY_DUPLICATE', 'ROW_OHLCV_INVALID',
     'ROW_TIMESTAMP_INVALID', 'ROW_METADATA_INVALID', 'VALIDATION_FAILED']);
+  const rootCategories = new Set(['TICKER', 'COUNT', 'NEXT_URL', 'REQUEST_ID_CAMEL',
+    'PAGINATION', 'MESSAGE', 'ERROR', 'OTHER']);
+  function rootFieldDetails(data) {
+    if (data.reason !== 'INVALID_RESPONSE' || data.diagnostic_code !== 'ROOT_FIELDS_UNEXPECTED') return '';
+    const fields = data.unexpected_root_fields;
+    if (!Array.isArray(fields) || fields.length < 1 || fields.length > 8) return '';
+    const seen = new Set(); let total = 0;
+    for (const field of fields) {
+      if (!field || typeof field !== 'object' || Array.isArray(field) || Object.keys(field).length !== 2
+          || !rootCategories.has(field.category) || seen.has(field.category)
+          || !Number.isInteger(field.count) || field.count < 1 || field.count > 12) return '';
+      if (field.category !== 'OTHER' && field.count !== 1) return '';
+      seen.add(field.category); total += field.count;
+    }
+    if (total > 12) return '';
+    return ` Unexpected root categories: ${fields.map((field) => `${field.category} (${field.count})`).join(', ')}.`;
+  }
   const local = (path, action = false) => fetch(path, {cache: 'no-store', credentials: 'omit', mode: 'same-origin',
     headers: action ? {'X-Velocity-Market-Preview': '1'} : {}}).then(async (r) => { if (!r.ok) throw new Error('local'); return r.json(); });
   let ready = false, busy = false, selecting = false, shortlist = [], page = 0, pages = 1, revision = 0;
@@ -142,7 +159,7 @@
       const data = await local(`/api/market-data/discovery/load?date=${encodeURIComponent(requested)}`, true);
       await refresh();
       const diagnostic = data.reason === 'INVALID_RESPONSE' && diagnostics.has(data.diagnostic_code)
-        ? ` Diagnostic: ${data.diagnostic_code}.` : '';
+        ? ` Diagnostic: ${data.diagnostic_code}.${rootFieldDetails(data)}` : '';
       $('discovery-message').textContent = `${requested}: ${reasons[data.reason] || 'Discovery unavailable.'}${diagnostic}${data.cached ? ' Five-minute cached response; no provider call.' : ''}${data.retry_after_seconds ? ` Retry after at least ${data.retry_after_seconds} seconds; manual retry only.` : ''}`;
     } catch { $('discovery-message').textContent = 'Local load unavailable. No raw provider details are displayed.'; }
     finally { busy = false; controls(); }

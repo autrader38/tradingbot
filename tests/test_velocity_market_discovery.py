@@ -525,6 +525,20 @@ class HTTPTests(unittest.TestCase):
         self.assertEqual(json.loads(self.request('/api/market-data/discovery')[2])['rows'],[])
         self.read.assert_called_once();self.old.assert_not_called()
 
+    def test_unexpected_root_names_publish_only_categories_and_bounded_counts(self):
+        self.read.return_value=(200,'application/json','',body(ticker=KEY,**{KEY:KEY}))
+        code,_,value=self.request('/api/market-data/discovery/load?date=2026-10-16',
+                                 headers={'X-Velocity-Market-Preview':'1'})
+        self.assertEqual(code,200)
+        result=json.loads(value)
+        self.assertEqual(result['diagnostic_code'],'ROOT_FIELDS_UNEXPECTED')
+        self.assertEqual(result['unexpected_root_fields'],[{'category':'TICKER','count':1},{'category':'OTHER','count':1}])
+        self.assertEqual(result['retry_after_seconds'],60)
+        self.assertLess(len(value),1024);self.assertNotIn(KEY.encode(),value)
+        for field in ('request_id','rows','received_rows','provider_results_count'):
+            self.assertNotIn(field,result)
+        self.read.assert_called_once();self.old.assert_not_called()
+
     def test_load_requires_explicit_header_same_origin_and_get(self):
         path='/api/market-data/discovery/load?date=2026-10-16'
         self.assertEqual(self.request(path)[0],403)
@@ -700,6 +714,40 @@ class BrowserTests(unittest.TestCase):
         message=self.page.locator('#discovery-message').inner_text()
         self.assertNotIn(KEY,message);self.assertNotIn('Diagnostic:',message)
         self.assertEqual(self.page.locator('#discovery-message svg').count(),0)
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
+
+    def test_all_root_categories_visible_but_no_names_values_or_partial_data(self):
+        raw=dict.fromkeys(('ticker','count','next_url','requestId','pagination','message','error'),KEY)
+        raw.update({KEY+str(index):KEY for index in range(5)})
+        self.read.return_value=(200,'application/json','',json.dumps(raw).encode())
+        self.open();self.page.locator('#discovery-load').click()
+        self.page.locator('#discovery-message').filter(has_text='Unexpected root categories:').wait_for()
+        message=self.page.locator('#discovery-message').inner_text()
+        for category in ('TICKER','COUNT','NEXT_URL','REQUEST_ID_CAMEL','PAGINATION','MESSAGE','ERROR'):
+            self.assertIn(f'{category} (1)',message)
+        self.assertIn('OTHER (5)',message);self.assertNotIn(KEY,message)
+        self.assertIn('Retry after at least 60 seconds; manual retry only.',message)
+        self.assertEqual(self.page.locator('#discovery-rows tr').count(),0)
+        self.read.assert_called_once();self.ticker_read.assert_not_called()
+
+    def test_malicious_or_unbounded_root_details_never_reach_display(self):
+        self.open()
+        payload={'reason':'INVALID_RESPONSE','diagnostic_code':'ROOT_FIELDS_UNEXPECTED','retry_after_seconds':60}
+        self.page.route('**/api/market-data/discovery/load?*',lambda route:route.fulfill(json=payload))
+        cases=([{'category':KEY+'<svg>','count':1}], [{'category':'OTHER','count':True}],
+               [{'category':'OTHER','count':0}], [{'category':'OTHER','count':13}],
+               [{'category':'OTHER','count':1.5}], [{'category':'TICKER','count':2}],
+               [{'category':'OTHER','count':1,'name':KEY}], [{'category':'OTHER','count':1}]*9,
+               [{'category':'TICKER','count':1},{'category':'TICKER','count':1}],
+               [{'category':'TICKER','count':1},{'category':'OTHER','count':12}],None,KEY)
+        for fields in cases:
+            payload['unexpected_root_fields']=fields
+            self.page.locator('#discovery-load').click()
+            self.page.locator('#discovery-message').filter(has_text='Retry after at least 60 seconds').wait_for()
+            message=self.page.locator('#discovery-message').inner_text()
+            self.assertIn('Diagnostic: ROOT_FIELDS_UNEXPECTED.',message)
+            self.assertNotIn('Unexpected root categories:',message);self.assertNotIn(KEY,message)
+            self.assertEqual(self.page.locator('#discovery-message svg').count(),0)
         self.read.assert_not_called();self.ticker_read.assert_not_called()
 
     def test_diagnostic_only_displayed_for_invalid_response(self):

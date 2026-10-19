@@ -16,7 +16,7 @@ from .models import _decode, _eastern, _ticker, _utc, _watchlist
 from .reference import _TickerReference, _decode_reference
 from .research import _research_row
 from .discovery import (_DiscoveryFilters, _GroupedLimitError, _GroupedDiagnostic,
-                        _GroupedValidationError, _grouped_diagnostic, _decode_grouped,
+                        _GroupedValidationError, _grouped_diagnostic, _grouped_root_fields, _decode_grouped,
                         _filter_decimal, _request_date)
 from .transport import _read_response, _read_grouped_response
 
@@ -216,7 +216,7 @@ class _MarketDataPreview:
             except Exception as error:
                 _RATE.backoff(60)
                 return {**_unavailable('INVALID_RESPONSE', 60),
-                        'diagnostic_code': _grouped_diagnostic(error)}
+                        'diagnostic_code': _grouped_diagnostic(error), **_grouped_root_fields(error)}
             finally:
                 with self._lock: self._active = False
         except Exception:

@@ -182,6 +182,11 @@ reported complete. [PRE3B safe rejection diagnostics](docs/velocity-market-data-
 adds fixed validation-stage codes without publishing raw responses or weakening
 the parser. The actual provider rejection remains unproven pending a later manual
 code report; PRE3B requires independent review and actual Windows qualification.
+The user subsequently confirmed `ROOT_FIELDS_UNEXPECTED`.
+[PRE3C root-field diagnostics](docs/velocity-market-data-pre3c.md) adds only fixed
+categories and bounded counts; extra fields still reject the entire response.
+The actual extra metadata remains unidentified until a later category report.
+PRE3C requires independent review and actual Windows qualification.
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 

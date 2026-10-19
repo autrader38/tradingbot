@@ -248,5 +248,146 @@ class StaticDiagnostics(unittest.TestCase):
         self.assertEqual(d._grouped_diagnostic(RuntimeError(KEY)), 'VALIDATION_FAILED')
 
 
+class RootFieldDiagnostics(Offline):
+    def fields(self, value):
+        with self.assertRaises(d._GroupedValidationError) as caught:
+            decode(value)
+        error = caught.exception
+        self.assertEqual(d._grouped_diagnostic(error), 'ROOT_FIELDS_UNEXPECTED')
+        payload = d._grouped_root_fields(error)
+        self.assertNotIn(KEY, json.dumps(payload))
+        self.assertNotIn(KEY, repr(error))
+        self.assertNotIn(KEY, repr(error.root_fields))
+        return payload['unexpected_root_fields']
+
+    def test_all_categories_and_multiple_unknown_keys_in_fixed_order(self):
+        # Twelve total root keys is the existing structural cap. No root status
+        # is needed to test rejection, which precedes status qualification.
+        raw = {name: KEY for name in ('ticker','count','next_url','requestId',
+                                      'pagination','message','error')}
+        raw.update({f'unknown_{index}': KEY for index in range(5)})
+        expected = [{'category': category.value, 'count': 5 if category is d._RootFieldCategory.OTHER else 1}
+                    for category in d._RootFieldCategory]
+        self.assertEqual(self.fields(json.dumps(raw).encode()), expected)
+        self.assertEqual(self.fields(json.dumps(dict(reversed(tuple(raw.items())))).encode()), expected)
+
+    def test_only_unknown_names_are_aggregated_not_echoed_or_fingerprinted(self):
+        raw = {KEY + str(index): KEY for index in range(12)}
+        self.assertEqual(self.fields(json.dumps(raw).encode()), [{'category':'OTHER','count':12}])
+
+    def test_values_do_not_influence_root_name_classification(self):
+        for value in (None, False, 0, KEY, [], 'not-a-ticker'):
+            self.assertEqual(self.fields(body(ticker=value)), [{'category':'TICKER','count':1}])
+
+    def test_escaped_key_uses_exact_decoded_name_only(self):
+        self.assertEqual(self.fields(b'{"\\u0074icker":"anonymous"}'), [{'category':'TICKER','count':1}])
+
+    def test_original_six_root_fields_and_success_are_unchanged(self):
+        self.assertEqual(d._ROOT_FIELDS, frozenset(('adjusted','queryCount','resultsCount','status','request_id','results')))
+        self.assertEqual(decode().received_count, 8)
+        self.assertEqual(d._grouped_root_fields(RuntimeError(KEY)), {})
+
+    def test_structure_limit_still_precedes_root_classification(self):
+        raw = {f'unknown_{index}': KEY for index in range(13)}
+        for value in (json.dumps(raw).encode(), body(ticker={'nested':KEY}), body(**{'X'*300:KEY})):
+            with self.assertRaises(d._GroupedValidationError) as caught:
+                decode(value)
+            self.assertEqual(d._grouped_diagnostic(caught.exception), 'JSON_STRUCTURE_INVALID')
+            self.assertEqual(d._grouped_root_fields(caught.exception), {})
+
+    def test_duplicate_root_keys_still_fail_structure_not_partial_classification(self):
+        with self.assertRaises(d._GroupedValidationError) as caught:
+            decode(b'{"ticker":1,"ticker":2}')
+        self.assertEqual(d._grouped_diagnostic(caught.exception), 'JSON_STRUCTURE_INVALID')
+        self.assertEqual(d._grouped_root_fields(caught.exception), {})
+
+    def test_invalid_substituted_details_are_omitted_at_publication(self):
+        category = d._RootFieldCategory
+        for fields in (None, [], ((KEY,1),), ((category.OTHER,True),), ((category.OTHER,0),),
+                       ((category.OTHER,-1),), ((category.OTHER,13),), ((category.TICKER,2),),
+                       ((category.OTHER,1),(category.OTHER,1)), ((category.OTHER,12),(category.TICKER,1)),
+                       ((category.TICKER,1),(category.OTHER,12)), ((category.OTHER,1,KEY),)):
+            error = d._GroupedValidationError(d._GroupedDiagnostic.ROOT_FIELDS_UNEXPECTED)
+            error.root_fields = fields
+            error.args = (KEY,)
+            self.assertEqual(d._grouped_root_fields(error), {})
+
+    def test_no_details_for_unrelated_diagnostic_or_foreign_error(self):
+        fields = ((d._RootFieldCategory.OTHER,1),)
+        error = d._GroupedValidationError(d._GroupedDiagnostic.ROW_FIELDS_UNEXPECTED, root_fields=fields)
+        self.assertEqual(error.root_fields, ())
+        error.root_fields = fields
+        self.assertEqual(d._grouped_root_fields(error), {})
+        error.diagnostic = KEY
+        self.assertEqual(d._grouped_root_fields(error), {})
+
+    def test_error_retains_only_immutable_categories_and_counts(self):
+        error = d._GroupedValidationError(d._GroupedDiagnostic.ROOT_FIELDS_UNEXPECTED,
+                                          root_fields=d._classify_root_fields({KEY,'ticker'}))
+        self.assertEqual(error.root_fields, ((d._RootFieldCategory.TICKER,1),(d._RootFieldCategory.OTHER,1)))
+        first = d._grouped_root_fields(error)
+        first['unexpected_root_fields'][0]['category'] = KEY
+        self.assertEqual(d._grouped_root_fields(error)['unexpected_root_fields'][0]['category'], 'TICKER')
+
+    def test_browser_and_python_root_category_sets_match(self):
+        source = (ROOT/'tradingbot_dashboard/static/market-discovery.js').read_text(encoding='utf-8')
+        values = ast.literal_eval(re.search(r'const rootCategories = new Set\((\[[\s\S]*?\])\);',source)[1])
+        self.assertEqual(values,[category.value for category in d._RootFieldCategory])
+        self.assertEqual(len(values),8)
+
+
+def root_field_case(name, expected):
+    def test(self):
+        self.assertEqual(self.fields(body(**{name: KEY})), [{'category':expected,'count':1}])
+    return test
+
+
+for name, expected in (('ticker','TICKER'),('count','COUNT'),('next_url','NEXT_URL'),
+                       ('requestId','REQUEST_ID_CAMEL'),('pagination','PAGINATION'),
+                       ('message','MESSAGE'),('error','ERROR')):
+    setattr(RootFieldDiagnostics,'test_closed_'+name,root_field_case(name,expected))
+for index, name in enumerate((KEY,'','\n'+KEY,'\u202e'+KEY,'<script>'+KEY+'</script>',
+                              'Authorization: Bearer '+KEY,'X'*240,'Ticker','TICKER','requestid','requestID')):
+    setattr(RootFieldDiagnostics,f'test_other_name_{index}',root_field_case(name,'OTHER'))
+
+
+class RootFieldPublication(Offline):
+    def setUp(self):
+        super().setUp()
+        self.stack.enter_context(patch.dict('os.environ', {'MASSIVE_API_KEY':KEY}))
+        self.stack.enter_context(patch.object(massive, '_now', return_value=NOW))
+        self.stack.enter_context(patch.object(massive.time, 'monotonic', return_value=1000.0))
+        self.stack.enter_context(patch.object(massive, '_RATE', massive._RateGate()))
+        self.read = self.stack.enter_context(patch.object(massive, '_read_grouped_response'))
+        self.old = self.stack.enter_context(patch.object(massive, '_read_response',side_effect=AssertionError('No chained calls')))
+        self.preview = massive._MarketDataPreview(enabled=True)
+
+    def test_bounded_output_no_partial_data_no_leakage_and_exact_manual_backoff(self):
+        raw = {KEY+str(index):KEY for index in range(12)}
+        self.read.return_value = (200,'application/json','',json.dumps(raw).encode())
+        original = build_demo_snapshot().to_payload()
+        result = self.preview.load_discovery('2026-10-16')
+        self.assertEqual(result, {'provider':'Massive','state':'UNAVAILABLE','reason':'INVALID_RESPONSE',
+            'demo':False,'bars':[],'retry_after_seconds':60,'diagnostic_code':'ROOT_FIELDS_UNEXPECTED',
+            'unexpected_root_fields':[{'category':'OTHER','count':12}]})
+        self.assertLess(len(json.dumps(result)),1024)
+        self.assertNotIn(KEY,json.dumps(result))
+        self.assertEqual(self.preview.discovery()['rows'],[])
+        self.assertEqual(build_demo_snapshot().to_payload(),original)
+        self.assertEqual(massive._RATE.blocked_until,1060.0)
+        self.assertEqual(self.preview.load_discovery('2026-10-16')['reason'],'RATE_LIMITED')
+        self.assertEqual(self.preview.observe('AAPL','history')['reason'],'RATE_LIMITED')
+        self.read.assert_called_once();self.old.assert_not_called()
+
+    def test_all_categories_fit_fixed_output_bound(self):
+        raw = dict.fromkeys(d._ROOT_FIELD_NAMES,KEY)
+        raw[KEY] = KEY
+        self.read.return_value = (200,'application/json','',json.dumps(raw).encode())
+        result = self.preview.load_discovery('2026-10-16')
+        self.assertEqual(len(result['unexpected_root_fields']),8)
+        self.assertLess(len(json.dumps(result)),1024)
+        self.assertNotIn(KEY,json.dumps(result))
+
+
 if __name__ == '__main__':
     unittest.main()

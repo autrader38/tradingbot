@@ -17,6 +17,7 @@ __all__ = ()
 _MAX_BODY = 8 * 1024 * 1024
 _MAX_ROWS = 30_000
 _PAGE_SIZE = 50
+_ROOT_FIELDS = frozenset(('adjusted', 'queryCount', 'resultsCount', 'status', 'request_id', 'results'))
 _MISSING = ('CLOSE_TO_CLOSE_CHANGE', 'PREVIOUS_TEN_BAR_AVERAGE_VOLUME',
             'EOD_RELATIVE_VOLUME', 'DATED_MARKET_CAP', 'VOLATILITY_CLASSIFICATION',
             'ABCD_SETUP', 'INSTRUMENT_CLASSIFICATION')
@@ -53,10 +54,55 @@ class _GroupedDiagnostic(Enum):
     VALIDATION_FAILED = 'VALIDATION_FAILED'
 
 
+class _RootFieldCategory(Enum):
+    TICKER = 'TICKER'
+    COUNT = 'COUNT'
+    NEXT_URL = 'NEXT_URL'
+    REQUEST_ID_CAMEL = 'REQUEST_ID_CAMEL'
+    PAGINATION = 'PAGINATION'
+    MESSAGE = 'MESSAGE'
+    ERROR = 'ERROR'
+    OTHER = 'OTHER'
+
+
+# Diagnostic labels only. None of these names becomes an accepted root field.
+_ROOT_FIELD_NAMES = {'ticker': _RootFieldCategory.TICKER, 'count': _RootFieldCategory.COUNT,
+                     'next_url': _RootFieldCategory.NEXT_URL, 'requestId': _RootFieldCategory.REQUEST_ID_CAMEL,
+                     'pagination': _RootFieldCategory.PAGINATION, 'message': _RootFieldCategory.MESSAGE,
+                     'error': _RootFieldCategory.ERROR}
+
+
+def _safe_root_fields(fields):
+    """Immutable enum/count pairs only; bounded by the existing 12-key JSON cap."""
+    if type(fields) is not tuple or not 1 <= len(fields) <= len(_RootFieldCategory): return ()
+    order, previous, total = tuple(_RootFieldCategory), -1, 0
+    for entry in fields:
+        if type(entry) is not tuple or len(entry) != 2: return ()
+        category, count = entry
+        if type(category) is not _RootFieldCategory or type(count) is not int or not 1 <= count <= 12: return ()
+        if category is not _RootFieldCategory.OTHER and count != 1: return ()
+        index = order.index(category)
+        if index <= previous: return ()
+        previous, total = index, total + count
+    return fields if total <= 12 else ()
+
+
+def _classify_root_fields(keys):
+    # Read field names only, never their values; unknown names are not retained,
+    # echoed or fingerprinted. Ordering is fixed, independent of response order.
+    _check(type(keys) is set and 1 <= len(keys) <= 12)
+    counts = dict.fromkeys(_RootFieldCategory, 0)
+    for key in keys:
+        _check(type(key) is str)
+        counts[_ROOT_FIELD_NAMES.get(key, _RootFieldCategory.OTHER)] += 1
+    return tuple((category, count) for category, count in counts.items() if count)
+
+
 class _GroupedValidationError(ValueError):
-    """Carries only a closed stage category, never provider values or messages."""
-    def __init__(self, diagnostic):
+    """Closed categories/counts only, never provider values, raw names or messages."""
+    def __init__(self, diagnostic, *, root_fields=()):
         self.diagnostic = diagnostic if type(diagnostic) is _GroupedDiagnostic else _GroupedDiagnostic.VALIDATION_FAILED
+        self.root_fields = _safe_root_fields(root_fields) if self.diagnostic is _GroupedDiagnostic.ROOT_FIELDS_UNEXPECTED else ()
         super().__init__('Grouped response failed validation')
 
 
@@ -65,6 +111,13 @@ def _grouped_diagnostic(error):
     # cannot turn exception text, arguments or arbitrary attributes into JSON.
     value = getattr(error, 'diagnostic', None) if type(error) is _GroupedValidationError else None
     return value.value if type(value) is _GroupedDiagnostic else _GroupedDiagnostic.VALIDATION_FAILED.value
+
+
+def _grouped_root_fields(error):
+    if type(error) is not _GroupedValidationError or _grouped_diagnostic(error) != 'ROOT_FIELDS_UNEXPECTED': return {}
+    fields = _safe_root_fields(getattr(error, 'root_fields', None))
+    if not fields: return {}
+    return {'unexpected_root_fields': [{'category': category.value, 'count': count} for category, count in fields]}
 
 
 @contextmanager
@@ -264,7 +317,10 @@ def _decode_grouped(body, requested_date, now):
     with _validation_stage(_GroupedDiagnostic.JSON_STRUCTURE_INVALID):
         _check(type(raw) is dict)
     with _validation_stage(_GroupedDiagnostic.ROOT_FIELDS_UNEXPECTED):
-        _check(set(raw) <= {'adjusted', 'queryCount', 'resultsCount', 'status', 'request_id', 'results'})
+        unexpected = set(raw) - _ROOT_FIELDS
+        if unexpected:
+            raise _GroupedValidationError(_GroupedDiagnostic.ROOT_FIELDS_UNEXPECTED,
+                                          root_fields=_classify_root_fields(unexpected))
     with _validation_stage(_GroupedDiagnostic.ROOT_STATUS_INVALID):
         _check(raw.get('status') == 'OK')
     with _validation_stage(_GroupedDiagnostic.ROOT_ADJUSTMENT_INVALID):

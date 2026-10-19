@@ -526,7 +526,7 @@ class HTTPTests(unittest.TestCase):
 class StaticTests(unittest.TestCase):
     def test_pure_calculations_and_reference_parser_have_no_io_or_broker_imports(self):
         for name in ('research.py','reference.py'):
-            tree=ast.parse((ROOT/'tradingbot_marketdata'/name).read_text())
+            tree=ast.parse((ROOT/'tradingbot_marketdata'/name).read_text(encoding='utf-8'))
             for node in ast.walk(tree):
                 if isinstance(node,ast.Import):modules=[n.name for n in node.names]
                 elif isinstance(node,ast.ImportFrom):modules=[node.module or '']
@@ -535,14 +535,14 @@ class StaticTests(unittest.TestCase):
                 if isinstance(node,ast.Call) and isinstance(node.func,ast.Attribute):self.assertNotIn(node.func.attr,('now','today','connect','request','write'))
 
     def test_frontend_is_local_only_has_no_persistence_order_api_or_auto_polling(self):
-        text=(ROOT/'tradingbot_dashboard/static/eod-scanner.js').read_text()
+        text=(ROOT/'tradingbot_dashboard/static/eod-scanner.js').read_text(encoding='utf-8')
         for forbidden in ('https://','api.massive.com','Bearer','MASSIVE_API_KEY','localStorage','sessionStorage',
                           'setInterval','setTimeout','WebSocket','innerHTML','placeOrder','cancelOrder','document.cookie'):
             self.assertNotIn(forbidden,text)
         self.assertIn('BigInt',text);self.assertIn('X-Velocity-Market-Preview',text)
 
     def test_real_panel_preserves_separate_demo_and_unqualified_strategy(self):
-        html=(ROOT/'tradingbot_dashboard/static/index.html').read_text()
+        html=(ROOT/'tradingbot_dashboard/static/index.html').read_text(encoding='utf-8')
         for marker in ('Real EOD Watchlist Scanner','FULL STRATEGY QUALIFICATION: NOT AVAILABLE',
                        'DEMO MARKET DATA — NO LIVE FEED','High / Very High volatility and ABCD setup qualification',
                        'TRADING BLOCKED','READ-ONLY REQUIRED'):

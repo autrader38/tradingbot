@@ -149,8 +149,10 @@ class SourceTests(Offline):
             self.assertEqual(result['excluded_unsupported'],1); self.assertEqual(result['rows'],[])
 
     def test_invalid_utf8_duplicate_keys_nonfinite_nested_trailing_and_truncated_json(self):
+        complete = FIXTURE.rstrip()
+        self.assertTrue(complete.endswith(b'}'))
         for value in (b'\xff', b'{"status":"OK","status":"OK"}', b'{"status":NaN}',
-                      b'{"status":Infinity}', b'{"status":{"nested":{"bad":[]}}}', FIXTURE+b'x', FIXTURE[:-2]):
+                      b'{"status":Infinity}', b'{"status":{"nested":{"bad":[]}}}', FIXTURE+b'x', complete[:-1]):
             with self.subTest(value=value[:30]), self.assertRaises((ValueError,UnicodeError)):
                 decode(value)
 
@@ -380,7 +382,9 @@ class AdapterTests(Offline):
 
     def test_invalid_response_cannot_publish_partial_or_previous_market_as_new_date(self):
         self.load();self.tick.return_value+=400
-        self.read.return_value=(200,'application/json','',FIXTURE[:-3])
+        complete = FIXTURE.rstrip()
+        self.assertTrue(complete.endswith(b'}'))
+        self.read.return_value=(200,'application/json','',complete[:-1])
         self.assertEqual(self.load()['reason'],'INVALID_RESPONSE');self.assertEqual(self.preview.discovery()['rows'],[])
 
     def test_shortlist_requires_valid_discovered_tickers_distinct_and_five_max(self):

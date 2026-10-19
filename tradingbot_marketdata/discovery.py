@@ -17,7 +17,7 @@ __all__ = ()
 _MAX_BODY = 8 * 1024 * 1024
 _MAX_ROWS = 30_000
 _PAGE_SIZE = 50
-_ROOT_FIELDS = frozenset(('adjusted', 'queryCount', 'resultsCount', 'status', 'request_id', 'results'))
+_ROOT_FIELDS = frozenset(('adjusted', 'queryCount', 'resultsCount', 'count', 'status', 'request_id', 'results'))
 _MISSING = ('CLOSE_TO_CLOSE_CHANGE', 'PREVIOUS_TEN_BAR_AVERAGE_VOLUME',
             'EOD_RELATIVE_VOLUME', 'DATED_MARKET_CAP', 'VOLATILITY_CLASSIFICATION',
             'ABCD_SETUP', 'INSTRUMENT_CLASSIFICATION')
@@ -56,7 +56,6 @@ class _GroupedDiagnostic(Enum):
 
 class _RootFieldCategory(Enum):
     TICKER = 'TICKER'
-    COUNT = 'COUNT'
     NEXT_URL = 'NEXT_URL'
     REQUEST_ID_CAMEL = 'REQUEST_ID_CAMEL'
     PAGINATION = 'PAGINATION'
@@ -66,7 +65,7 @@ class _RootFieldCategory(Enum):
 
 
 # Diagnostic labels only. None of these names becomes an accepted root field.
-_ROOT_FIELD_NAMES = {'ticker': _RootFieldCategory.TICKER, 'count': _RootFieldCategory.COUNT,
+_ROOT_FIELD_NAMES = {'ticker': _RootFieldCategory.TICKER,
                      'next_url': _RootFieldCategory.NEXT_URL, 'requestId': _RootFieldCategory.REQUEST_ID_CAMEL,
                      'pagination': _RootFieldCategory.PAGINATION, 'message': _RootFieldCategory.MESSAGE,
                      'error': _RootFieldCategory.ERROR}
@@ -328,6 +327,11 @@ def _decode_grouped(body, requested_date, now):
     count = raw.get('resultsCount')
     with _validation_stage(_GroupedDiagnostic.RESULT_COUNTS_INVALID):
         _check(type(count) is int and count >= 0)
+        if 'count' in raw:
+            reported_count = raw['count']
+            _check(type(reported_count) is int and 0 <= reported_count <= _MAX_ROWS
+                   and reported_count == count)
+            # Actual received length must independently equal resultsCount below.
     if count > _MAX_ROWS: raise _GroupedLimitError()
     query_count = raw.get('queryCount')
     with _validation_stage(_GroupedDiagnostic.RESULT_COUNTS_INVALID):

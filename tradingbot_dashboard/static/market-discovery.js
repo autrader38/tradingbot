@@ -26,12 +26,12 @@
     'ROOT_METADATA_INVALID', 'RESULT_COUNTS_INVALID', 'ROW_FIELDS_UNEXPECTED',
     'ROW_IDENTITY_INVALID', 'ROW_IDENTITY_DUPLICATE', 'ROW_OHLCV_INVALID',
     'ROW_TIMESTAMP_INVALID', 'ROW_METADATA_INVALID', 'VALIDATION_FAILED']);
-  const rootCategories = new Set(['TICKER', 'COUNT', 'NEXT_URL', 'REQUEST_ID_CAMEL',
+  const rootCategories = new Set(['TICKER', 'NEXT_URL', 'REQUEST_ID_CAMEL',
     'PAGINATION', 'MESSAGE', 'ERROR', 'OTHER']);
   function rootFieldDetails(data) {
     if (data.reason !== 'INVALID_RESPONSE' || data.diagnostic_code !== 'ROOT_FIELDS_UNEXPECTED') return '';
     const fields = data.unexpected_root_fields;
-    if (!Array.isArray(fields) || fields.length < 1 || fields.length > 8) return '';
+    if (!Array.isArray(fields) || fields.length < 1 || fields.length > 7) return '';
     const seen = new Set(); let total = 0;
     for (const field of fields) {
       if (!field || typeof field !== 'object' || Array.isArray(field) || Object.keys(field).length !== 2

@@ -10,7 +10,7 @@ from unittest.mock import Mock, patch
 
 from tradingbot_dashboard.demo_data import build_demo_snapshot
 from tradingbot_marketdata import discovery as d, massive, transport
-from tests.test_velocity_market_discovery import FIXTURE, NOW, DAY, KEY, ROOT, body, decode
+from tests.test_velocity_market_discovery import FIXTURE, NOW, DAY, KEY, ROOT, body, decode, large_body
 
 
 def row_body(**fields):
@@ -263,10 +263,10 @@ class RootFieldDiagnostics(Offline):
     def test_all_categories_and_multiple_unknown_keys_in_fixed_order(self):
         # Twelve total root keys is the existing structural cap. No root status
         # is needed to test rejection, which precedes status qualification.
-        raw = {name: KEY for name in ('ticker','count','next_url','requestId',
+        raw = {name: KEY for name in ('ticker','next_url','requestId',
                                       'pagination','message','error')}
-        raw.update({f'unknown_{index}': KEY for index in range(5)})
-        expected = [{'category': category.value, 'count': 5 if category is d._RootFieldCategory.OTHER else 1}
+        raw.update({f'unknown_{index}': KEY for index in range(6)})
+        expected = [{'category': category.value, 'count': 6 if category is d._RootFieldCategory.OTHER else 1}
                     for category in d._RootFieldCategory]
         self.assertEqual(self.fields(json.dumps(raw).encode()), expected)
         self.assertEqual(self.fields(json.dumps(dict(reversed(tuple(raw.items())))).encode()), expected)
@@ -282,8 +282,8 @@ class RootFieldDiagnostics(Offline):
     def test_escaped_key_uses_exact_decoded_name_only(self):
         self.assertEqual(self.fields(b'{"\\u0074icker":"anonymous"}'), [{'category':'TICKER','count':1}])
 
-    def test_original_six_root_fields_and_success_are_unchanged(self):
-        self.assertEqual(d._ROOT_FIELDS, frozenset(('adjusted','queryCount','resultsCount','status','request_id','results')))
+    def test_only_count_added_to_original_root_allowlist(self):
+        self.assertEqual(d._ROOT_FIELDS, frozenset(('adjusted','queryCount','resultsCount','count','status','request_id','results')))
         self.assertEqual(decode().received_count, 8)
         self.assertEqual(d._grouped_root_fields(RuntimeError(KEY)), {})
 
@@ -333,7 +333,7 @@ class RootFieldDiagnostics(Offline):
         source = (ROOT/'tradingbot_dashboard/static/market-discovery.js').read_text(encoding='utf-8')
         values = ast.literal_eval(re.search(r'const rootCategories = new Set\((\[[\s\S]*?\])\);',source)[1])
         self.assertEqual(values,[category.value for category in d._RootFieldCategory])
-        self.assertEqual(len(values),8)
+        self.assertEqual(len(values),7)
 
 
 def root_field_case(name, expected):
@@ -342,7 +342,7 @@ def root_field_case(name, expected):
     return test
 
 
-for name, expected in (('ticker','TICKER'),('count','COUNT'),('next_url','NEXT_URL'),
+for name, expected in (('ticker','TICKER'),('next_url','NEXT_URL'),
                        ('requestId','REQUEST_ID_CAMEL'),('pagination','PAGINATION'),
                        ('message','MESSAGE'),('error','ERROR')):
     setattr(RootFieldDiagnostics,'test_closed_'+name,root_field_case(name,expected))
@@ -356,7 +356,7 @@ class RootFieldPublication(Offline):
         super().setUp()
         self.stack.enter_context(patch.dict('os.environ', {'MASSIVE_API_KEY':KEY}))
         self.stack.enter_context(patch.object(massive, '_now', return_value=NOW))
-        self.stack.enter_context(patch.object(massive.time, 'monotonic', return_value=1000.0))
+        self.tick = self.stack.enter_context(patch.object(massive.time, 'monotonic', return_value=1000.0))
         self.stack.enter_context(patch.object(massive, '_RATE', massive._RateGate()))
         self.read = self.stack.enter_context(patch.object(massive, '_read_grouped_response'))
         self.old = self.stack.enter_context(patch.object(massive, '_read_response',side_effect=AssertionError('No chained calls')))
@@ -384,9 +384,145 @@ class RootFieldPublication(Offline):
         raw[KEY] = KEY
         self.read.return_value = (200,'application/json','',json.dumps(raw).encode())
         result = self.preview.load_discovery('2026-10-16')
-        self.assertEqual(len(result['unexpected_root_fields']),8)
+        self.assertEqual(len(result['unexpected_root_fields']),7)
         self.assertLess(len(json.dumps(result)),1024)
         self.assertNotIn(KEY,json.dumps(result))
+
+    def test_valid_count_one_manual_request_and_cache_without_extra_quota(self):
+        self.read.return_value = (200,'application/json','',body(count=8))
+        result = self.preview.load_discovery('2026-10-16')
+        self.assertEqual((result['provider_results_count'],result['received_rows']), (8,8))
+        self.assertNotIn('diagnostic_code',result)
+        self.assertNotIn('count',result)
+        self.assertNotIn(KEY,json.dumps(result))
+        with patch.object(massive._RATE,'reserve',side_effect=AssertionError('No quota for cache hit')):
+            self.assertTrue(self.preview.load_discovery('2026-10-16')['cached'])
+        self.assertEqual(self.preview.observe('AAPL','history')['reason'],'RATE_LIMITED')
+        self.assertEqual(tuple(massive._RATE.attempts),(1000.0,))
+        self.assertEqual(massive._RATE.blocked_until,0)
+        self.read.assert_called_once();self.old.assert_not_called()
+
+    def test_invalid_count_sanitized_with_exact_existing_manual_backoff(self):
+        self.read.return_value = (200,'application/json','',body(count=KEY,request_id=KEY))
+        original = build_demo_snapshot().to_payload()
+        result = self.preview.load_discovery('2026-10-16')
+        self.assertEqual(result, {'provider':'Massive','state':'UNAVAILABLE','reason':'INVALID_RESPONSE',
+            'demo':False,'bars':[],'retry_after_seconds':60,'diagnostic_code':'RESULT_COUNTS_INVALID'})
+        self.assertNotIn(KEY,json.dumps(result))
+        self.assertEqual(self.preview.discovery()['rows'],[])
+        self.assertEqual(build_demo_snapshot().to_payload(),original)
+        self.assertEqual(massive._RATE.blocked_until,1060.0)
+        self.assertEqual(self.preview.load_discovery('2026-10-16')['reason'],'RATE_LIMITED')
+        self.assertEqual(self.preview.observe('AAPL','history')['reason'],'RATE_LIMITED')
+        self.read.assert_called_once();self.old.assert_not_called()
+
+    def test_bad_count_cannot_republish_old_success_or_partial_rows(self):
+        self.read.return_value = (200,'application/json','',body(count=8))
+        self.preview.load_discovery('2026-10-16')
+        self.tick.return_value += 400
+        self.read.return_value = (200,'application/json','',body(count=7))
+        result = self.preview.load_discovery('2026-10-16')
+        self.assertEqual(result['diagnostic_code'],'RESULT_COUNTS_INVALID')
+        self.assertEqual(result['retry_after_seconds'],60)
+        self.assertEqual(self.preview.discovery()['rows'],[])
+        for field in ('rows','received_rows','provider_results_count','unexpected_root_fields'):
+            self.assertNotIn(field,result)
+        self.assertEqual(self.read.call_count,2);self.old.assert_not_called()
+
+
+class OptionalCountTests(Offline):
+    def test_valid_optional_count_and_missing_count_publish_identical_evidence(self):
+        original, compatible = decode(), decode(body(count=8))
+        self.assertEqual(original, compatible)
+        self.assertEqual(original.page(NOW), compatible.page(NOW))
+        self.assertEqual(compatible.rows[0].close.as_tuple(), original.rows[0].close.as_tuple())
+
+    def test_zero_count_zero_rows_and_optional_absent_results(self):
+        for value in (body([],count=0), b'{"status":"OK","adjusted":true,"resultsCount":0,"count":0}'):
+            result = decode(value).page(NOW)
+            self.assertEqual(result['received_rows'],0)
+            self.assertEqual(result['reason'],'NO_SUPPORTED_DAILY_OBSERVATIONS')
+            self.assertEqual(result['rows'],[])
+
+    def test_exact_maximum_count_and_received_rows(self):
+        raw = json.loads(large_body(d._MAX_ROWS))
+        raw['count'] = d._MAX_ROWS
+        result = decode(json.dumps(raw).encode()).page(NOW)
+        self.assertEqual(result['received_rows'],30000)
+        self.assertEqual(result['validated_rows'],30000)
+        self.assertEqual(len(result['rows']),50)
+
+    def test_query_count_has_separate_unchanged_validation(self):
+        for query in (None,0,1,9,30000):
+            result = decode(body(count=8,queryCount=query))
+            self.assertEqual(result.received_count,8)
+            self.assertEqual(result.query_count,query)
+        for query in (True,-1,30001,'8'):
+            with self.assertRaises(d._GroupedValidationError) as caught:
+                decode(body(count=8,queryCount=query))
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'RESULT_COUNTS_INVALID')
+
+    def test_count_must_match_both_results_count_and_actual_received_length(self):
+        for count, results in ((7,8),(8,7),(7,7),(9,9),(0,8)):
+            with self.assertRaises(d._GroupedValidationError) as caught:
+                decode(body(count=count,resultsCount=results))
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'RESULT_COUNTS_INVALID')
+
+    def test_count_is_received_count_not_supported_or_filtered_candidate_count(self):
+        original = decode().page(NOW)
+        self.assertEqual((original['received_rows'],original['validated_rows'],original['eligible_candidates']),(8,6,5))
+        for count in (6,5):
+            with self.assertRaises(d._GroupedValidationError) as caught:
+                decode(body(count=count))
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'RESULT_COUNTS_INVALID')
+
+    def test_count_with_remaining_unknown_fields_still_rejected_and_classified(self):
+        for count in (8,None,KEY):
+            with self.assertRaises(d._GroupedValidationError) as caught:
+                decode(body(count=count,next_url=KEY,**{KEY:KEY}))
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'ROOT_FIELDS_UNEXPECTED')
+            payload = d._grouped_root_fields(caught.exception)
+            self.assertEqual(payload,{'unexpected_root_fields':[{'category':'NEXT_URL','count':1},{'category':'OTHER','count':1}]})
+            self.assertNotIn(KEY,json.dumps(payload))
+
+    def test_integer_lexemes_only_not_decimal_or_exponent(self):
+        for value in (b'8.0',b'8e0',b'8E+0'):
+            with self.assertRaises(d._GroupedValidationError) as caught:
+                decode(body(count=8).replace(b'"count":8',b'"count":'+value))
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'RESULT_COUNTS_INVALID')
+
+    def test_duplicate_count_including_escaped_name_is_still_rejected(self):
+        for value in (b'{"count":0,"count":0}',b'{"count":0,"co\\u0075nt":0}'):
+            with self.assertRaises(d._GroupedValidationError) as caught:decode(value)
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'JSON_STRUCTURE_INVALID')
+
+    def test_malformed_or_nonfinite_json_is_still_rejected(self):
+        complete = body(count=8).rstrip()
+        self.assertTrue(complete.endswith(b'}'))
+        for value in (complete[:-1], complete+b'x', b'{"count":NaN}', b'{"count":Infinity}'):
+            with self.assertRaises(d._GroupedValidationError) as caught:decode(value)
+            self.assertEqual(d._grouped_diagnostic(caught.exception),'JSON_SYNTAX_INVALID')
+
+    def test_valid_count_does_not_rescue_bad_ohlcv_or_timestamp(self):
+        for field, value, expected in (('c',0,'ROW_OHLCV_INVALID'),('t',None,'ROW_TIMESTAMP_INVALID')):
+            rows = json.loads(FIXTURE)['results']
+            rows[-1][field] = value
+            with self.assertRaises(d._GroupedValidationError) as caught:decode(body(rows,count=8))
+            self.assertEqual(d._grouped_diagnostic(caught.exception),expected)
+
+
+def invalid_optional_count(value):
+    def test(self):
+        with self.assertRaises(d._GroupedValidationError) as caught:decode(body(count=value))
+        self.assertEqual(d._grouped_diagnostic(caught.exception),'RESULT_COUNTS_INVALID')
+        self.assertEqual(d._grouped_root_fields(caught.exception),{})
+    return test
+
+
+for name, value in (('negative',-1),('oversized',30001),('large_integer',10**20),
+                    ('bool_true',True),('bool_false',False),('decimal_integral',8.0),
+                    ('decimal_fractional',8.5),('string','8'),('null',None)):
+    setattr(OptionalCountTests,'test_invalid_'+name,invalid_optional_count(value))
 
 
 if __name__ == '__main__':

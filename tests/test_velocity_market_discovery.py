@@ -157,7 +157,7 @@ class SourceTests(Offline):
                 decode(value)
 
     def test_unexpected_metadata_or_pagination_is_never_followed(self):
-        for fields in ({'next_url':'https://example.invalid'}, {'count':8}, {'request_id':{}}, {'request_id':'x'*129}):
+        for fields in ({'next_url':'https://example.invalid'}, {'ticker':'anonymous'}, {'request_id':{}}, {'request_id':'x'*129}):
             with self.subTest(fields=fields), self.assertRaises(ValueError): decode(body(**fields))
 
     def test_deep_or_excessive_number_and_string_tokens_are_bounded_before_decode(self):
@@ -704,6 +704,27 @@ class BrowserTests(unittest.TestCase):
         self.assertEqual(self.page.locator('#discovery-received').inner_text(),'—')
         self.read.assert_called_once();self.ticker_read.assert_not_called()
 
+    def test_valid_optional_count_loads_original_candidates_and_coverage(self):
+        self.read.return_value=(200,'application/json','',body(count=8))
+        self.open();self.load()
+        self.assertEqual(self.page.locator('#discovery-received').inner_text(),'8 / 8')
+        self.assertEqual(self.page.locator('#discovery-validated').inner_text(),'6')
+        self.assertEqual(self.symbols(),['ABCD','VELA','QBIT','BRK.B','MTRX'])
+        self.assertNotIn('Diagnostic:',self.page.locator('#discovery-message').inner_text())
+        self.assertNotIn(KEY,self.page.locator('#discovery-message').inner_text())
+        self.read.assert_called_once();self.ticker_read.assert_not_called()
+
+    def test_mismatched_optional_count_shows_safe_count_error_without_partial_data(self):
+        self.read.return_value=(200,'application/json','',body(count=7,request_id=KEY))
+        self.open();self.page.locator('#discovery-load').click()
+        self.page.locator('#discovery-message').filter(has_text='Diagnostic: RESULT_COUNTS_INVALID.').wait_for()
+        message=self.page.locator('#discovery-message').inner_text()
+        self.assertIn('Retry after at least 60 seconds; manual retry only.',message)
+        self.assertNotIn('Unexpected root categories:',message);self.assertNotIn(KEY,message)
+        self.assertEqual(self.page.locator('#discovery-rows tr').count(),0)
+        self.assertEqual(self.page.locator('#discovery-received').inner_text(),'—')
+        self.read.assert_called_once();self.ticker_read.assert_not_called()
+
     def test_unknown_diagnostic_is_not_displayed_or_interpreted_as_html(self):
         self.open()
         self.page.route('**/api/market-data/discovery/load?*',lambda route:route.fulfill(
@@ -717,15 +738,15 @@ class BrowserTests(unittest.TestCase):
         self.read.assert_not_called();self.ticker_read.assert_not_called()
 
     def test_all_root_categories_visible_but_no_names_values_or_partial_data(self):
-        raw=dict.fromkeys(('ticker','count','next_url','requestId','pagination','message','error'),KEY)
-        raw.update({KEY+str(index):KEY for index in range(5)})
+        raw=dict.fromkeys(('ticker','next_url','requestId','pagination','message','error'),KEY)
+        raw.update({KEY+str(index):KEY for index in range(6)})
         self.read.return_value=(200,'application/json','',json.dumps(raw).encode())
         self.open();self.page.locator('#discovery-load').click()
         self.page.locator('#discovery-message').filter(has_text='Unexpected root categories:').wait_for()
         message=self.page.locator('#discovery-message').inner_text()
-        for category in ('TICKER','COUNT','NEXT_URL','REQUEST_ID_CAMEL','PAGINATION','MESSAGE','ERROR'):
+        for category in ('TICKER','NEXT_URL','REQUEST_ID_CAMEL','PAGINATION','MESSAGE','ERROR'):
             self.assertIn(f'{category} (1)',message)
-        self.assertIn('OTHER (5)',message);self.assertNotIn(KEY,message)
+        self.assertIn('OTHER (6)',message);self.assertNotIn(KEY,message)
         self.assertIn('Retry after at least 60 seconds; manual retry only.',message)
         self.assertEqual(self.page.locator('#discovery-rows tr').count(),0)
         self.read.assert_called_once();self.ticker_read.assert_not_called()
@@ -734,10 +755,10 @@ class BrowserTests(unittest.TestCase):
         self.open()
         payload={'reason':'INVALID_RESPONSE','diagnostic_code':'ROOT_FIELDS_UNEXPECTED','retry_after_seconds':60}
         self.page.route('**/api/market-data/discovery/load?*',lambda route:route.fulfill(json=payload))
-        cases=([{'category':KEY+'<svg>','count':1}], [{'category':'OTHER','count':True}],
+        cases=([{'category':KEY+'<svg>','count':1}], [{'category':'COUNT','count':1}], [{'category':'OTHER','count':True}],
                [{'category':'OTHER','count':0}], [{'category':'OTHER','count':13}],
                [{'category':'OTHER','count':1.5}], [{'category':'TICKER','count':2}],
-               [{'category':'OTHER','count':1,'name':KEY}], [{'category':'OTHER','count':1}]*9,
+               [{'category':'OTHER','count':1,'name':KEY}], [{'category':'OTHER','count':1}]*8,
                [{'category':'TICKER','count':1},{'category':'TICKER','count':1}],
                [{'category':'TICKER','count':1},{'category':'OTHER','count':12}],None,KEY)
         for fields in cases:

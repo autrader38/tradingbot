@@ -15,7 +15,9 @@ import time
 from .models import _decode, _eastern, _ticker, _utc, _watchlist
 from .reference import _TickerReference, _decode_reference
 from .research import _research_row
-from .discovery import _DiscoveryFilters, _GroupedLimitError, _decode_grouped, _filter_decimal, _request_date
+from .discovery import (_DiscoveryFilters, _GroupedLimitError, _GroupedDiagnostic,
+                        _GroupedValidationError, _grouped_diagnostic, _decode_grouped,
+                        _filter_decimal, _request_date)
 from .transport import _read_response, _read_grouped_response
 
 __all__ = ()
@@ -194,7 +196,7 @@ class _MarketDataPreview:
                               429: 'RATE_LIMITED'}.get(code, 'REDIRECT_REJECTED' if 300 <= code < 400 else 'PROVIDER_UNAVAILABLE')
                     return _unavailable(reason, delay)
                 if type(content_type) is not str or content_type.split(';')[0].strip().lower() != 'application/json':
-                    raise ValueError('Invalid discovery content')
+                    raise _GroupedValidationError(_GroupedDiagnostic.HTTP_CONTENT_TYPE_INVALID)
                 series = _decode_grouped(body, requested, retrieved)
                 result = series.page(retrieved)
                 with self._lock:
@@ -211,9 +213,10 @@ class _MarketDataPreview:
             except OSError:
                 _RATE.backoff(15)
                 return _unavailable('NETWORK_UNAVAILABLE', 15)
-            except Exception:
+            except Exception as error:
                 _RATE.backoff(60)
-                return _unavailable('INVALID_RESPONSE', 60)
+                return {**_unavailable('INVALID_RESPONSE', 60),
+                        'diagnostic_code': _grouped_diagnostic(error)}
             finally:
                 with self._lock: self._active = False
         except Exception:

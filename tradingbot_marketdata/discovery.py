@@ -1,8 +1,10 @@
 """Pure, bounded grouped-daily evidence and preliminary discovery, not signals."""
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal
+from enum import Enum
 from fractions import Fraction
 import json
 import re
@@ -29,6 +31,50 @@ _LIMITATIONS = ('PRELIMINARY EOD CANDIDATES — NOT FULLY QUALIFIED',
 class _GroupedLimitError(ValueError):
     def __init__(self):
         super().__init__('Grouped response exceeds fixed limits')
+
+
+class _GroupedDiagnostic(Enum):
+    HTTP_CONTENT_TYPE_INVALID = 'HTTP_CONTENT_TYPE_INVALID'
+    HTTP_CONTENT_ENCODING_INVALID = 'HTTP_CONTENT_ENCODING_INVALID'
+    HTTP_CONTENT_LENGTH_INVALID = 'HTTP_CONTENT_LENGTH_INVALID'
+    JSON_SYNTAX_INVALID = 'JSON_SYNTAX_INVALID'
+    JSON_STRUCTURE_INVALID = 'JSON_STRUCTURE_INVALID'
+    ROOT_FIELDS_UNEXPECTED = 'ROOT_FIELDS_UNEXPECTED'
+    ROOT_STATUS_INVALID = 'ROOT_STATUS_INVALID'
+    ROOT_ADJUSTMENT_INVALID = 'ROOT_ADJUSTMENT_INVALID'
+    ROOT_METADATA_INVALID = 'ROOT_METADATA_INVALID'
+    RESULT_COUNTS_INVALID = 'RESULT_COUNTS_INVALID'
+    ROW_FIELDS_UNEXPECTED = 'ROW_FIELDS_UNEXPECTED'
+    ROW_IDENTITY_INVALID = 'ROW_IDENTITY_INVALID'
+    ROW_IDENTITY_DUPLICATE = 'ROW_IDENTITY_DUPLICATE'
+    ROW_OHLCV_INVALID = 'ROW_OHLCV_INVALID'
+    ROW_TIMESTAMP_INVALID = 'ROW_TIMESTAMP_INVALID'
+    ROW_METADATA_INVALID = 'ROW_METADATA_INVALID'
+    VALIDATION_FAILED = 'VALIDATION_FAILED'
+
+
+class _GroupedValidationError(ValueError):
+    """Carries only a closed stage category, never provider values or messages."""
+    def __init__(self, diagnostic):
+        self.diagnostic = diagnostic if type(diagnostic) is _GroupedDiagnostic else _GroupedDiagnostic.VALIDATION_FAILED
+        super().__init__('Grouped response failed validation')
+
+
+def _grouped_diagnostic(error):
+    # Recheck at the publication boundary; even a substituted/tampered error
+    # cannot turn exception text, arguments or arbitrary attributes into JSON.
+    value = getattr(error, 'diagnostic', None) if type(error) is _GroupedValidationError else None
+    return value.value if type(value) is _GroupedDiagnostic else _GroupedDiagnostic.VALIDATION_FAILED.value
+
+
+@contextmanager
+def _validation_stage(diagnostic):
+    try:
+        yield
+    except (_GroupedLimitError, _GroupedValidationError):
+        raise
+    except (ValueError, TypeError, ArithmeticError):
+        raise _GroupedValidationError(diagnostic) from None
 
 
 def _request_date(value, now):
@@ -73,16 +119,18 @@ def _preflight(text):
 
 
 def _pairs(pairs):
-    _check(len(pairs) <= 12)
-    result = {}
-    for key, value in pairs:
-        _check(key not in result)
-        result[key] = value
+    with _validation_stage(_GroupedDiagnostic.JSON_STRUCTURE_INVALID):
+        _check(len(pairs) <= 12)
+        result = {}
+        for key, value in pairs:
+            _check(key not in result)
+            result[key] = value
     return result
 
 
 def _integer(text):
-    _check(len(text) <= 28)
+    with _validation_stage(_GroupedDiagnostic.JSON_STRUCTURE_INVALID):
+        _check(len(text) <= 28)
     return int(text)
 
 
@@ -201,48 +249,67 @@ class _GroupedSummary:
 
 
 def _decode_grouped(body, requested_date, now):
-    _check(type(body) is bytes)
+    with _validation_stage(_GroupedDiagnostic.JSON_STRUCTURE_INVALID):
+        _check(type(body) is bytes)
     if len(body) > _MAX_BODY: raise _GroupedLimitError()
     _check(type(requested_date) is date)
     _request_date(requested_date.isoformat(), now)
-    text = body.decode('utf-8')
-    _preflight(text)
-    raw = json.loads(text, parse_float=Decimal, parse_int=_integer,
-                     parse_constant=_constant, object_pairs_hook=_pairs)
-    _check(type(raw) is dict and set(raw) <= {'adjusted', 'queryCount', 'resultsCount', 'status', 'request_id', 'results'})
-    _check(raw.get('status') == 'OK' and raw.get('adjusted') is True)
+    with _validation_stage(_GroupedDiagnostic.JSON_SYNTAX_INVALID):
+        text = body.decode('utf-8')
+    with _validation_stage(_GroupedDiagnostic.JSON_STRUCTURE_INVALID):
+        _preflight(text)
+    with _validation_stage(_GroupedDiagnostic.JSON_SYNTAX_INVALID):
+        raw = json.loads(text, parse_float=Decimal, parse_int=_integer,
+                         parse_constant=_constant, object_pairs_hook=_pairs)
+    with _validation_stage(_GroupedDiagnostic.JSON_STRUCTURE_INVALID):
+        _check(type(raw) is dict)
+    with _validation_stage(_GroupedDiagnostic.ROOT_FIELDS_UNEXPECTED):
+        _check(set(raw) <= {'adjusted', 'queryCount', 'resultsCount', 'status', 'request_id', 'results'})
+    with _validation_stage(_GroupedDiagnostic.ROOT_STATUS_INVALID):
+        _check(raw.get('status') == 'OK')
+    with _validation_stage(_GroupedDiagnostic.ROOT_ADJUSTMENT_INVALID):
+        _check(raw.get('adjusted') is True)
     count = raw.get('resultsCount')
-    _check(type(count) is int and count >= 0)
+    with _validation_stage(_GroupedDiagnostic.RESULT_COUNTS_INVALID):
+        _check(type(count) is int and count >= 0)
     if count > _MAX_ROWS: raise _GroupedLimitError()
     query_count = raw.get('queryCount')
-    _check(query_count is None or type(query_count) is int and 0 <= query_count <= _MAX_ROWS)
-    if 'request_id' in raw:
-        _check(type(raw['request_id']) is str and 1 <= len(raw['request_id']) <= 128
-               and raw['request_id'].isascii() and raw['request_id'].isprintable())
+    with _validation_stage(_GroupedDiagnostic.RESULT_COUNTS_INVALID):
+        _check(query_count is None or type(query_count) is int and 0 <= query_count <= _MAX_ROWS)
+    with _validation_stage(_GroupedDiagnostic.ROOT_METADATA_INVALID):
+        if 'request_id' in raw:
+            _check(type(raw['request_id']) is str and 1 <= len(raw['request_id']) <= 128
+                   and raw['request_id'].isascii() and raw['request_id'].isprintable())
     rows = raw.get('results', [])
-    _check(type(rows) is list and len(rows) == count)
+    with _validation_stage(_GroupedDiagnostic.RESULT_COUNTS_INVALID):
+        _check(type(rows) is list and len(rows) == count)
     accepted, seen, otc, unsupported = [], set(), 0, 0
     for row in rows:
-        _check(type(row) is dict and set(row) <= {'T', 'o', 'h', 'l', 'c', 'v', 't', 'vw', 'n', 'otc'})
+        with _validation_stage(_GroupedDiagnostic.ROW_FIELDS_UNEXPECTED):
+            _check(type(row) is dict and set(row) <= {'T', 'o', 'h', 'l', 'c', 'v', 't', 'vw', 'n', 'otc'})
         symbol = row.get('T')
-        _check(type(symbol) is str and 1 <= len(symbol) <= 32 and symbol.isascii() and symbol.isprintable())
-        _check(symbol not in seen)
+        with _validation_stage(_GroupedDiagnostic.ROW_IDENTITY_INVALID):
+            _check(type(symbol) is str and 1 <= len(symbol) <= 32 and symbol.isascii() and symbol.isprintable())
+        with _validation_stage(_GroupedDiagnostic.ROW_IDENTITY_DUPLICATE):
+            _check(symbol not in seen)
         seen.add(symbol)
-        values = [_numeric(row.get(name), volume=name == 'v') for name in ('o', 'h', 'l', 'c', 'v')]
-        opened, high, low, closed, volume = values
-        _check(low <= opened <= high and low <= closed <= high)
+        with _validation_stage(_GroupedDiagnostic.ROW_OHLCV_INVALID):
+            values = [_numeric(row.get(name), volume=name == 'v') for name in ('o', 'h', 'l', 'c', 'v')]
+            opened, high, low, closed, volume = values
+            _check(low <= opened <= high and low <= closed <= high)
         timestamp = row.get('t')
-        instant = _instant(timestamp)
-        eastern = _eastern(instant)
-        _check(instant <= _utc(now))
-        # Grouped timestamps have their own documented semantics. Permit an
-        # instant on the requested ET date, or exactly the next midnight boundary.
-        _check(eastern.date() == requested_date or
-               eastern.date() == requested_date + timedelta(days=1)
-               and eastern.hour == eastern.minute == eastern.second == eastern.microsecond == 0)
-        vwap = None if 'vw' not in row else _numeric(row['vw'])
-        if 'n' in row: _check(type(row['n']) is int and 0 <= row['n'] <= 10**15)
-        if 'otc' in row: _check(type(row['otc']) is bool)
+        with _validation_stage(_GroupedDiagnostic.ROW_TIMESTAMP_INVALID):
+            instant = _instant(timestamp)
+            eastern = _eastern(instant)
+            _check(instant <= _utc(now))
+            # Preserve the reviewed grouped timestamp/date contract exactly.
+            _check(eastern.date() == requested_date or
+                   eastern.date() == requested_date + timedelta(days=1)
+                   and eastern.hour == eastern.minute == eastern.second == eastern.microsecond == 0)
+        with _validation_stage(_GroupedDiagnostic.ROW_METADATA_INVALID):
+            vwap = None if 'vw' not in row else _numeric(row['vw'])
+            if 'n' in row: _check(type(row['n']) is int and 0 <= row['n'] <= 10**15)
+            if 'otc' in row: _check(type(row['otc']) is bool)
         if row.get('otc', False): otc += 1; continue
         try: _ticker(symbol)
         except ValueError: unsupported += 1; continue

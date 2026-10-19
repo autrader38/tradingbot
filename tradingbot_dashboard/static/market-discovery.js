@@ -18,6 +18,14 @@
     VALIDATED_GROUPED_DAILY_SOURCE: 'Validated dated EOD summary. Candidates remain preliminary.',
     INVALID_SHORTLIST: 'Selection rejected. Use at most five distinct validated discovered tickers.',
     DISCOVERY_REQUIRED: 'Load validated discovery evidence before selecting symbols.'});
+  // Only fixed stage names may reach the page. Never display arbitrary server
+  // strings, provider fields, exception messages or request identifiers.
+  const diagnostics = new Set(['HTTP_CONTENT_TYPE_INVALID', 'HTTP_CONTENT_ENCODING_INVALID',
+    'HTTP_CONTENT_LENGTH_INVALID', 'JSON_SYNTAX_INVALID', 'JSON_STRUCTURE_INVALID',
+    'ROOT_FIELDS_UNEXPECTED', 'ROOT_STATUS_INVALID', 'ROOT_ADJUSTMENT_INVALID',
+    'ROOT_METADATA_INVALID', 'RESULT_COUNTS_INVALID', 'ROW_FIELDS_UNEXPECTED',
+    'ROW_IDENTITY_INVALID', 'ROW_IDENTITY_DUPLICATE', 'ROW_OHLCV_INVALID',
+    'ROW_TIMESTAMP_INVALID', 'ROW_METADATA_INVALID', 'VALIDATION_FAILED']);
   const local = (path, action = false) => fetch(path, {cache: 'no-store', credentials: 'omit', mode: 'same-origin',
     headers: action ? {'X-Velocity-Market-Preview': '1'} : {}}).then(async (r) => { if (!r.ok) throw new Error('local'); return r.json(); });
   let ready = false, busy = false, selecting = false, shortlist = [], page = 0, pages = 1, revision = 0;
@@ -133,7 +141,9 @@
     try {
       const data = await local(`/api/market-data/discovery/load?date=${encodeURIComponent(requested)}`, true);
       await refresh();
-      $('discovery-message').textContent = `${requested}: ${reasons[data.reason] || 'Discovery unavailable.'}${data.cached ? ' Five-minute cached response; no provider call.' : ''}${data.retry_after_seconds ? ` Retry after at least ${data.retry_after_seconds} seconds; manual retry only.` : ''}`;
+      const diagnostic = data.reason === 'INVALID_RESPONSE' && diagnostics.has(data.diagnostic_code)
+        ? ` Diagnostic: ${data.diagnostic_code}.` : '';
+      $('discovery-message').textContent = `${requested}: ${reasons[data.reason] || 'Discovery unavailable.'}${diagnostic}${data.cached ? ' Five-minute cached response; no provider call.' : ''}${data.retry_after_seconds ? ` Retry after at least ${data.retry_after_seconds} seconds; manual retry only.` : ''}`;
     } catch { $('discovery-message').textContent = 'Local load unavailable. No raw provider details are displayed.'; }
     finally { busy = false; controls(); }
   });

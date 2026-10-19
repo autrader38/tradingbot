@@ -509,6 +509,22 @@ class HTTPTests(unittest.TestCase):
             self.assertEqual(self.request(path,'HEAD')[2],b'');self.assertNotIn(KEY.encode(),data)
         self.read.assert_not_called()
 
+    def test_rejection_publishes_only_fixed_diagnostic_and_unchanged_backoff(self):
+        self.read.return_value=(200,'application/json','',body(adjusted=False,request_id=KEY))
+        code,headers,value=self.request('/api/market-data/discovery/load?date=2026-10-16',
+                                      headers={'X-Velocity-Market-Preview':'1'})
+        self.assertEqual(code,200)
+        self.assertEqual(headers['Content-Security-Policy'],_CSP)
+        result=json.loads(value)
+        self.assertEqual(result['reason'],'INVALID_RESPONSE')
+        self.assertEqual(result['diagnostic_code'],'ROOT_ADJUSTMENT_INVALID')
+        self.assertEqual(result['retry_after_seconds'],60)
+        self.assertNotIn(KEY.encode(),value)
+        for field in ('request_id','rows','received_rows','provider_results_count'):
+            self.assertNotIn(field,result)
+        self.assertEqual(json.loads(self.request('/api/market-data/discovery')[2])['rows'],[])
+        self.read.assert_called_once();self.old.assert_not_called()
+
     def test_load_requires_explicit_header_same_origin_and_get(self):
         path='/api/market-data/discovery/load?date=2026-10-16'
         self.assertEqual(self.request(path)[0],403)
@@ -662,6 +678,39 @@ class BrowserTests(unittest.TestCase):
         self.page.locator('#discovery-sort').select_option('price')
         self.page.wait_for_function('() => document.querySelector("#discovery-rows tr").dataset.ticker === "MTRX"')
         self.read.assert_called_once();self.ticker_read.assert_not_called()
+
+    def test_fixed_diagnostic_and_manual_backoff_visible_without_partial_results(self):
+        self.read.return_value=(200,'application/json','',body(adjusted=False,request_id=KEY))
+        self.open();self.page.locator('#discovery-load').click()
+        self.page.locator('#discovery-message').filter(has_text='Diagnostic: ROOT_ADJUSTMENT_INVALID.').wait_for()
+        message=self.page.locator('#discovery-message').inner_text()
+        self.assertIn('Retry after at least 60 seconds; manual retry only.',message)
+        self.assertNotIn(KEY,message)
+        self.assertEqual(self.page.locator('#discovery-rows tr').count(),0)
+        self.assertEqual(self.page.locator('#discovery-received').inner_text(),'—')
+        self.read.assert_called_once();self.ticker_read.assert_not_called()
+
+    def test_unknown_diagnostic_is_not_displayed_or_interpreted_as_html(self):
+        self.open()
+        self.page.route('**/api/market-data/discovery/load?*',lambda route:route.fulfill(
+            json={'reason':'INVALID_RESPONSE','diagnostic_code':KEY+'<svg onload=alert(1)>',
+                  'retry_after_seconds':60}))
+        self.page.locator('#discovery-load').click()
+        self.page.locator('#discovery-message').filter(has_text='Retry after at least 60 seconds').wait_for()
+        message=self.page.locator('#discovery-message').inner_text()
+        self.assertNotIn(KEY,message);self.assertNotIn('Diagnostic:',message)
+        self.assertEqual(self.page.locator('#discovery-message svg').count(),0)
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
+
+    def test_diagnostic_only_displayed_for_invalid_response(self):
+        self.open()
+        self.page.route('**/api/market-data/discovery/load?*',lambda route:route.fulfill(
+            json={'reason':'ACCESS_DENIED','diagnostic_code':'ROW_TIMESTAMP_INVALID',
+                  'retry_after_seconds':300}))
+        self.page.locator('#discovery-load').click()
+        self.page.locator('#discovery-message').filter(has_text='Retry after at least 300 seconds').wait_for()
+        self.assertNotIn('ROW_TIMESTAMP_INVALID',self.page.locator('#discovery-message').inner_text())
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
 
     def test_selected_ticker_reaches_pre2_only_manual_history_then_reference_qualifies(self):
         self.open();self.load();self.select('VELA');self.ticker_read.assert_not_called()

@@ -5,7 +5,8 @@ from datetime import date
 import re
 import ssl
 
-from .discovery import _MAX_BODY as _MAX_GROUPED_BODY, _GroupedLimitError
+from .discovery import (_MAX_BODY as _MAX_GROUPED_BODY, _GroupedLimitError,
+                        _GroupedDiagnostic, _GroupedValidationError)
 
 __all__ = ()
 
@@ -41,16 +42,18 @@ def _read_grouped_response(path, credential):
         connection.request('GET', path, headers={'Authorization': 'Bearer ' + credential,
             'Accept': 'application/json', 'User-Agent': 'Velocity-Local-EOD-Preview/1'})
         response = connection.getresponse()
-        if response.getheader('Content-Encoding', 'identity').lower() not in ('identity', ''):
-            raise ValueError('Unsupported grouped encoding')
+        encoding = response.getheader('Content-Encoding', 'identity')
+        if type(encoding) is not str or encoding.lower() not in ('identity', ''):
+            raise _GroupedValidationError(_GroupedDiagnostic.HTTP_CONTENT_ENCODING_INVALID)
         length = response.getheader('Content-Length')
         if length is not None:
-            if not length.isascii() or not length.isdigit() or len(length) > 10:
-                raise ValueError('Invalid grouped length')
+            if type(length) is not str or not length.isascii() or not length.isdigit() or len(length) > 10:
+                raise _GroupedValidationError(_GroupedDiagnostic.HTTP_CONTENT_LENGTH_INVALID)
             if int(length) > _MAX_GROUPED_BODY: raise _GroupedLimitError()
         body = response.read(_MAX_GROUPED_BODY + 1)
         if len(body) > _MAX_GROUPED_BODY: raise _GroupedLimitError()
-        if length is not None and len(body) != int(length): raise ValueError('Incomplete grouped response')
+        if length is not None and len(body) != int(length):
+            raise _GroupedValidationError(_GroupedDiagnostic.HTTP_CONTENT_LENGTH_INVALID)
         return response.status, response.getheader('Content-Type', ''), response.getheader('Retry-After', ''), body
     finally:
         try: connection.close()

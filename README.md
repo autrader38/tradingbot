@@ -177,8 +177,11 @@ visible session-only PRE2 research shortlist, then manually load history and dat
 reference separately. The configured watchlist and DEMO scanner stay unchanged.
 **PRELIMINARY EOD CANDIDATES — NOT FULLY QUALIFIED** is not a live signal or proof
 of complete U.S. coverage. No startup polling, automatic follow-up, persistence,
-commercial redistribution or trading authority. PRE3 still requires independent
-review and actual Windows qualification.
+commercial redistribution or trading authority. PRE3A Windows validation was
+reported complete. [PRE3B safe rejection diagnostics](docs/velocity-market-data-pre3b.md)
+adds fixed validation-stage codes without publishing raw responses or weakening
+the parser. The actual provider rejection remains unproven pending a later manual
+code report; PRE3B requires independent review and actual Windows qualification.
 
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 

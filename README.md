@@ -186,6 +186,14 @@ field only as an exact bounded integer equal to `resultsCount` and received rows
 Other extra fields still reject the whole response, with no partial publication.
 PRE3D requires independent review and actual Windows qualification.
 
+[PRE4A offline multi-day screening](docs/velocity-market-data-pre4a.md) adds a private,
+bounded evaluator for up to eleven validated grouped dates. It calculates exact
+observed close-to-close change, previous ten-observation volume average and EOD
+relative volume, with explicit missing history and unverified session/adjustment
+continuity. Preliminary matches are not full strategy qualification. Provider
+collection and dashboard activation remain inactive for later PRE4B/PRE4C review.
+PRE4A requires independent review and actual Windows qualification; trading stays blocked.
+
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 
 After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.

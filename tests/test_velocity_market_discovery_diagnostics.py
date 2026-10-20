@@ -192,7 +192,8 @@ class PublicationDiagnostics(Offline):
         self.preview.load_discovery('2026-10-16')
         self.tick.return_value += 400
         self.read.return_value = (200, 'application/json', '', row_body(c=0))
-        result = self.preview.load_discovery('2026-10-16')
+        # Retained dates no longer trigger fresh requests; reject a new load.
+        result = self.preview.load_discovery('2026-10-15')
         self.assertEqual(result['diagnostic_code'], 'ROW_OHLCV_INVALID')
         self.assertEqual(self.preview.discovery()['rows'], [])
         self.assertEqual(self.read.call_count, 2)
@@ -421,7 +422,7 @@ class RootFieldPublication(Offline):
         self.preview.load_discovery('2026-10-16')
         self.tick.return_value += 400
         self.read.return_value = (200,'application/json','',body(count=7))
-        result = self.preview.load_discovery('2026-10-16')
+        result = self.preview.load_discovery('2026-10-15')
         self.assertEqual(result['diagnostic_code'],'RESULT_COUNTS_INVALID')
         self.assertEqual(result['retry_after_seconds'],60)
         self.assertEqual(self.preview.discovery()['rows'],[])

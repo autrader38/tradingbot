@@ -5,6 +5,7 @@ uncached attempt requires a user load; failures establish manual-retry backoff.
 """
 
 from collections import deque
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
 import math
@@ -19,6 +20,7 @@ from .discovery import (_DiscoveryFilters, _GroupedLimitError, _GroupedDiagnosti
                         _GroupedValidationError, _grouped_diagnostic, _grouped_root_fields, _decode_grouped,
                         _filter_decimal, _request_date)
 from .transport import _read_response, _read_grouped_response
+from .collection import _CollectionError, _GroupedCollection
 
 __all__ = ()
 
@@ -73,7 +75,7 @@ def _unavailable(reason, retry_after=0):
 
 class _MarketDataPreview:
     __slots__ = ('_enabled', '_watchlist', '_credential', '_cache', '_loaded', '_lock', '_active',
-                 '_discovery', '_discovery_cache', '_shortlist', '_shortlist_sources')
+                 '_discovery', '_discovery_cache', '_shortlist', '_shortlist_sources', '_collection', '_closed')
 
     def __init__(self, *, enabled=False, watchlist=_DEFAULT_WATCHLIST):
         if type(enabled) is not bool: raise ValueError('Invalid market preview configuration')
@@ -84,6 +86,7 @@ class _MarketDataPreview:
         self._cache, self._loaded, self._lock, self._active = {}, {}, Lock(), False
         self._discovery, self._discovery_cache = None, {}
         self._shortlist, self._shortlist_sources = (), ()
+        self._collection, self._closed = _GroupedCollection(), False
 
     def __repr__(self):
         return '<MarketDataPreview read-only>'
@@ -145,16 +148,17 @@ class _MarketDataPreview:
         try:
             now = _utc(_now())
             filters = _DiscoveryFilters(_filter_decimal(max_price), _filter_decimal(min_volume))
-            with self._lock: loaded = self._discovery
-            if loaded is None:
-                result = _unavailable('USER_LOAD_REQUIRED' if self._enabled and self._credential
-                                      else 'KEY_NOT_CONFIGURED' if self._enabled else 'PREVIEW_DISABLED')
-                result.update({'rows': [], 'requested_date': None})
-            else:
-                series, retrieved = loaded
-                if now < retrieved: raise ValueError('Invalid discovery time')
-                result = series.page(now, filters=filters, search=search, sort=sort, page=page)
-                result['retrieved_at'] = retrieved.isoformat()
+            with self._lock:
+                loaded = self._discovery
+                if loaded is None:
+                    result = _unavailable('USER_LOAD_REQUIRED' if self._enabled and self._credential
+                                          else 'KEY_NOT_CONFIGURED' if self._enabled else 'PREVIEW_DISABLED')
+                    result.update({'rows': [], 'requested_date': None})
+                else:
+                    series, retrieved = loaded
+                    if now < retrieved: raise ValueError('Invalid discovery time')
+                    result = series.page(now, filters=filters, search=search, sort=sort, page=page)
+                    result['retrieved_at'] = retrieved.isoformat()
             today = _eastern(now).date()
             suggested = today - timedelta(days=1)
             while suggested.weekday() >= 5: suggested -= timedelta(days=1)
@@ -174,9 +178,22 @@ class _MarketDataPreview:
             if not self._enabled: return _unavailable('PREVIEW_DISABLED')
             if self._credential is None: return _unavailable('KEY_NOT_CONFIGURED')
             with self._lock:
+                if self._closed: return _unavailable('COLLECTION_CLOSED')
                 if self._active: return _unavailable('REQUEST_IN_PROGRESS', 1)
+                retained = self._collection.get(requested)
+                if retained is not None:
+                    if now < retained.retrieved_at: return _unavailable('INVALID_REQUEST')
+                    result = retained.summary.page(now)
+                    self._discovery = (retained.summary, retained.retrieved_at)
+                    cached = self._discovery_cache.get(requested)
+                    result.update({'retrieved_at': retained.retrieved_at.isoformat(), 'cached': True,
+                                   'http_cache_valid': bool(cached and tick < cached[2]),
+                                   'retained': True, 'retry_after_seconds': 0})
+                    return result
+                self._collection.require_capacity()
                 cached = self._discovery_cache.get(requested)
                 if cached and tick < cached[2] and now >= cached[1]:
+                    self._collection.retain(cached[0], cached[1])
                     self._discovery = cached[:2]
                     result = cached[0].page(now)
                     result.update({'retrieved_at': cached[1].isoformat(), 'cached': True, 'retry_after_seconds': 0})
@@ -198,12 +215,23 @@ class _MarketDataPreview:
                 if type(content_type) is not str or content_type.split(';')[0].strip().lower() != 'application/json':
                     raise _GroupedValidationError(_GroupedDiagnostic.HTTP_CONTENT_TYPE_INVALID)
                 series = _decode_grouped(body, requested, retrieved)
-                result = series.page(retrieved)
+                del body  # Never retained, logged, persisted or returned.
+                expires = time.monotonic() + 300
+                selected = (series, retrieved)
+                cache = {requested: (series, retrieved, expires)}
                 with self._lock:
-                    self._discovery = (series, retrieved)
-                    self._discovery_cache = {requested: (series, retrieved, time.monotonic() + 300)}
-                result.update({'retrieved_at': retrieved.isoformat(), 'cached': False, 'retry_after_seconds': 0})
+                    if self._closed: return _unavailable('COLLECTION_CLOSED')
+                    result = series.page(retrieved)
+                    result.update({'retrieved_at': retrieved.isoformat(), 'cached': False,
+                                   'retained': True, 'http_cache_valid': True, 'retry_after_seconds': 0})
+                    self._collection.retain(series, retrieved)
+                    self._discovery, self._discovery_cache = selected, cache
                 return result
+            except _CollectionError as error:
+                return _unavailable(error.reason)
+            except MemoryError:
+                _RATE.backoff(60)
+                return _unavailable('COLLECTION_MEMORY_LIMIT', 60)
             except _GroupedLimitError:
                 _RATE.backoff(60)
                 return _unavailable('RESPONSE_LIMIT_EXCEEDED', 60)
@@ -219,8 +247,55 @@ class _MarketDataPreview:
                         'diagnostic_code': _grouped_diagnostic(error), **_grouped_root_fields(error)}
             finally:
                 with self._lock: self._active = False
+        except _CollectionError as error:
+            return _unavailable(error.reason)
         except Exception:
             return _unavailable('INVALID_REQUEST')
+
+    def collection_status(self, target_text=None):
+        try:
+            target = _request_date(target_text, _utc(_now())) if target_text is not None else None
+            with self._lock:
+                result = self._collection.status(target)
+                result['request_in_progress'] = self._active
+            return result
+        except Exception:
+            return _unavailable('INVALID_REQUEST')
+
+    def clear_collection(self):
+        with self._lock:
+            if self._closed: return _unavailable('COLLECTION_CLOSED')
+            if self._active: return _unavailable('REQUEST_IN_PROGRESS', 1)
+            self._collection.clear()
+            # Release all grouped references, including the current view/cache.
+            # Original watchlist, selected research symbols and PRE2 data survive.
+            self._discovery, self._discovery_cache = None, {}
+            return self._collection.status()
+
+    @contextmanager
+    def _collection_evaluation(self, target_text):
+        """Explicit internal-only PRE4A handoff. No HTTP scanner activation."""
+        target = _request_date(target_text, _utc(_now()))
+        with self._lock:
+            if self._closed: raise _CollectionError('COLLECTION_CLOSED')
+            if self._active: raise _CollectionError('REQUEST_IN_PROGRESS')
+            self._active = True
+        try:
+            with self._collection.evaluate(target) as result:
+                with self._lock:
+                    if self._closed: raise _CollectionError('COLLECTION_CLOSED')
+                yield result
+        finally:
+            with self._lock: self._active = False
+
+    def close(self):
+        with self._lock:
+            self._closed = True
+            self._collection.clear(close=True)
+            self._discovery, self._discovery_cache = None, {}
+            self._loaded.clear()
+            self._cache.clear()
+            self._credential = None
 
     def observe(self, ticker, view):
         try:
@@ -239,6 +314,7 @@ class _MarketDataPreview:
                 requested_date = history[0].bars[-1].session_date
             key = (ticker, view)
             with self._lock:
+                if self._closed: return _unavailable('COLLECTION_CLOSED')
                 if ticker not in self._watchlist + self._shortlist: return _unavailable('INVALID_REQUEST')
                 if key in self._cache:
                     series, retrieved, expires = self._cache[key]
@@ -272,6 +348,7 @@ class _MarketDataPreview:
                     _decode(body, ticker, view, retrieved, start, end)
                 publication = self._publication(series, retrieved, retrieved, view, False)
                 with self._lock:
+                    if self._closed: return _unavailable('COLLECTION_CLOSED')
                     if view in ('history', 'reference'):
                         self._loaded[key] = (series, retrieved)
                     if view == 'reference' or series.bars:

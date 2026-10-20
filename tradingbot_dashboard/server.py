@@ -47,6 +47,10 @@ class _LocalServer(ThreadingHTTPServer):
         self.market_data = _MarketDataPreview(enabled=market_data_preview, watchlist=watchlist)
         super().__init__((HOST, port), _Handler)
 
+    def server_close(self):
+        self.market_data.close()
+        super().server_close()
+
 
 class _Handler(BaseHTTPRequestHandler):
     server_version = 'VelocityDashboard'
@@ -86,6 +90,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(self.server.market_data.configuration())
         elif self.path == '/api/market-data/research':
             self._json(self.server.market_data.research())
+        elif self.path.partition('?')[0] == '/api/market-data/collection':
+            try:
+                fields = self._query({'target'}, 32)
+                self._json(self.server.market_data.collection_status(fields.get('target')))
+            except ValueError:
+                self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_REQUEST'}, status=400)
+        elif self.path == '/api/market-data/collection/clear':
+            if not self._explicit_load(expected): return
+            self._json(self.server.market_data.clear_collection())
         elif self.path.partition('?')[0] == '/api/market-data/discovery':
             try:
                 fields = self._query({'price', 'volume', 'search', 'sort', 'page'}, 256)
@@ -172,7 +185,7 @@ class _Handler(BaseHTTPRequestHandler):
     def _not_allowed(self):
         self.close_connection = True
         allow = 'GET' if self.path.partition('?')[0] in ('/api/market-data/observation',
-            '/api/market-data/discovery/load', '/api/market-data/shortlist') else 'GET, HEAD'
+            '/api/market-data/discovery/load', '/api/market-data/shortlist', '/api/market-data/collection/clear') else 'GET, HEAD'
         self._respond(405, 'text/plain; charset=utf-8', b'Read-only visual mode.\n', allow=allow)
 
     do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _not_allowed

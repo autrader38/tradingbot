@@ -17,6 +17,10 @@
     PROVIDER_UNAVAILABLE: 'Provider unavailable.', NO_SUPPORTED_DAILY_OBSERVATIONS: 'No supported daily observations returned. This is not proof of a market session or absence of trading.',
     VALIDATED_GROUPED_DAILY_SOURCE: 'Validated dated EOD summary. Candidates remain preliminary.',
     INVALID_SHORTLIST: 'Selection rejected. Use at most five distinct validated discovered tickers.',
+    COLLECTION_DATE_LIMIT: 'Eleven dates already retained. Clear explicitly to start a new collection; nothing was discarded.',
+    COLLECTION_MEMORY_LIMIT: 'Collection memory/row reservation is full. Existing dates are preserved; no provider request was made if rejected before loading.',
+    COLLECTION_SOURCE_INCOMPATIBLE: 'New source is incompatible with retained PRE4A evidence. Existing dates are preserved.',
+    COLLECTION_CLOSED: 'This local application session has closed.',
     DISCOVERY_REQUIRED: 'Load validated discovery evidence before selecting symbols.'});
   // Only fixed stage names may reach the page. Never display arbitrary server
   // strings, provider fields, exception messages or request identifiers.
@@ -46,13 +50,32 @@
   const local = (path, action = false) => fetch(path, {cache: 'no-store', credentials: 'omit', mode: 'same-origin',
     headers: action ? {'X-Velocity-Market-Preview': '1'} : {}}).then(async (r) => { if (!r.ok) throw new Error('local'); return r.json(); });
   let ready = false, busy = false, selecting = false, shortlist = [], page = 0, pages = 1, revision = 0;
+  let retainedCount = 0, collectionRevision = 0;
   function controls() {
     $('discovery-date').disabled = !ready || busy;
     $('discovery-load').disabled = !ready || busy;
+    $('collection-clear').disabled = busy || retainedCount === 0;
     $('discovery-configured').disabled = selecting || !shortlist.length;
     for (const button of $('discovery-rows').querySelectorAll('button')) {
       button.disabled = busy || selecting || (!shortlist.includes(button.dataset.ticker) && shortlist.length >= 5);
     }
+  }
+  async function collectionStatus() {
+    const current = ++collectionRevision, target = $('discovery-date').value;
+    try {
+      const data = await local(`/api/market-data/collection${target ? `?target=${encodeURIComponent(target)}` : ''}`);
+      if (current !== collectionRevision || target !== $('discovery-date').value) return;
+      if (!Number.isInteger(data.retained_count) || data.retained_count < 0 || data.retained_count > 11) throw new Error('status');
+      retainedCount = data.retained_count;
+      $('collection-count').textContent = `${retainedCount} / 11 dates`;
+      const states = {TARGET_NOT_RETAINED: 'Selected target is not retained.',
+        INSUFFICIENT_DATED_INPUTS: 'Selected target has fewer than ten earlier retained dates.',
+        TEN_EARLIER_DATES_RETAINED_TICKER_HISTORY_UNVERIFIED: 'Target and ten earlier dates retained. Per-ticker history remains unverified until explicit internal PRE4A evaluation.'};
+      $('collection-status').textContent = `${states[data.input_status] || 'Collection status unavailable.'} ${data.retained_rows} received rows retained. Memory charge ${(data.charged_retained_bytes / 1048576).toFixed(1)} / 384 MiB. No multi-day screening has run.`;
+      $('collection-dates').replaceChildren(...(data.dates || []).slice(0, 11).map((entry) => node('li',
+        `${entry.requested_date} ET · ${entry.validated_rows} validated / ${entry.received_rows} received · Retrieved ${entry.retrieved_at}`)));
+      controls();
+    } catch { if (current === collectionRevision) $('collection-status').textContent = 'Local collection status unavailable. No provider request was made.'; }
   }
   function selection(config) {
     shortlist = config.session_shortlist;
@@ -158,10 +181,24 @@
     try {
       const data = await local(`/api/market-data/discovery/load?date=${encodeURIComponent(requested)}`, true);
       await refresh();
+      await collectionStatus();
       const diagnostic = data.reason === 'INVALID_RESPONSE' && diagnostics.has(data.diagnostic_code)
         ? ` Diagnostic: ${data.diagnostic_code}.${rootFieldDetails(data)}` : '';
-      $('discovery-message').textContent = `${requested}: ${reasons[data.reason] || 'Discovery unavailable.'}${diagnostic}${data.cached ? ' Five-minute cached response; no provider call.' : ''}${data.retry_after_seconds ? ` Retry after at least ${data.retry_after_seconds} seconds; manual retry only.` : ''}`;
+      const reuse = data.cached ? data.http_cache_valid ? ' Five-minute cached response; retained evidence reused; no provider call.' : ' Session-retained evidence reused beyond HTTP cache; no provider call or currentness claim.' : '';
+      $('discovery-message').textContent = `${requested}: ${reasons[data.reason] || 'Discovery unavailable.'}${diagnostic}${reuse}${data.retry_after_seconds ? ` Retry after at least ${data.retry_after_seconds} seconds; manual retry only.` : ''}`;
     } catch { $('discovery-message').textContent = 'Local load unavailable. No raw provider details are displayed.'; }
+    finally { busy = false; controls(); }
+  });
+  $('discovery-date').addEventListener('change', collectionStatus);
+  $('collection-clear').addEventListener('click', async () => {
+    if (busy || retainedCount === 0) return;
+    busy = true; controls(); ++revision; ++collectionRevision;
+    try {
+      const data = await local('/api/market-data/collection/clear', true);
+      await refresh(); await collectionStatus();
+      $('discovery-message').textContent = data.reason ? reasons[data.reason] || 'Collection could not be cleared.'
+        : 'Retained dates, grouped HTTP cache and discovery view cleared. PRE2 research selections and configured watchlist unchanged. No provider request.';
+    } catch { $('collection-status').textContent = 'Local clear unavailable. No provider request was made.'; }
     finally { busy = false; controls(); }
   });
   for (const id of ['discovery-price', 'discovery-volume', 'discovery-search', 'discovery-sort']) $(id).addEventListener('input', () => { page = 0; refresh(); });
@@ -175,7 +212,7 @@
     try {
       const config = await local('/api/market-data');
       ready = config.enabled === true && config.configured === true;
-      selection(config); await refresh();
+      selection(config); await refresh(); await collectionStatus();
     } catch { $('discovery-message').textContent = 'Local discovery configuration unavailable.'; }
     controls();
   }

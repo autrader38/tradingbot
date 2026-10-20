@@ -334,17 +334,19 @@ class AdapterTests(Offline):
             self.preview.discovery(sort=sort,search='a',min_volume='1000000')
         self.preview.configuration();self.preview.research();self.read.assert_called_once()
 
-    def test_five_minute_date_specific_cache_and_single_summary_capacity(self):
+    def test_five_minute_cache_is_distinct_from_session_retention(self):
         first=self.load();again=self.load();self.assertTrue(again['cached']);self.read.assert_called_once()
         self.assertEqual(first['retrieved_at'],again['retrieved_at'])
         self.tick.return_value+=301
-        self.load();self.assertEqual(self.read.call_count,2)
+        retained=self.load();self.assertEqual(self.read.call_count,1)
+        self.assertTrue(retained['retained']);self.assertFalse(retained['http_cache_valid'])
         self.tick.return_value+=15
         raw=json.loads(FIXTURE)
         for row in raw['results']:row['t']-=86400000
         self.read.return_value=(200,'application/json','',json.dumps(raw).encode())
         result=self.preview.load_discovery('2026-10-15')
         self.assertFalse(result['cached']);self.assertEqual(len(self.preview._discovery_cache),1)
+        self.assertEqual(self.preview.collection_status()['retained_count'],2)
 
     def test_quota_shared_with_existing_previous_history_and_reference_endpoints(self):
         self.load();self.assertEqual(self.preview.observe('AAPL','history')['reason'],'RATE_LIMITED')
@@ -385,7 +387,10 @@ class AdapterTests(Offline):
         complete = FIXTURE.rstrip()
         self.assertTrue(complete.endswith(b'}'))
         self.read.return_value=(200,'application/json','',complete[:-1])
-        self.assertEqual(self.load()['reason'],'INVALID_RESPONSE');self.assertEqual(self.preview.discovery()['rows'],[])
+        # PRE4B reuses retained dates without provider work; exercise a new date.
+        self.assertEqual(self.preview.load_discovery('2026-10-15')['reason'],'INVALID_RESPONSE')
+        self.assertEqual(self.preview.discovery()['rows'],[])
+        self.assertEqual(self.preview.collection_status()['retained_count'],1)
 
     def test_shortlist_requires_valid_discovered_tickers_distinct_and_five_max(self):
         self.assertEqual(self.preview.select_research(('VELA',))['reason'],'DISCOVERY_REQUIRED')

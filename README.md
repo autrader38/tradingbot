@@ -194,6 +194,14 @@ continuity. Preliminary matches are not full strategy qualification. Provider
 collection and dashboard activation remain inactive for later PRE4B/PRE4C review.
 PRE4A requires independent review and actual Windows qualification; trading stays blocked.
 
+[PRE4B manual multi-day collection](docs/velocity-market-data-pre4b.md) retains up to
+eleven explicitly loaded grouped dates in bounded session memory. The discovery
+panel shows original dates, retrieval times and counts, with an explicit clear
+action; repeated retained dates use no provider quota. Existing manual request
+limits and PRE2 research remain. The internal PRE4A handoff has no active scanner
+UI or automatic evaluation. PRE4B requires independent review and actual Windows
+qualification before PRE4C; trading stays blocked.
+
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 
 After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.

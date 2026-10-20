@@ -412,7 +412,10 @@ class ContractTests(Offline):
                 self.assertNotIn(name,('now','today','open','read','write','connect','request','append_event','execute','eval','exec'))
         for directory in ('tradingbot_dashboard','tradingbot_marketdata'):
             for other in (ROOT/directory).glob('*.py'):
-                if other!=path:self.assertNotIn('multiday',other.read_text(encoding='utf-8'))
+                # PRE4B authorizes only the explicit internal collection handoff;
+                # no dashboard/provider automatic evaluation is activated.
+                if other!=path and other.name!='collection.py':
+                    self.assertNotIn('multiday',other.read_text(encoding='utf-8'))
         self.assertEqual(m.__all__,())
 
 

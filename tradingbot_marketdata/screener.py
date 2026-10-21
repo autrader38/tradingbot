@@ -35,9 +35,11 @@ class _ScreenFilters:
                and 0 <= value <= 1000000)
 
     def payload(self):
-        return {'price': str(self.base.max_price), 'change': str(self.base.min_change),
-                'average': str(self.base.min_average_volume),
-                'relative': None if self.min_relative is None else str(self.min_relative)}
+        # Echo the validated plain-decimal controls without exponent notation or
+        # rounding. Decimal formatting retains supplied scale and signed zero.
+        return {'price': format(self.base.max_price, 'f'), 'change': format(self.base.min_change, 'f'),
+                'average': format(self.base.min_average_volume, 'f'),
+                'relative': None if self.min_relative is None else format(self.min_relative, 'f')}
 
 
 def _screen_filters(price='5', change='3', average='1000000', relative=''):

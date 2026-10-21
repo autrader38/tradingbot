@@ -32,7 +32,9 @@ py -3.12 -m tradingbot_dashboard --market-data-preview --open
 5. Target/threshold edits clear the displayed view and require another explicit
    evaluation. **Reset research filters** restores defaults without evaluating.
    Every evaluation visibly resets search, sorting and outcome view to their
-   defaults. Original DEMO/PRE2 controls and frozen strategy settings are unchanged.
+   defaults. These three view controls are disabled until evaluation finishes;
+   afterwards they filter the retained result locally. Original DEMO/PRE2 controls
+   and frozen strategy settings are unchanged.
 
 The default command remains fully offline DEMO, with no collection or evaluation:
 
@@ -159,16 +161,58 @@ mode None and LIVE UNSUPPORTED remain. The first real PAPER order remains blocke
 No Resistance Squeeze, Level 2, pattern recognition, execution simulation or broker
 execution is implemented. Personal/non-commercial local research only.
 
+## PRE4C review repairs
+
+Review of checkpoint `ce52ce4a131d6088c433f14bd89bfccf37eb0aa1` identified two
+display defects and an unsafe PRE4B test shutdown:
+
+- Decimal's default string conversion changed small accepted control values such
+  as `0.000000000001` into `1E-12`. The browser correctly rejected the differing
+  applied-settings text, leaving no displayed result. Filter metadata now uses
+  fixed-point Decimal formatting without rounding, preserving scale and signed
+  zero. Exact calculations, threshold bounds and source observations are unchanged.
+- Search/outcome edits while evaluation was pending could relabel default-view
+  rows. Search, sort and outcome controls now remain disabled during evaluation
+  and are restored on both success and failure. Rendering also checks all three
+  returned view settings against the controls, including programmatic edits.
+  Target/threshold changes still invalidate pending results; no automatic
+  reevaluation, provider call or additional request capability was added.
+- The PRE4B server-close test called `server_close()` while another thread still
+  ran `serve_forever()` and selected the listening socket. It now waits for
+  `shutdown()` to finish that loop before closing the socket, following the
+  standard-library lifecycle. All retained-evidence cleanup assertions remain,
+  with checks that shutdown leaves the socket open and close releases it. Other
+  threaded dashboard fixtures already use shutdown before close. The production
+  entrypoint closes only after its serving loop exits and is unchanged.
+
+The unsafe test ordering is confirmed by inspection. The reported Windows native
+exit `0xc0000008` has not been reproduced on this Linux environment, so its exact
+native cause and resolution remain **unverified Windows qualification blockers**
+until the repaired test and full Windows suite complete without that exit. Linux
+success does not establish Windows approval. No broker, quota, decoder, security,
+calculation, safety-state or production server-lifecycle change is included.
+
+Repair verification on Linux CPython 3.12.14 passed: 48 PRE4C tests (including
+twelve installed-browser checks), 104 PRE4A/PRE4B tests and 587 existing dashboard /
+market-data regressions, totaling 739 selected tests. A complete offline discovery
+run passed **9,004 tests, 4 skipped, zero failures** (1,212.680 seconds). All 162
+tracked Python files compiled. Both diff checks and secret/account/environment,
+external-resource, private-export, broker-operation, persistence and protected-scope
+scans passed. No dependencies, real provider calls, API-key access, IBKR requests
+or Gateway changes were involved. These results do not provide Windows clearance.
+
 ## Windows qualification
 
 ```powershell
 git pull --ff-only
 git rev-parse HEAD
 $env:IBKR_RUN_READ_ONLY_TESTS = "0"
-py -3.12 -m unittest tests.test_velocity_multiday_screener -v
+py -3.12 -X faulthandler -m unittest tests.test_velocity_grouped_collection.HTTPTests.test_server_close_clears_retention_even_if_preview_still_referenced -v
+if ($LASTEXITCODE -ne 0) { throw "Server-close qualification failed: $LASTEXITCODE" }
+py -3.12 -X faulthandler -m unittest tests.test_velocity_multiday_screener -v
 py -3.12 -m unittest tests.test_velocity_multiday tests.test_velocity_grouped_collection -v
 py -3.12 -m unittest tests.test_velocity_market_discovery tests.test_velocity_market_discovery_diagnostics tests.test_velocity_marketdata tests.test_velocity_eod_research tests.test_velocity_dashboard tests.test_velocity_scanner -v
-py -3.12 -m unittest discover -v
+py -3.12 -X faulthandler -m unittest discover -v
 git ls-files '*.py' | ForEach-Object { py -3.12 -m py_compile $_; if ($LASTEXITCODE -ne 0) { throw "Compile failed: $_" } }
 git diff --check
 git diff --cached --check

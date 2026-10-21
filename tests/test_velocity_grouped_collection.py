@@ -383,7 +383,13 @@ class HTTPTests(unittest.TestCase):
     def test_server_close_clears_retention_even_if_preview_still_referenced(self):
         preview = self.server.market_data
         self.request('/api/market-data/discovery/load?date=2026-10-16', headers=ACTION)
+        # serve_forever runs on the fixture's other thread. Wait for its selector
+        # loop to stop before closing the socket; closing an active Windows
+        # socket handle underneath select is unsafe. Normal cleanup is repeatable.
+        self.server.shutdown()
+        self.assertGreaterEqual(self.server.socket.fileno(), 0)
         self.server.server_close()
+        self.assertEqual(self.server.socket.fileno(), -1)
         self.assertEqual(preview.collection_status()['state'], 'COLLECTION_CLOSED')
         self.assertIsNone(preview._discovery); self.assertEqual(preview._discovery_cache, {})
 

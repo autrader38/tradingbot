@@ -51,6 +51,21 @@ class Offline(previous.Offline):
 
 
 class EvaluationTests(Offline):
+    def test_small_filter_values_round_trip_as_plain_decimal_text(self):
+        for field in ('price', 'change', 'average', 'relative'):
+            for value in ('0.000000000001', '0.000000010000', '0.000000000000'):
+                if field == 'price' and value == '0.000000000000': continue
+                with self.subTest(field=field, value=value), localcontext() as context:
+                    context.prec = 2; context.traps[Inexact] = True; context.traps[Rounded] = True
+                    result = self.evaluate(**{field: value})
+                    self.assertEqual(result['state'], 'HISTORICAL_SCREENING_RESULT')
+                    self.assertEqual(result['filters'][field], value)
+                    page = self.preview.screening_page(result['evaluation_id'])
+                    self.assertEqual(page['filters'], result['filters'])
+        result = self.evaluate(change='-0.000000000001')
+        self.assertEqual(result['filters']['change'], '-0.000000000001')
+        self.read.assert_not_called(); self.other.assert_not_called()
+
     def test_explicit_handoff_exact_engine_metrics_and_source_provenance(self):
         with patch.object(c, '_screen_grouped_history', wraps=c._screen_grouped_history) as engine:
             result = self.evaluate()
@@ -355,6 +370,72 @@ class BrowserTests(unittest.TestCase):
         self.assertIn('UNAVAILABLE',row.inner_text());self.assertIn('Market cap UNVERIFIED',row.inner_text())
         row.locator('summary').click();self.assertIn('9 prior observations',row.inner_text())
         self.assertEqual(self.page.locator('#multi-sources li').count(),11)
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
+
+    def test_small_decimal_thresholds_display_results_for_each_control(self):
+        self.prepare()
+        for field, default in (('price','5'), ('change','3'), ('average','1000000'), ('relative','')):
+            with self.subTest(field=field):
+                self.page.locator('#multi-'+field).fill('0.000000000001')
+                self.evaluate()
+                self.assertEqual(self.page.locator('#multi-rows tr').count(),4)
+                self.assertIn('0.000000000001',self.page.locator('#multi-applied').inner_text())
+                self.page.locator('#multi-'+field).fill(default)
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
+
+    def test_view_controls_are_frozen_during_evaluation_and_reenabled_afterwards(self):
+        self.prepare(); held=[]
+        self.page.route('**/api/market-data/multiday/evaluate?*',lambda route:held.append(route))
+        self.page.locator('#multi-evaluate').click();self.page.wait_for_timeout(40)
+        self.assertEqual(len(held),1)
+        for field in ('search','sort','outcome'):
+            self.assertTrue(self.page.locator('#multi-'+field).is_disabled())
+        with patch.object(c,'_screen_grouped_history',wraps=c._screen_grouped_history) as engine:
+            result=self.server.market_data.evaluate_screening(TARGET.isoformat())
+            held[0].fulfill(json=result)
+            self.page.locator('#multi-applied').filter(has_text='Applied target').wait_for()
+            self.page.locator('#multi-evaluate:not([disabled])').wait_for()
+            for field in ('search','sort','outcome'):
+                self.assertTrue(self.page.locator('#multi-'+field).is_enabled())
+            self.assertEqual(self.page.locator('#multi-search').input_value(),'')
+            self.assertEqual(self.page.locator('#multi-outcome').input_value(),'ALL')
+            self.assertEqual(self.page.locator('#multi-rows tr').count(),4)
+            self.page.locator('#multi-search').fill('vela')
+            self.page.wait_for_function('() => document.querySelectorAll("#multi-rows tr").length===1')
+            self.assertEqual(self.page.locator('#multi-rows tr').get_attribute('data-ticker'),'VELA')
+            self.page.locator('#multi-outcome').select_option('PRELIMINARY_NOT_MET')
+            self.page.wait_for_function('() => document.querySelectorAll("#multi-rows tr").length===0')
+            engine.assert_called_once()
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
+
+    def test_pending_evaluation_never_renders_rows_for_different_view_controls(self):
+        self.prepare(); held=[]
+        self.page.route('**/api/market-data/multiday/evaluate?*',lambda route:held.append(route))
+        for field, value in (('search','NEXA'), ('outcome','INSUFFICIENT_HISTORY'), ('sort','symbol')):
+            with self.subTest(field=field):
+                self.page.locator('#multi-evaluate').click();self.page.wait_for_timeout(40)
+                self.assertEqual(len(held),1)
+                result=self.server.market_data.evaluate_screening(TARGET.isoformat())
+                # Even programmatic edits to disabled controls cannot relabel returned rows.
+                self.page.locator('#multi-'+field).evaluate('(el, value) => { el.value=value; el.dispatchEvent(new Event("input")); }',value)
+                held.pop().fulfill(json=result)
+                self.page.locator('#multi-evaluate:not([disabled])').wait_for()
+                self.assertEqual(self.page.locator('#multi-rows tr').count(),0)
+                self.assertNotIn('Applied target',self.page.locator('#multi-applied').inner_text())
+                self.assertTrue(self.page.locator('#multi-empty').is_visible())
+        self.read.assert_not_called();self.ticker_read.assert_not_called()
+
+    def test_failed_evaluation_reenables_view_controls_without_publishing_rows(self):
+        self.prepare()
+        self.page.route('**/api/market-data/multiday/evaluate?*',lambda route:route.fulfill(
+            json={'state':'UNAVAILABLE','reason':'SCREENING_UNAVAILABLE'}))
+        self.page.locator('#multi-evaluate').click()
+        self.page.locator('#multi-message').filter(has_text='Local screening unavailable').wait_for()
+        self.page.locator('#multi-evaluate:not([disabled])').wait_for()
+        for field in ('search','sort','outcome'):
+            self.assertTrue(self.page.locator('#multi-'+field).is_enabled())
+        self.assertEqual(self.page.locator('#multi-rows tr').count(),0)
+        self.assertIsNone(self.server.market_data._screening)
         self.read.assert_not_called();self.ticker_read.assert_not_called()
 
     def test_search_sort_outcome_pagination_and_reset(self):

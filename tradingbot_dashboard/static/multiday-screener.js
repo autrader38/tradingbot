@@ -20,6 +20,7 @@
   const criteria = ['multi-price', 'multi-change', 'multi-average', 'multi-relative'];
   function controls() {
     $('multi-evaluate').disabled = busy || !$('multi-target').value;
+    for (const id of ['multi-search', 'multi-sort', 'multi-outcome']) $(id).disabled = busy;
     $('multi-prev').disabled = busy || !evaluation || page === 0;
     $('multi-next').disabled = busy || !evaluation || page + 1 >= pages;
   }
@@ -74,7 +75,9 @@
     }
     if (data.target_date !== $('multi-target').value || data.filters.price !== $('multi-price').value
         || data.filters.change !== $('multi-change').value || data.filters.average !== $('multi-average').value
-        || (data.filters.relative === null ? '' : data.filters.relative) !== $('multi-relative').value) {
+        || (data.filters.relative === null ? '' : data.filters.relative) !== $('multi-relative').value
+        || data.search !== $('multi-search').value.trim().toUpperCase()
+        || data.sort !== $('multi-sort').value || data.outcome_filter !== $('multi-outcome').value) {
       empty('Result belongs to different applied settings. Explicitly evaluate this draft.'); return;
     }
     evaluation = data.evaluation_id; page = data.page; pages = data.pages;

@@ -202,6 +202,14 @@ limits and PRE2 research remain. The internal PRE4A handoff has no active scanne
 UI or automatic evaluation. PRE4B requires independent review and actual Windows
 qualification before PRE4C; trading stays blocked.
 
+[PRE4C real multi-day EOD screener](docs/velocity-market-data-pre4c.md) adds explicit
+local evaluation of PRE4B's manually retained dates using PRE4A's exact engine.
+Research thresholds, outcome counts, ticker search, exact-value sorting and
+50-row pagination stay separate from DEMO/PRE2 and trading strategy controls.
+Market cap, session continuity, adjustment vintage and full strategy qualification
+remain unverified. Restart requires manually reloading dates. PRE4C requires
+independent review and actual Windows qualification; trading stays blocked.
+
 Follow [AGENTS.md](AGENTS.md). Keep strategy rules deterministic and versioned; never commit credentials, account identifiers or real webhook endpoints. AI may explain results, but may not change active rules or risk limits.
 
 After separate implementation authorization, prepare trustworthy point-in-time data and build/validate the deterministic historical research model. Later phases may evaluate realistic execution, observe paper results, scan live market data and consider reviewed automated paper execution. Live routing or a paper-to-live switch requires later explicit approval.

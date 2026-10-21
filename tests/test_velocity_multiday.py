@@ -398,7 +398,7 @@ class ContractTests(Offline):
                             ('min_change',True),('min_average_volume',Decimal(-1))):
             with self.assertRaises(ValueError):m._MultiDayFilters(**{field:value})
 
-    def test_pure_module_inactive_and_no_protected_imports_or_operations(self):
+    def test_pure_module_and_qualified_consumers_have_no_protected_operations(self):
         path=ROOT/'tradingbot_marketdata/multiday.py'
         tree=ast.parse(path.read_text(encoding='utf-8'))
         forbidden=('os','time','socket','http','pathlib','sqlite3','threading','tradingbot_broker',
@@ -412,10 +412,17 @@ class ContractTests(Offline):
                 self.assertNotIn(name,('now','today','open','read','write','connect','request','append_event','execute','eval','exec'))
         for directory in ('tradingbot_dashboard','tradingbot_marketdata'):
             for other in (ROOT/directory).glob('*.py'):
-                # PRE4B authorizes only the explicit internal collection handoff;
-                # no dashboard/provider automatic evaluation is activated.
-                if other!=path and other.name!='collection.py':
-                    self.assertNotIn('multiday',other.read_text(encoding='utf-8'))
+                # PRE4C adds multiday URL/asset names, not direct engine access.
+                # Only the source handoff and typed projection import the model.
+                if other!=path and other.name not in ('collection.py', 'screener.py'):
+                    for item in ast.walk(ast.parse(other.read_text(encoding='utf-8'))):
+                        if isinstance(item,ast.ImportFrom):
+                            self.assertNotIn(item.module,('multiday','tradingbot_marketdata.multiday'))
+                        if isinstance(item,ast.Import):
+                            self.assertFalse(any(alias.name=='tradingbot_marketdata.multiday' for alias in item.names))
+                        if isinstance(item,ast.Call):
+                            name=item.func.attr if isinstance(item.func,ast.Attribute) else item.func.id if isinstance(item.func,ast.Name) else ''
+                            self.assertNotEqual(name,'_screen_grouped_history')
         self.assertEqual(m.__all__,())
 
 

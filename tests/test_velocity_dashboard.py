@@ -322,7 +322,7 @@ class StaticTests(unittest.TestCase):
         self.assertEqual([attrs['data-timeframe'] for _, attrs in self.page.elements if 'data-timeframe' in attrs], list(TIMEFRAMES))
 
     def test_semantic_tables_and_accessible_canvases(self):
-        self.assertEqual(sum(tag == 'table' for tag, _ in self.page.elements), 5)
+        self.assertEqual(sum(tag == 'table' for tag, _ in self.page.elements), 6)
         self.assertGreaterEqual(sum(tag == 'th' for tag, _ in self.page.elements), 14)
         self.assertEqual(sum(tag == 'canvas' and 'aria-label' in attrs for tag, attrs in self.page.elements), 3)
         self.assertIn('focus-visible', self.css)
@@ -354,7 +354,7 @@ class StaticTests(unittest.TestCase):
         self.assertNotIn('<style', self.html)
         for tag, attrs in self.page.elements:
             self.assertFalse(any(key.startswith('on') or key == 'style' for key in attrs), tag)
-            if tag == 'script': self.assertIn(attrs.get('src'), ('/app.js', '/market-data.js', '/eod-scanner.js', '/market-discovery.js'))
+            if tag == 'script': self.assertIn(attrs.get('src'), ('/app.js', '/market-data.js', '/eod-scanner.js', '/market-discovery.js', '/multiday-screener.js'))
 
     def test_no_trade_controls_forms_or_credential_inputs(self):
         allowed_inputs = {'filter-max-price': 'number', 'filter-min-change': 'number',
@@ -366,7 +366,8 @@ class StaticTests(unittest.TestCase):
             'eod-min-average': 'number', 'eod-min-rvol': 'number', 'eod-require-cap': 'checkbox',
             'eod-search': 'search', 'eod-matches-only': 'checkbox',
             'discovery-date': 'date', 'discovery-price': 'number', 'discovery-volume': 'number',
-            'discovery-search': 'search'}
+            'discovery-search': 'search', 'multi-price':'number', 'multi-change':'number',
+            'multi-average':'number', 'multi-relative':'number', 'multi-search':'search'}
         actual_inputs = {}
         for tag, attrs in self.page.elements:
             self.assertNotIn(tag, ('form', 'textarea'))
@@ -393,7 +394,7 @@ class StaticTests(unittest.TestCase):
     def test_production_imports_and_calls_are_isolated(self):
         allowed = {'argparse', 'webbrowser', 'http.server', 'json', 'pathlib', 'dataclasses', 'datetime',
                    'math', 'snapshot', 'demo_data', 'server', 'socketserver', 'urllib.parse',
-                   'tradingbot_marketdata.massive'}
+                   'tradingbot_marketdata.massive', 'tradingbot_marketdata.screener'}
         forbidden_calls = {'eval', 'exec', 'compile', 'system', 'popen', 'subprocess', 'reqAllOpenOrders',
                            'reqExecutions', 'reqCompletedOrders', 'placeOrder', 'cancelOrder'}
         for path in ROOT.glob('*.py'):

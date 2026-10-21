@@ -8,6 +8,7 @@ from urllib.parse import parse_qs
 
 from .demo_data import build_demo_snapshot
 from tradingbot_marketdata.massive import _DEFAULT_WATCHLIST, _MarketDataPreview
+from tradingbot_marketdata.screener import _MAX_SCREEN_BODY
 
 
 HOST = '127.0.0.1'
@@ -19,6 +20,7 @@ _ASSETS = {'/': ('index.html', 'text/html; charset=utf-8'),
            '/market-data.js': ('market-data.js', 'text/javascript; charset=utf-8'),
            '/eod-scanner.js': ('eod-scanner.js', 'text/javascript; charset=utf-8'),
            '/market-discovery.js': ('market-discovery.js', 'text/javascript; charset=utf-8'),
+           '/multiday-screener.js': ('multiday-screener.js', 'text/javascript; charset=utf-8'),
            '/favicon.svg': ('favicon.svg', 'image/svg+xml; charset=utf-8')}
 _CSP = ("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; "
         "img-src 'self'; font-src 'none'; object-src 'none'; base-uri 'none'; "
@@ -90,6 +92,27 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(self.server.market_data.configuration())
         elif self.path == '/api/market-data/research':
             self._json(self.server.market_data.research())
+        elif self.path == '/api/market-data/multiday':
+            self._json(self.server.market_data.screening_status(), limit=_MAX_SCREEN_BODY)
+        elif self.path.partition('?')[0] == '/api/market-data/multiday/evaluate':
+            if not self._explicit_load(expected): return
+            try:
+                fields = self._query({'target', 'price', 'change', 'average', 'relative'}, 256)
+                target = fields.pop('target')
+                self._json(self.server.market_data.evaluate_screening(target, **fields), limit=_MAX_SCREEN_BODY)
+            except (KeyError, ValueError):
+                self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_SCREENING_REQUEST', 'rows': []}, status=400)
+        elif self.path.partition('?')[0] == '/api/market-data/multiday/page':
+            try:
+                fields = self._query({'evaluation', 'search', 'sort', 'outcome', 'page'}, 256)
+                serial, page = fields.pop('evaluation'), fields.pop('page', '0')
+                if not serial.isascii() or not serial.isdigit() or not 1 <= len(serial) <= 19:
+                    raise ValueError('Invalid evaluation')
+                if not page.isascii() or not page.isdigit() or not 1 <= len(page) <= 3:
+                    raise ValueError('Invalid page')
+                self._json(self.server.market_data.screening_page(int(serial), page=int(page), **fields), limit=_MAX_SCREEN_BODY)
+            except (KeyError, ValueError):
+                self._json({'state': 'UNAVAILABLE', 'reason': 'INVALID_SCREENING_REQUEST', 'rows': []}, status=400)
         elif self.path.partition('?')[0] == '/api/market-data/collection':
             try:
                 fields = self._query({'target'}, 32)
@@ -172,8 +195,10 @@ class _Handler(BaseHTTPRequestHandler):
             return False
         return True
 
-    def _json(self, payload, *, status=200):
+    def _json(self, payload, *, status=200, limit=None):
         body = json.dumps(payload, allow_nan=False, ensure_ascii=False, separators=(',', ':')).encode('utf-8')
+        if limit is not None and len(body) > limit:
+            body = b'{"state":"UNAVAILABLE","reason":"SCREENING_RESPONSE_LIMIT","rows":[]}'
         self._respond(status, 'application/json; charset=utf-8', body)
 
     def do_GET(self):
@@ -185,7 +210,8 @@ class _Handler(BaseHTTPRequestHandler):
     def _not_allowed(self):
         self.close_connection = True
         allow = 'GET' if self.path.partition('?')[0] in ('/api/market-data/observation',
-            '/api/market-data/discovery/load', '/api/market-data/shortlist', '/api/market-data/collection/clear') else 'GET, HEAD'
+            '/api/market-data/discovery/load', '/api/market-data/shortlist', '/api/market-data/collection/clear',
+            '/api/market-data/multiday/evaluate') else 'GET, HEAD'
         self._respond(405, 'text/plain; charset=utf-8', b'Read-only visual mode.\n', allow=allow)
 
     do_POST = do_PUT = do_PATCH = do_DELETE = do_OPTIONS = do_TRACE = do_CONNECT = _not_allowed

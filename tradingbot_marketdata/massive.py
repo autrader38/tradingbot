@@ -21,6 +21,7 @@ from .discovery import (_DiscoveryFilters, _GroupedLimitError, _GroupedDiagnosti
                         _filter_decimal, _request_date)
 from .transport import _read_response, _read_grouped_response
 from .collection import _CollectionError, _GroupedCollection
+from .screener import _screen_filters, _project_screen, _screen_metadata, _screen_page
 
 __all__ = ()
 
@@ -75,7 +76,8 @@ def _unavailable(reason, retry_after=0):
 
 class _MarketDataPreview:
     __slots__ = ('_enabled', '_watchlist', '_credential', '_cache', '_loaded', '_lock', '_active',
-                 '_discovery', '_discovery_cache', '_shortlist', '_shortlist_sources', '_collection', '_closed')
+                 '_discovery', '_discovery_cache', '_shortlist', '_shortlist_sources', '_collection', '_closed',
+                 '_screening', '_screening_serial')
 
     def __init__(self, *, enabled=False, watchlist=_DEFAULT_WATCHLIST):
         if type(enabled) is not bool: raise ValueError('Invalid market preview configuration')
@@ -87,6 +89,7 @@ class _MarketDataPreview:
         self._discovery, self._discovery_cache = None, {}
         self._shortlist, self._shortlist_sources = (), ()
         self._collection, self._closed = _GroupedCollection(), False
+        self._screening, self._screening_serial = None, 0
 
     def __repr__(self):
         return '<MarketDataPreview read-only>'
@@ -194,6 +197,7 @@ class _MarketDataPreview:
                 cached = self._discovery_cache.get(requested)
                 if cached and tick < cached[2] and now >= cached[1]:
                     self._collection.retain(cached[0], cached[1])
+                    self._screening = None
                     self._discovery = cached[:2]
                     result = cached[0].page(now)
                     result.update({'retrieved_at': cached[1].isoformat(), 'cached': True, 'retry_after_seconds': 0})
@@ -225,6 +229,7 @@ class _MarketDataPreview:
                     result.update({'retrieved_at': retrieved.isoformat(), 'cached': False,
                                    'retained': True, 'http_cache_valid': True, 'retry_after_seconds': 0})
                     self._collection.retain(series, retrieved)
+                    self._screening = None
                     self._discovery, self._discovery_cache = selected, cache
                 return result
             except _CollectionError as error:
@@ -267,21 +272,22 @@ class _MarketDataPreview:
             if self._closed: return _unavailable('COLLECTION_CLOSED')
             if self._active: return _unavailable('REQUEST_IN_PROGRESS', 1)
             self._collection.clear()
+            self._screening = None
             # Release all grouped references, including the current view/cache.
             # Original watchlist, selected research symbols and PRE2 data survive.
             self._discovery, self._discovery_cache = None, {}
             return self._collection.status()
 
     @contextmanager
-    def _collection_evaluation(self, target_text):
-        """Explicit internal-only PRE4A handoff. No HTTP scanner activation."""
+    def _collection_evaluation(self, target_text, *, filters=None):
+        """Explicit scoped PRE4A handoff; PRE4C publishes only a bounded projection."""
         target = _request_date(target_text, _utc(_now()))
         with self._lock:
             if self._closed: raise _CollectionError('COLLECTION_CLOSED')
             if self._active: raise _CollectionError('REQUEST_IN_PROGRESS')
             self._active = True
         try:
-            with self._collection.evaluate(target) as result:
+            with self._collection.evaluate(target, filters=filters) as result:
                 with self._lock:
                     if self._closed: raise _CollectionError('COLLECTION_CLOSED')
                 yield result
@@ -292,10 +298,61 @@ class _MarketDataPreview:
         with self._lock:
             self._closed = True
             self._collection.clear(close=True)
+            self._screening = None
             self._discovery, self._discovery_cache = None, {}
             self._loaded.clear()
             self._cache.clear()
             self._credential = None
+
+    def screening_status(self):
+        with self._lock:
+            return _screen_metadata(self._screening) if self._screening is not None else {
+                **_unavailable('USER_EVALUATION_REQUIRED'), 'rows': []}
+
+    def evaluate_screening(self, target_text, *, price='5', change='3', average='1000000', relative=''):
+        try:
+            filters = _screen_filters(price, change, average, relative)
+            # Use the original PRE4B owner/serialization path. It alone supplies
+            # exact retained summaries; no caller executions or provider work.
+            with self._collection_evaluation(target_text, filters=filters.base) as evidence:
+                with self._lock:
+                    self._screening = None  # Release old projection before building its replacement.
+                    self._screening_serial += 1
+                    serial = self._screening_serial
+                if evidence.reason is not None: return _unavailable('SCREENING_SOURCE_INCOMPATIBLE')
+                metadata = self._collection.status(evidence.target_date)
+                sources = tuple((item['requested_date'], item['retrieved_at'], item['received_rows'], item['validated_rows'])
+                                for item in metadata['dates'] if item['requested_date'] <= evidence.target_date.isoformat())
+                projected = _project_screen(evidence, filters, serial, sources)
+                with self._lock:
+                    if self._closed: return _unavailable('COLLECTION_CLOSED')
+                    payload = _screen_page(projected)
+                    self._screening = projected
+                    return payload
+        except _CollectionError as error:
+            return _unavailable(error.reason)
+        except (ValueError, TypeError, ArithmeticError):
+            return _unavailable('INVALID_SCREENING_REQUEST')
+        except MemoryError:
+            return _unavailable('SCREENING_MEMORY_LIMIT')
+        except Exception:
+            return _unavailable('SCREENING_UNAVAILABLE')
+
+    def screening_page(self, evaluation_id, *, search='', sort='change', outcome='ALL', page=0):
+        try:
+            # Keep one bounded pagination workspace; never let a reader pin an
+            # entire superseded projection across replacement/clear/shutdown.
+            with self._lock:
+                if self._screening is None: return _unavailable('USER_EVALUATION_REQUIRED')
+                if type(evaluation_id) is not int or evaluation_id != self._screening.evaluation_id:
+                    return _unavailable('SCREENING_SUPERSEDED')
+                return _screen_page(self._screening, search=search, sort=sort, outcome=outcome, page=page)
+        except (ValueError, TypeError, ArithmeticError):
+            return _unavailable('INVALID_SCREENING_REQUEST')
+        except MemoryError:
+            return _unavailable('SCREENING_MEMORY_LIMIT')
+        except Exception:
+            return _unavailable('SCREENING_UNAVAILABLE')
 
     def observe(self, ticker, view):
         try:

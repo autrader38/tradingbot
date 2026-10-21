@@ -452,6 +452,20 @@ input[type=checkbox],input[type=range]{accent-color:var(--cyan)}
 .filter-field{min-width:0}
 .filter-field label{display:flex;align-items:center;justify-content:space-between;gap:5px;min-height:24px;font-size:10px;color:var(--muted);margin-bottom:6px}
 .discovery-filters{grid-template-columns:repeat(4,minmax(0,1fr))}
+.multi-filters{grid-template-columns:repeat(4,minmax(0,1fr))}
+.multi-coverage{grid-template-columns:repeat(5,minmax(0,1fr))}
+.multi-table{min-width:1200px;width:100%}.multi-table-scroll{max-height:620px;overflow:auto}
+.multi-table td{vertical-align:top}.multi-table td small{display:block;margin-top:6px;color:var(--muted);font-size:10px;line-height:1.6}
+.multi-table details{max-width:225px;white-space:normal;font-size:10px;line-height:1.7;color:var(--muted)}
+.multi-table summary{cursor:pointer;color:var(--cyan)}.multi-table ul{padding-left:16px}
+.multi-outcome{font-size:9px;font-weight:700;white-space:nowrap;padding:5px 7px;border-radius:4px;background:#f5b94215;color:var(--amber)}
+.multi-outcome[data-outcome=PRELIMINARY_MATCH]{color:var(--green);background:#42d69b14}
+.multi-outcome[data-outcome=PRELIMINARY_NOT_MET]{color:var(--red);background:#f66d7a12}
+#multi-target{max-width:230px;background:var(--panel);color:var(--text);border:1px solid var(--border);border-radius:5px;padding:9px}
+.multi-workspace button:disabled{opacity:.4;cursor:not-allowed}.multi-workspace a{color:var(--cyan)}
+.multi-workspace .market-quality{margin:14px 22px;font-size:11px;color:var(--muted);line-height:1.8}
+@media(max-width:820px){.multi-filters{grid-template-columns:repeat(2,minmax(0,1fr))}.multi-coverage{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:600px){.multi-coverage{grid-template-columns:repeat(2,minmax(0,1fr))}}
 .discovery-collection{margin:12px 22px;padding:16px;border:1px solid #39cafa35;border-radius:8px;background:#09243140}
 .collection-heading{display:flex;align-items:center;justify-content:space-between;gap:12px;flex-wrap:wrap}
 .collection-heading h3{margin:0;font-size:13px}.collection-heading h3 span{color:var(--cyan);margin-left:10px}

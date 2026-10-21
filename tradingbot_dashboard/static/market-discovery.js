@@ -71,10 +71,11 @@
       const states = {TARGET_NOT_RETAINED: 'Selected target is not retained.',
         INSUFFICIENT_DATED_INPUTS: 'Selected target has fewer than ten earlier retained dates.',
         TEN_EARLIER_DATES_RETAINED_TICKER_HISTORY_UNVERIFIED: 'Target and ten earlier dates retained. Per-ticker history remains unverified until explicit internal PRE4A evaluation.'};
-      $('collection-status').textContent = `${states[data.input_status] || 'Collection status unavailable.'} ${data.retained_rows} received rows retained. Memory charge ${(data.charged_retained_bytes / 1048576).toFixed(1)} / 384 MiB. No multi-day screening has run.`;
+      $('collection-status').textContent = `${states[data.input_status] || 'Collection status unavailable.'} ${data.retained_rows} received rows retained. Memory charge ${(data.charged_retained_bytes / 1048576).toFixed(1)} / 384 MiB. Collection status does not perform screening.`;
       $('collection-dates').replaceChildren(...(data.dates || []).slice(0, 11).map((entry) => node('li',
         `${entry.requested_date} ET · ${entry.validated_rows} validated / ${entry.received_rows} received · Retrieved ${entry.retrieved_at}`)));
       controls();
+      document.dispatchEvent(new CustomEvent('velocity-collection-status', {detail: data}));
     } catch { if (current === collectionRevision) $('collection-status').textContent = 'Local collection status unavailable. No provider request was made.'; }
   }
   function selection(config) {

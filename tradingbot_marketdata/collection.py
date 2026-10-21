@@ -60,11 +60,12 @@ def _charge(summary, retrieved):
 
 class _GroupedCollection:
     """One preview lifetime. All operations serialized; no source eviction."""
-    __slots__ = ('_entries', '_lock', '_closed', '_evaluating')
+    __slots__ = ('_entries', '_lock', '_closed', '_evaluating', '_revision')
 
     def __init__(self):
         self._entries, self._lock = {}, Lock()
         self._closed = self._evaluating = False
+        self._revision = 0
 
     def __repr__(self):
         return '<GroupedCollection session-only>'
@@ -114,6 +115,7 @@ class _GroupedCollection:
             self._capacity(rows + summary.received_count, retained + charged)
             entry = _RetainedSummary(summary, retrieved, charged)
             self._entries[summary.requested_date] = entry
+            self._revision += 1
             return entry
 
     def status(self, target=None):
@@ -123,7 +125,7 @@ class _GroupedCollection:
             present = target in self._entries if target else False
             rows, charged = self._totals()
             return {'state': 'COLLECTION_CLOSED' if self._closed else 'RETAINED_EVIDENCE' if entries else 'EMPTY_COLLECTION',
-                    'retained_count': len(entries), 'maximum_dates': _MAX_DATES,
+                    'retained_count': len(entries), 'maximum_dates': _MAX_DATES, 'collection_revision': self._revision,
                     'dates': [{'requested_date': item.summary.requested_date.isoformat(),
                                'retrieved_at': item.retrieved_at.isoformat(),
                                'received_rows': item.summary.received_count, 'validated_rows': len(item.summary.rows)}
@@ -139,11 +141,11 @@ class _GroupedCollection:
                     'evaluation_active': self._evaluating, 'limitations': list(_LIMITATIONS)}
 
     @contextmanager
-    def evaluate(self, target):
+    def evaluate(self, target, *, filters=None):
         """Internal scoped handoff only; never HTTP publication or automatic work.
 
-        Callers must release the result at scope exit; future PRE4C must separately
-        qualify any result retention/publication. Later source dates are excluded.
+        Callers must release the full result at scope exit. PRE4C retains only
+        its separately bounded scalar projection. Later source dates are excluded.
         """
         with self._lock:
             if self._closed: raise _CollectionError('COLLECTION_CLOSED')
@@ -153,7 +155,7 @@ class _GroupedCollection:
             sources = tuple(self._entries[day].summary for day in sorted(self._entries) if day <= target)
             self._evaluating = True
         try:
-            yield _screen_grouped_history(sources, target)
+            yield _screen_grouped_history(sources, target) if filters is None else _screen_grouped_history(sources, target, filters=filters)
         finally:
             with self._lock: self._evaluating = False
 
@@ -161,4 +163,5 @@ class _GroupedCollection:
         with self._lock:
             if self._evaluating and not close: raise _CollectionError('REQUEST_IN_PROGRESS')
             self._entries.clear()
+            self._revision += 1
             if close: self._closed = True
